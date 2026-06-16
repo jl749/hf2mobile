@@ -14,7 +14,10 @@
       HF_HOME = "./.hf_cache";
       UV_CACHE_DIR = "./.uv_cache";
       UV_PYTHON_DOWNLOADS = "never";
-      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ];
+      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+        pkgs.stdenv.cc.cc.lib 
+        pkgs.zlib
+      ];
     };
   in {
     devShells.${system}.default = 
