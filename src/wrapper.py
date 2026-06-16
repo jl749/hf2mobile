@@ -1,38 +1,12 @@
-import time
+# TODO: as we support more architectures expand this module into submodule
 import inspect
 from collections import defaultdict
-from typing import Sequence, Dict, Any, Tuple, List, Set
+from typing import Sequence, Dict, Any, Tuple, List
 
 import torch
 import transformers
 
-class TokenSpeedStreamer(transformers.generation.streamers.BaseStreamer):
-    def __init__(self):
-        self.token_count = 0
-        self.start_time: float | None = None
-
-    def put(self, value):
-        """Called every time the model generates a new token/batch."""
-        if self.start_time is None:
-            self.start_time = time.perf_counter()
-            return
-
-        num_tokens = value.numel()
-        self.token_count += num_tokens
-        
-        elapsed = time.perf_counter() - self.start_time
-        if elapsed > 0:
-            current_speed = self.token_count / elapsed
-            print(f"\rGenerated: {self.token_count} tokens | Speed: {current_speed:.2f} tok/sec", end="")
-
-    def end(self):
-        """Called when generation finishes."""
-        if self.start_time is None:
-            raise RuntimeError("self.start_time was never set!")
-        elapsed = time.perf_counter() - self.start_time
-        final_speed = self.token_count / elapsed
-        print(f"\n\n✨ Done! Final Average Speed: {final_speed:.2f} tok/sec")
-
+from utils import convert_dtype
 
 class CausalLMWrapper:
     def __init__(
@@ -71,7 +45,7 @@ class CausalLMWrapper:
         if "Attention" in self.plugin_suffix:
             KV_CACHE_VAR_NAME = "past_key_values"
             
-            # ===== Register PYTREE ===== #
+            # ===== Register DynamicCache Pytree Node ===== #
             def cache_flatten(past_kv):
                 flat_tensors = tuple(e for cache in past_kv.layers for e in (cache.keys, cache.values))
                 metadata = {"num_layers": len(past_kv.layers)}
@@ -109,7 +83,7 @@ class CausalLMWrapper:
                     outputs = attn_cls.forward(self, **bound_args.arguments)
                     assert isinstance(outputs, tuple) and len(outputs) == 2, "Only support the latest transformers"
 
-                    return outputs[0], past_kv  # NOTE: replacing attn_weight to past_kv
+                    return outputs[0], past_kv  # WARNING: replaced `attn_weight` to `past_kv`. May cause problem
 
                 TraceableAttnCls = type(
                     f"Traceable{attn_cls.__name__}",
@@ -138,8 +112,6 @@ class CausalLMWrapper:
         return suffix2modules
 
     def _observation_hook(self, module: torch.nn.Module, hook_args: Tuple[Any, ...], *args):
-        def get_dtype(tensor) -> str:
-            return str(tensor.dtype).split(".")[-1]
 
         _module_name = self._module2name[module]
         if len(args) == 2:
@@ -162,19 +134,19 @@ class CausalLMWrapper:
                 _module_inputs[param_name] = (None, None)
                 continue
             if isinstance(value, (int, float, bool)):
-                _module_inputs[param_name] = (value, get_dtype(torch.tensor(value)))
+                _module_inputs[param_name] = (value, convert_dtype(torch.tensor(value)))
             elif isinstance(value, torch.Tensor):
-                _module_inputs[param_name] = (tuple(value.shape), get_dtype(value))
+                _module_inputs[param_name] = (tuple(value.shape), convert_dtype(value))
             elif isinstance(value, transformers.DynamicCache):
                 layer_idx = module.layer_idx
                 flat_cache, _ = torch.utils._pytree.tree_flatten(value)
                 k = flat_cache[layer_idx*2]
                 v = flat_cache[layer_idx*2+1]
-                _module_inputs[param_name] = ((tuple(k.shape), get_dtype(k)), (tuple(v.shape), get_dtype(v)))
+                _module_inputs[param_name] = ((tuple(k.shape), convert_dtype(k)), (tuple(v.shape), convert_dtype(v)))
             else:
                 try:
                     flat_tensors, spec = torch.utils._pytree.tree_flatten(value)
-                    _ = torch.utils._pytree.tree_unflatten(((tuple(t.shape), get_dtype(t)) for t in flat_tensors), spec)
+                    _ = torch.utils._pytree.tree_unflatten(((tuple(t.shape), convert_dtype(t)) for t in flat_tensors), spec)
                     _module_inputs[param_name] = _
                 except Exception:
                     raise RuntimeError(f"Unknown `{param_name}={value}` when inspecting the hook at `{module.__class__.__name__}`")
@@ -193,43 +165,3 @@ class CausalLMWrapper:
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
-
-
-def main():
-    model_name = "Qwen/Qwen3-0.6B"
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="auto",
-    ).cpu()
-
-    prompt = "Give me a short introduction to large language model./think"
-    messages = [{"role": "user", "content": prompt}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True  # by default
-    )
-
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    model_wrapper = CausalLMWrapper(
-        model, 
-        model_inputs,
-        plugin_suffix=("Attention", "RotaryEmbedding")
-    )
-    print(model_wrapper.captured_plugin_inputs)
-    import json
-    with open("data.json", "w", encoding="utf-8") as f:
-        json.dump(model_wrapper.captured_plugin_inputs, f, ensure_ascii=False, indent=4)
-    # for plugin_suffix, captured_inputs in list(model_wrapper.captured_plugin_inputs.items())[:2]:
-    #     for ci in captured_inputs:
-    #     print(f"\n📍 Layer: {layer_path}")
-    #     for param, attributes in tensor_meta.items():
-    #         print(f"   └── Param: {param:<15} -> Meta: {attributes}")
-    # output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
-    # print(tokenizer.decode(output_ids, skip_special_tokens=True).strip("\n"))
-
-
-if __name__ == "__main__":
-    main()
