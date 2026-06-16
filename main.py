@@ -46,10 +46,10 @@ class CausalLMWrapper:
         self.plugin_suffix = plugin_suffix
         
         # Maps memory addresses (module instances) to hierarchical string names
-        self.MODULE2NAME = {mod: name for name, mod in model.named_modules()}
+        self._module2name = {mod: name for name, mod in model.named_modules()}
         
         # Container to store captured input shapes/dtypes
-        self.NAME2INPUT: Dict[str, Set[tuple]] = defaultdict(set)
+        self._plugin_inputs: Dict[str, Dict[str, List[Set[tuple]]]] = defaultdict(lambda: defaultdict(list))
         
         # Internal storage to manage active hook attachment states
         self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
@@ -60,6 +60,10 @@ class CausalLMWrapper:
         self.model.generate(**model_inputs, **generate_kwargs)  # type: ignore[reportAttributeAccessIssue]
         self._detach_hooks()
 
+    @property
+    def captured_plugin_inputs(self) -> Dict[str, Dict[str, List[Set[tuple]]]]:
+        return self._plugin_inputs
+
     def apply_plugin_wrappers(self):
         """Force nn.Module inputs to be flattened out"""
         HF_CONFIG = self.model.config
@@ -67,14 +71,26 @@ class CausalLMWrapper:
         if "Attention" in self.plugin_suffix:
             KV_CACHE_VAR_NAME = "past_key_values"
             
-            def unwrap_cache(past_kv):
-                assert isinstance(past_kv, transformers.DynamicCache)
-                return tuple((c.keys, c.values) for c in past_kv.layers)
-            def wrap_cache(traceable_tuple):
+            # ===== Register PYTREE ===== #
+            def cache_flatten(past_kv):
+                flat_tensors = tuple(e for cache in past_kv.layers for e in (cache.keys, cache.values))
+                metadata = {"num_layers": len(past_kv.layers)}
+                return flat_tensors, metadata
+            def cache_unflatten(flat_tensors, metadata):
+                if any(t is None for t in flat_tensors):
+                    past_kv = transformers.DynamicCache(config=HF_CONFIG)
                 past_kv = transformers.DynamicCache()
-                for layer_idx, (key_states, value_states) in enumerate(traceable_tuple):
-                    past_kv.update(key_states, value_states, layer_idx)
+                for i in range(0, len(flat_tensors), 2):
+                    layer_idx = i // 2
+                    k = flat_tensors[i]
+                    v = flat_tensors[i+1]
+                    past_kv.update(k, v, layer_idx)
                 return past_kv
+            torch.utils._pytree.register_pytree_node(
+                transformers.DynamicCache,
+                flatten_fn=cache_flatten,
+                unflatten_fn=cache_unflatten
+            )
 
             # ===== Make Attention to take traceable tuple and parse to DynamicCache ===== #
             attn_layers = self.get_plugin_modules(plugin_suffix="Attention")
@@ -85,24 +101,15 @@ class CausalLMWrapper:
                 attn_cls = module.__class__
                 forward_sig = inspect.signature(module.forward)
                 def attn_forward(self, *_args, **_kwargs):
+                    """Custom Attn forward"""
                     bound_args = forward_sig.bind_partial(*_args, **_kwargs)
                     bound_args.apply_defaults()
-                    traceable_tuple = bound_args.arguments.get(KV_CACHE_VAR_NAME, None)
-                    if traceable_tuple is None:
-                        past_kv = None
-                    else:  # traceable_tuple -> Cache
-                        if any(e is None for tup in traceable_tuple for e in tup):
-                            past_kv = transformers.DynamicCache(config=HF_CONFIG)
-                        else:
-                            past_kv = wrap_cache(traceable_tuple)
-                        bound_args.arguments[KV_CACHE_VAR_NAME] = past_kv
+                    past_kv = bound_args.arguments.get(KV_CACHE_VAR_NAME, None)
 
                     outputs = attn_cls.forward(self, **bound_args.arguments)
-                    assert isinstance(outputs, tuple), "Only support the latest transformers"
+                    assert isinstance(outputs, tuple) and len(outputs) == 2, "Only support the latest transformers"
 
-                    self._output_kv_tobe_popped = unwrap_cache(past_kv)
-
-                    return outputs
+                    return outputs[0], past_kv  # NOTE: replacing attn_weight to past_kv
 
                 TraceableAttnCls = type(
                     f"Traceable{attn_cls.__name__}",
@@ -110,38 +117,6 @@ class CausalLMWrapper:
                     {"forward": attn_forward}
                 )
                 module.__class__ = TraceableAttnCls
-            # ===== Make DecoderLayer to pass traceable tuple to Attention module ===== #
-            decode_layers = self.get_plugin_modules(plugin_suffix="DecoderLayer")
-            _candidate_decode_cls = set(m.__class__.__name__ for m in decode_layers)
-            if len(_candidate_decode_cls) > 1:
-                raise RuntimeError(f"More than one class candidate detected for suffix `DecoderLayer`: {_candidate_decode_cls}")
-            for module in decode_layers:
-                decoder_cls = module.__class__
-                forward_sig = inspect.signature(module.forward)
-                def decoder_forward(self, *_args, **_kwargs):
-                    bound_args = forward_sig.bind_partial(*_args, **_kwargs)
-                    bound_args.apply_defaults()
-                    past_kv = bound_args.arguments.get(KV_CACHE_VAR_NAME, None)
-                    if past_kv is not None:  # Cache -> traceable_tuple
-                        bound_args.arguments[KV_CACHE_VAR_NAME] = unwrap_cache(past_kv)
-
-                    outputs = decoder_cls.forward(self, **bound_args.arguments)
-
-                    traceable_tuple = getattr(self.self_attn, "_output_kv_tobe_popped")
-                    delattr(self.self_attn, "_output_kv_tobe_popped")
-                    if any(e is None for tup in traceable_tuple for e in tup):
-                        past_kv = transformers.DynamicCache(config=HF_CONFIG)
-                    else:
-                        past_kv = wrap_cache(traceable_tuple)
-
-                    return outputs
-
-                TraceableDecoderCls = type(
-                    f"Traceable{decoder_cls.__name__}",
-                    (decoder_cls,), 
-                    {"forward": decoder_forward}
-                )
-                module.__class__ = TraceableDecoderCls
 
     def get_plugin_modules(
         self,
@@ -163,7 +138,7 @@ class CausalLMWrapper:
         return suffix2modules
 
     def _observation_hook(self, module: torch.nn.Module, hook_args: Tuple[Any, ...], *args):
-        _module_name = self.MODULE2NAME[module]
+        _module_name = self._module2name[module]
         if len(args) == 2:
             # Layout is: (module, input_args, input_kwargs, output)
             actual_args = hook_args
@@ -176,27 +151,36 @@ class CausalLMWrapper:
         bound_args = sig.bind(*actual_args, **actual_kwargs)
         bound_args.apply_defaults()
         name2val = bound_args.arguments
-        if "_kwargs" in name2val:  # custom forward under `apply_plugin_wrappers`
-            name2val = name2val["_kwargs"]
-            name2val.pop("kwargs")
+        name2val = name2val["_kwargs"] if "_kwargs" in name2val else name2val  # custom forward under `apply_plugin_wrappers`
 
         _module_inputs = set()
         for param_name, value in name2val.items():
             if value is None:
-                _module_inputs.add((param_name, None, None))
+                _module_inputs.add((param_name, (None, None)))
                 continue
-            if isinstance(value, (int, float)):
-                value = torch.tensor(value)
-            if isinstance(value, torch.Tensor):
-                _module_inputs.add((param_name, tuple(value.shape), value.dtype))
-            elif isinstance(value, (list, tuple)) and all(isinstance(x, torch.Tensor) for x in value):
-                _module_inputs.add((param_name, ((tuple(x.shape), x.dtype) for x in value if isinstance(x, torch.Tensor))))
+            if isinstance(value, (int, float, bool)):
+                _module_inputs.add((param_name, (value, type(value))))
+            elif isinstance(value, torch.Tensor):
+                _module_inputs.add((param_name, (tuple(value.shape), value.dtype)))
+            elif isinstance(value, transformers.DynamicCache):
+                layer_idx = module.layer_idx
+                flat_cache, _ = torch.utils._pytree.tree_flatten(value)
+                k = flat_cache[layer_idx*2]
+                v = flat_cache[layer_idx*2+1]
+                _module_inputs.add((param_name, ((k.shape, v.shape), (k.dtype, v.dtype))))
+            else:
+                try:
+                    flat_tensors, spec = torch.utils._pytree.tree_flatten(value)
+                    value = torch.utils._pytree.tree_unflatten(((t.shape, t.dtype) for t in flat_tensors), spec)
+                    _module_inputs.add((param_name, value))
+                except Exception:
+                    raise RuntimeError(f"Unknown `{param_name}={value}` when inspecting the hook at `{module.__class__.__name__}`")
 
-        self.NAME2INPUT[_module_name] = _module_inputs
+        self._plugin_inputs[module.__class__.__name__][_module_name].append(_module_inputs)
 
     def _attach_hooks(self):
         """Attaches the forward hooks to inspect plugin inputs. Capture name, shape and dtype"""
-        self.NAME2INPUT.clear()
+        self._plugin_inputs.clear()
         self._hook_handles = []
         for module in (m for ml in self.get_plugin_modules().values() for m in ml):
             handle = module.register_forward_hook(self._observation_hook, with_kwargs=True)
@@ -231,7 +215,10 @@ def main():
         model_inputs,
         plugin_suffix=("Attention", "RotaryEmbedding")
     )
-    # for layer_path, tensor_meta in list(inspector.NAME2INPUT.items())[:2]:
+    breakpoint()
+    print(model_wrapper.captured_plugin_inputs)
+    # for plugin_suffix, captured_inputs in list(model_wrapper.captured_plugin_inputs.items())[:2]:
+    #     for ci in captured_inputs:
     #     print(f"\n📍 Layer: {layer_path}")
     #     for param, attributes in tensor_meta.items():
     #         print(f"   └── Param: {param:<15} -> Meta: {attributes}")
