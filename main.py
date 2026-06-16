@@ -49,7 +49,7 @@ class CausalLMWrapper:
         self._module2name = {mod: name for name, mod in model.named_modules()}
         
         # Container to store captured input shapes/dtypes
-        self._plugin_inputs: Dict[str, Dict[str, List[Set[tuple]]]] = defaultdict(lambda: defaultdict(list))
+        self._plugin_inputs: Dict[str, Dict[str, List[Dict[str, tuple]]]] = defaultdict(lambda: defaultdict(list))
         
         # Internal storage to manage active hook attachment states
         self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
@@ -61,7 +61,7 @@ class CausalLMWrapper:
         self._detach_hooks()
 
     @property
-    def captured_plugin_inputs(self) -> Dict[str, Dict[str, List[Set[tuple]]]]:
+    def captured_plugin_inputs(self) -> Dict[str, Dict[str, List[Dict[str, tuple]]]]:
         return self._plugin_inputs
 
     def apply_plugin_wrappers(self):
@@ -138,6 +138,9 @@ class CausalLMWrapper:
         return suffix2modules
 
     def _observation_hook(self, module: torch.nn.Module, hook_args: Tuple[Any, ...], *args):
+        def get_dtype(tensor) -> str:
+            return str(tensor.dtype).split(".")[-1]
+
         _module_name = self._module2name[module]
         if len(args) == 2:
             # Layout is: (module, input_args, input_kwargs, output)
@@ -153,26 +156,26 @@ class CausalLMWrapper:
         name2val = bound_args.arguments
         name2val = name2val["_kwargs"] if "_kwargs" in name2val else name2val  # custom forward under `apply_plugin_wrappers`
 
-        _module_inputs = set()
+        _module_inputs = dict()
         for param_name, value in name2val.items():
             if value is None:
-                _module_inputs.add((param_name, (None, None)))
+                _module_inputs[param_name] = (None, None)
                 continue
             if isinstance(value, (int, float, bool)):
-                _module_inputs.add((param_name, (value, type(value))))
+                _module_inputs[param_name] = (value, get_dtype(torch.tensor(value)))
             elif isinstance(value, torch.Tensor):
-                _module_inputs.add((param_name, (tuple(value.shape), value.dtype)))
+                _module_inputs[param_name] = (tuple(value.shape), get_dtype(value))
             elif isinstance(value, transformers.DynamicCache):
                 layer_idx = module.layer_idx
                 flat_cache, _ = torch.utils._pytree.tree_flatten(value)
                 k = flat_cache[layer_idx*2]
                 v = flat_cache[layer_idx*2+1]
-                _module_inputs.add((param_name, ((k.shape, v.shape), (k.dtype, v.dtype))))
+                _module_inputs[param_name] = ((tuple(k.shape), get_dtype(k)), (tuple(v.shape), get_dtype(v)))
             else:
                 try:
                     flat_tensors, spec = torch.utils._pytree.tree_flatten(value)
-                    value = torch.utils._pytree.tree_unflatten(((t.shape, t.dtype) for t in flat_tensors), spec)
-                    _module_inputs.add((param_name, value))
+                    _ = torch.utils._pytree.tree_unflatten(((tuple(t.shape), get_dtype(t)) for t in flat_tensors), spec)
+                    _module_inputs[param_name] = _
                 except Exception:
                     raise RuntimeError(f"Unknown `{param_name}={value}` when inspecting the hook at `{module.__class__.__name__}`")
 
@@ -215,8 +218,10 @@ def main():
         model_inputs,
         plugin_suffix=("Attention", "RotaryEmbedding")
     )
-    breakpoint()
     print(model_wrapper.captured_plugin_inputs)
+    import json
+    with open("data.json", "w", encoding="utf-8") as f:
+        json.dump(model_wrapper.captured_plugin_inputs, f, ensure_ascii=False, indent=4)
     # for plugin_suffix, captured_inputs in list(model_wrapper.captured_plugin_inputs.items())[:2]:
     #     for ci in captured_inputs:
     #     print(f"\n📍 Layer: {layer_path}")
