@@ -1,7 +1,7 @@
-import json
 import transformers
 
 from wrapper import CausalLMWrapper
+
 
 def main():
     model_name = "Qwen/Qwen3-0.6B"
@@ -17,18 +17,31 @@ def main():
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=True  # by default
+        enable_thinking=True,
     )
 
     model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
     model_wrapper = CausalLMWrapper(
-        model, 
+        model,
         model_inputs,
-        plugin_suffix=("Attention", "RotaryEmbedding")
+        plugin_suffix=("Attention", "RotaryEmbedding"),
     )
-    print(model_wrapper.captured_plugin_inputs)
-    with open("data.json", "w", encoding="utf-8") as f:
-        json.dump(model_wrapper.captured_plugin_inputs, f, ensure_ascii=False, indent=4)
+
+    # Prefill: full prompt length
+    # Decode:  single new token (last position), same attention mask length
+    model_wrapper.export_graphs(
+        prefill_inputs={
+            "input_ids": model_inputs["input_ids"],
+            "attention_mask": model_inputs["attention_mask"],
+        },
+        decode_inputs={
+            "input_ids": model_inputs["input_ids"][:, -1:],
+            "attention_mask": model_inputs["attention_mask"],
+        },
+        prefill_path="prefill.onnx",
+        decode_path="decode.onnx",
+    )
 
 
 if __name__ == "__main__":
