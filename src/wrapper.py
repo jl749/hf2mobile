@@ -5,13 +5,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 import transformers
 
-from utils import convert_dtype, FwdSpec, sig2fwdspecs, sig2num_outputs, TensorSpec, ModuleIOSpec
+from utils import register_torchlib_op, convert_dtype, FwdSpec, sig2fwdspecs, sig2num_outputs, TensorSpec, ModuleIOSpec, PluginRegisterInterface
 from utils.constant import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
 from utils.tracing.inspect import _flatten_call_args
 from utils.tracing.register import (
     CUSTOM_ONNX_TRANSLATIONS,
+    
     _ensure_op_registered,
-    _module_fwd_registry,
+    MODULE2FWD_REGISTRY,
 )
 
 
@@ -29,22 +30,44 @@ export_mode: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 # Wrapper class
 # ---------------------------------------------------------------------------
 
-class CausalLMWrapper:
+class CausalLMTracer(PluginRegisterInterface, HookRegisterInterface):
     def __init__(
         self,
         model: transformers.PreTrainedModel,
-        model_inputs: Dict[str, Any],
+        
         plugin_suffix: Sequence[str] = ("Attention", "RotaryEmbedding"),
         **generate_kwargs,
     ):
-        self.model = model
         self.plugin_suffix = plugin_suffix
-
-        self._module2name = {mod: name for name, mod in model.named_modules()}
-        self._hook_handles: List[torch.utils.hooks.RemovableHook] = []
-
         self.plugin_ios: Dict[str, ModuleIOSpec] = {}
 
+        self.model = model
+        self._module2name = {mod: name for name, mod in model.named_modules()}
+        self._id2module = {id(mod): module for mod in model.modules()}
+
+        PluginRegisterInterface.__init__(self)
+        HookRegisterInterface.__init__(self)
+
+
+    def get_plugin_modules(
+        self,
+        *,
+        plugin_suffix: Optional[str | Sequence[str]] = None,
+    ) -> Dict[str, List[torch.nn.Module]] | List[torch.nn.Module]:
+        """Helper method that filters torch modules based on `plugin_suffix` from self.model"""
+        plugin_suffix = plugin_suffix or self.plugin_suffix
+        if isinstance(plugin_suffix, str):
+            plugin_suffix = [plugin_suffix]
+        suffix2modules = {}
+        for suffix in plugin_suffix:
+            suffix2modules[suffix] = [
+                m for m in self.model.modules() if suffix in m.__class__.__name__
+            ]
+        if len(suffix2modules) == 1:
+            return next(iter(suffix2modules.values()))
+        return suffix2modules
+
+    def trace_graph(self, model_inputs: Dict[str, Any]):
         # Phase 1: observe original (unpatched) modules during generation
         self._attach_hooks()
         self.model.generate(**model_inputs, **generate_kwargs)
@@ -52,70 +75,6 @@ class CausalLMWrapper:
 
         # Phase 2: patch modules using captured IO shapes
         self._apply_plugin_wrappers()
-
-    # ------------------------------------------------------------------
-    # Plugin wrappers
-    # ------------------------------------------------------------------
-
-    def _apply_plugin_wrappers(self):
-        name2modules_dict: Dict[str, List[torch.nn.Module]] = self.get_plugin_modules(plugin_suffix=self.plugin_suffix)
-        for suffix, modules in name2modules_dict.items():
-            custom_op_name = f"Custom{suffix}"
-            if not modules:
-                continue  # TODO: logger warning
-            cls_names = set(m.__class__.__name__ for m in modules)
-            if len(cls_names) > 1:
-                raise RuntimeError(
-                    f"More than one class candidate for suffix '{suffix}': {cls_names}"
-                )
-
-            for module in modules:
-                orig_cls = module.__class__
-                _module_name: str = self._module2name[module]
-
-                sig = inspect.signature(orig_cls.forward)
-                fwdspecs: List[FwdSpec] = sig2fwdspecs(sig)
-
-                mode_ops: Dict[str, Any] = {}
-                mode_specs: Dict[str, List[FwdSpec]] = {}
-
-                prefill, decode = self.plugin_ios[f"{orig_cls.__name__}::{_module_name}"].unique_ios()
-                for input_specs, output_specs in (prefill, decode):
-                    # TODO: fwdspecs.resolve_unknown(input_spec)
-                    breakpoint()
-
-                    op_name = _ensure_op_registered(
-                        module=module,
-                        fwdspecs=fwdspecs,
-                        input_spec=input_specs,
-                        output_spec=output_specs,
-                    )
-
-                    # All modes share the same CPU forward (use_cache=False during export)
-                    if id(module) not in _module_fwd_registry:
-                        _module_fwd_registry[id(module)] = self._make_module_fwd(
-                            module=module,
-                            orig_cls=orig_cls,
-                            sig=sig,
-                            fwdspecs=resolved,
-                            num_outputs=_num_outputs,
-                        )
-
-                    mode_ops[mode] = getattr(torch.ops.hf_module2plugin, op_name)
-                    mode_specs[mode] = resolved
-
-                traceable_fwd = self._make_plugin_forward(
-                    module=module,
-                    orig_cls=orig_cls,
-                    sig=sig,
-                    mode_ops=mode_ops,
-                    mode_specs=mode_specs,
-                )
-                module.__class__ = type(
-                    f"Traceable{orig_cls.__name__}",
-                    (orig_cls,),
-                    {"forward": traceable_fwd},
-                )
 
     @staticmethod
     def _make_module_fwd(
@@ -227,73 +186,3 @@ class CausalLMWrapper:
             finally:
                 export_mode.reset(token)
             print(f"ONNX export successful ({mode}): {path}")
-
-    # ------------------------------------------------------------------
-    # Module enumeration
-    # ------------------------------------------------------------------
-
-    def get_plugin_modules(
-        self,
-        *,
-        plugin_suffix: Optional[str | Sequence[str]] = None,
-    ) -> Dict[str, List[torch.nn.Module]] | List[torch.nn.Module]:
-        plugin_suffix = plugin_suffix or self.plugin_suffix
-        if isinstance(plugin_suffix, str):
-            plugin_suffix = [plugin_suffix]
-        suffix2modules = {}
-        for suffix in plugin_suffix:
-            suffix2modules[suffix] = [
-                m for m in self.model.modules() if suffix in m.__class__.__name__
-            ]
-        if len(suffix2modules) == 1:
-            return next(iter(suffix2modules.values()))
-        return suffix2modules
-
-    # ------------------------------------------------------------------
-    # Observation hooks
-    # ------------------------------------------------------------------
-
-    def _input_pre_hook(self, module, hook_args, hook_kwargs):
-        """Pre-hook: capture inputs into _pending_inputs before the forward runs."""
-        _cls_name: str = module.__class__.__name__
-        _module_name: str = self._module2name[module]
-
-        _sig = inspect.signature(module.forward)
-        _bound_args = _sig.bind(*hook_args, **hook_kwargs)
-        _bound_args.apply_defaults()
-        name2val = _bound_args.arguments
-        name2val = name2val | name2val.pop("kwargs", {})
-        assert name2val, f"Empty `{_cls_name}.forward` input"
-
-        obsvd_inputs: INPUT_SPECS_TYPE = {
-            param_name: TensorSpec.from_tensor(value, module=module)
-            for param_name, value in name2val.items()
-        }
-        ms = self.plugin_ios.setdefault(f"{_cls_name}::{_module_name}", ModuleIOSpec(_cls_name, _module_name))
-        ms.input_specs.append(obsvd_inputs)
-
-    def _output_post_hook(self, module, hook_args, hook_kwargs, output):
-        """Post-hook: append this call's output to the class accumulator."""
-        _cls_name: str = module.__class__.__name__
-        _module_name: str = self._module2name[module]
-
-        _ts = TensorSpec.from_tensor(output)
-        obsvd_outputs: OUTPUT_SPECS_TYPE = (_ts,) if isinstance(_ts, TensorSpec) else _ts
-
-        self.plugin_ios[f"{_cls_name}::{_module_name}"].output_specs.append(obsvd_outputs)
-
-    def _attach_hooks(self):
-        self.plugin_ios.clear()
-        self._hook_handles = []
-        for module in (m for ml in self.get_plugin_modules().values() for m in ml):
-            self._hook_handles.append(
-                module.register_forward_pre_hook(self._input_pre_hook, with_kwargs=True)
-            )
-            self._hook_handles.append(
-                module.register_forward_hook(self._output_post_hook, with_kwargs=True)
-            )
-
-    def _detach_hooks(self):
-        for handle in self._hook_handles:
-            handle.remove()
-        self._hook_handles.clear()

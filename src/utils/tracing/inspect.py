@@ -22,11 +22,12 @@ class FwdSpec:
     kind: str
     count: int = 1
 
-    def resolve_unknown(self, input_specs: INPUT_SPECS_TYPE) -> None:
+    def resolve_unknown(self, input_specs: INPUT_SPECS_TYPE) -> "FwdSpec":
         """Resolve unknown FwdSpec using `input_specs` (actual observed tensor)"""
         if self.kind == "unknown":
             input_spec = input_specs.get(self.name, None)
             # TODO: update FwdSpec based on input_specs
+        return self
 
 def fwdspecs2kwargs(fwdspecs: List[FwdSpec], flat: list) -> dict:
     """
