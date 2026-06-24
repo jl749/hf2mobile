@@ -61,6 +61,20 @@ class TensorSpec:
     shape: Tuple[int, ...] | None = None
     scalar: int | float | None = None
 
+    @property
+    def torch_dtype(self) -> torch.dtype | None:
+        if self.dtype:
+            return convert_dtype(self.dtype)
+        return None
+
+    @property
+    def is_scalar(self) -> bool:
+        return not (self.scalar is None)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.dtype is None and self.shape is None and self.scalar is None
+
     @classmethod
     def from_tensor(cls, value: Any, module=None) -> Any:
         """
@@ -112,20 +126,6 @@ class TensorSpec:
                         _flat_leaves[i] = cls(shape=None, dtype=None)
             return torch.utils._pytree.tree_unflatten(_flat_leaves, spec)
 
-    @property
-    def torch_dtype(self) -> torch.dtype | None:
-        if self.dtype:
-            return convert_dtype(self.dtype)
-        return None
-
-    @property
-    def is_scalar(self) -> bool:
-        return not (self.scalar is None)
-
-    @property
-    def is_empty(self) -> bool:
-        return self.dtype is None and self.shape is None and self.scalar is None
-
     def __post_init__(self):
         if self.is_scalar:
             self.shape = ()  # override None
@@ -148,11 +148,7 @@ def _strip_cache_inputs(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _hashable_spec(value: Any) -> Any:
-    """Recursively canonicalize an IO spec value into a hashable form.
-
-    Handles TensorSpec, nested dict/list/tuple containers, scalars, and None.
-    Dicts are sorted by key so insertion order does not affect the hash.
-    """
+    """Recursively canonicalize an IO spec value into a hashable form"""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, TensorSpec):

@@ -82,7 +82,6 @@ class CausalLMWrapper:
                 prefill, decode = self.plugin_ios[f"{orig_cls.__name__}::{_module_name}"].unique_ios()
                 for input_specs, output_specs in (prefill, decode):
                     # TODO: fwdspecs.resolve_unknown(input_spec)
-                    _num_outputs = len(output_spec)
                     breakpoint()
 
                     op_name = _ensure_op_registered(

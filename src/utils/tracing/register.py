@@ -1,15 +1,13 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import onnx_ir
 import torch
 from torch.onnx._internal.exporter import _core as _onnx_core
 
-from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
+from .tensor_metadata import TensorSpec, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
 from .inspect import FwdSpec, fwdspecs2kwargs
-from utils.constant import CUSTOM_LIB_NAME
+from utils.constant import CUSTOM_LIB_NAME, CUSTOM_LIB, ONNX_DOMAIN_NAME
 
-
-_custom_lib = torch.library.Library(CUSTOM_LIB_NAME, "DEF")
 
 # op_name -> (fwdspecs, num_outputs)
 _registered_ops: Dict[str, Tuple[List[FwdSpec], int]] = {}
@@ -21,70 +19,92 @@ _module_fwd_registry: Dict[int, Any] = {}
 CUSTOM_ONNX_TRANSLATIONS: Dict[Any, Any] = {}
 
 
-def _schema_str(op_name: str, fwdspecs: List[FwdSpec], num_outputs: int) -> str:
-    parts = ["int module_id"]
-    for s in fwdspecs:
-        if s.kind == "tensor":
-            parts.append(f"Tensor {s.name}")
-        elif s.kind == "optional_tensor":
-            parts.append(f"Tensor? {s.name}")
-        elif s.kind == "tuple_tensor":
-            for i in range(s.count):
-                parts.append(f"Tensor {s.name}_{i}")
-    ret = "Tensor" if num_outputs == 1 else f"({', '.join('Tensor' for _ in range(num_outputs))})"
-    return f"{op_name}({', '.join(parts)}) -> {ret}"
+
+
+
+def _input_seq_len(input_spec: INPUT_SPECS_TYPE) -> int:
+    """Query length from an input dict — used to discriminate prefill vs decode."""
+    pid = input_spec.get("position_ids")
+    if isinstance(pid, TensorSpec) and pid.shape and len(pid.shape) >= 2:
+        return pid.shape[1]
+    for spec in input_spec.values():
+        if isinstance(spec, TensorSpec) and spec.shape and len(spec.shape) >= 2:
+            return spec.shape[1]
+    return 0
 
 
 def _ensure_op_registered(
     module: torch.nn.Module,
     fwdspecs: List[FwdSpec],
-    input_specs: INPUT_SPECS_TYPE,
-    output_specs: OUTPUT_SPECS_TYPE,
+    input_spec: INPUT_SPECS_TYPE,
+    output_spec: OUTPUT_SPECS_TYPE,
 ) -> str:
-    """Register a torch.library op for (cls_name, mode) if not already done.
+    """Register a torch.library op for a (cls_name, query_seq_len) pair.
 
-    op_name is ``{cls_name}_fwd_{mode}`` so prefill and decode get separate ops
-    with separate abstract impls (and therefore correct static output shapes).
-    Returns op_name.
+    The op name is ``{cls_name}_fwd_q{seq_len}`` so prefill (seq_len > 1) and
+    decode (seq_len == 1) get separate ops, each with its own abstract impl and
+    therefore correct static output shapes.  All module instances of the same
+    class share the registered op — dispatch happens via the leading
+    ``module_id`` argument at call time.
+
+    Args:
+        module: module instance — only its ``__class__.__name__`` is used here.
+        fwdspecs: forward-signature metadata (name / kind / count per parameter).
+                  Does not carry shape or dtype — those come from `input_spec`
+                  and `output_spec`.
+        input_spec: per-call input dict ({param_name: TensorSpec | nested}).
+                    Used to compute the query seq_len for op naming.
+        output_spec: per-call output structure, possibly nested e.g.
+                     ``(TensorSpec, [TensorSpec, TensorSpec])``.  Recursively
+                     flattened to drive both num_outputs and per-output
+                     shape/dtype in the abstract impl.
+    Returns:
+        op_name
     """
-    op_name = f"{module.__class__.__name__}_fwd_{mode}"
+    cls_name = module.__class__.__name__
+    # seq_len = _input_seq_len(input_spec)
+    op_name = f"{cls_name}_fwd"
     if op_name in _registered_ops:
         return op_name
-    custom_op_name = f"{module.__class__.__name__}Plugin"
-    num_outputs = len(output_spec)
+    custom_op_name = f"{cls_name}Plugin"
 
+    _leaves, _ = torch.utils._pytree.tree_flatten(output_spec)
+    flat_os = [v for v in _leaves if isinstance(v, TensorSpec) and not v.is_empty]
+    num_outputs = len(flat_os)
+    assert num_outputs > 0, f"`output_spec` passed is empty. Please check what `ModuleIOSpec.unique_ios` returns."
+
+    def _schema_str(op_name: str, fwdspecs: List[FwdSpec], num_outputs: int) -> str:
+        parts = ["int module_id"]
+        for s in fwdspecs:
+            if s.kind == "tensor":
+                parts.append(f"Tensor {s.name}")
+            elif s.kind == "optional_tensor":
+                parts.append(f"Tensor? {s.name}")
+            elif s.kind == "tuple_tensor":
+                for i in range(s.count):
+                    parts.append(f"Tensor {s.name}_{i}")
+        ret = "Tensor" if num_outputs == 1 else f"({', '.join('Tensor' for _ in range(num_outputs))})"
+        return f"{op_name}({', '.join(parts)}) -> {ret}"
     schema = _schema_str(op_name, fwdspecs, num_outputs)
-    _custom_lib.define(schema)
+    CUSTOM_LIB.define(schema)
 
-    _ps = fwdspecs
-    _no = num_outputs
-    _out_specs = output_specs  # List[(shape, dtype)] or None
-
-    @torch.library.impl(_custom_lib, op_name, "CPU")
+    @torch.library.impl(CUSTOM_LIB, op_name, "CPU")
     def _cpu_impl(module_id, *flat_tensors):
         fwd = _module_fwd_registry[module_id]
-        kwargs = myparamlist2kwargs(_ps, list(flat_tensors))
+        kwargs = fwdspecs2kwargs(fwdspecs, list(flat_tensors))
         return fwd(**kwargs)
 
     @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{op_name}")
     def _abstract_impl(module_id, *flat_tensors):
         device = next(t for t in flat_tensors if t is not None).device
-        if _out_specs:
-            outs = tuple(torch.empty(shape, dtype=dtype, device=device)
-                         for shape, dtype in _out_specs)
-        else:
-            first = next(t for t in flat_tensors if t is not None)
-            outs = tuple(torch.empty_like(first) for _ in range(_no))
-        return outs[0] if _no == 1 else outs
-
-    _ot = custom_op_name
-    _no2 = num_outputs
+        outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flat_os)
+        return outs
 
     def _onnx_translation(module_id, *flat_tensors):
         inputs = [t for t in flat_tensors if t is not None]
-        node = onnx_ir.Node("com.jerry", _ot, inputs, num_outputs=_no2)
+        node = onnx_ir.Node(ONNX_DOMAIN_NAME, custom_op_name, inputs, num_outputs=num_outputs)
         _onnx_core.current_tracer.nodes.append(node)
-        return node.outputs[0] if _no2 == 1 else tuple(node.outputs)
+        return node.outputs[0] if num_outputs == 1 else tuple(node.outputs)
 
     op_overload = getattr(getattr(torch.ops.hf_module2plugin, op_name), "default")
     CUSTOM_ONNX_TRANSLATIONS[op_overload] = _onnx_translation
