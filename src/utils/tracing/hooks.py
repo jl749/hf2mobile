@@ -1,15 +1,18 @@
-
-
+import inspect
 from abc import ABC
+from typing import Dict, List
 
-from utils.py_helper import check_field
+import torch
+
+from utils.py_helper import check_parent_field
+from .tensor_metadata import TensorSpec, ModuleIOSpec, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
 
 
 class HookRegisterInterface(ABC):
     def __init__(self):
         self.plugin_ios: Dict[str, ModuleIOSpec] = {}
         self._hook_handles: List[torch.utils.hooks.RemovableHook] = []
-        check_field(self, "_module2name")
+        check_parent_field(self, "_module2name")
 
     def _input_pre_hook(self, module, hook_args, hook_kwargs):
         """Pre-hook: capture inputs into _pending_inputs before the forward runs."""
@@ -27,7 +30,10 @@ class HookRegisterInterface(ABC):
             param_name: TensorSpec.from_tensor(value, module=module)
             for param_name, value in name2val.items()
         }
-        ms = self.plugin_ios.setdefault(f"{_cls_name}::{_module_name}", ModuleIOSpec(_cls_name, _module_name))
+        ms = self.plugin_ios.setdefault(
+            f"{_cls_name}::{_module_name}",
+            ModuleIOSpec(_cls_name, _module_name),
+        )
         ms.input_specs.append(obsvd_inputs)
 
     def _output_post_hook(self, module, hook_args, hook_kwargs, output):
@@ -43,7 +49,12 @@ class HookRegisterInterface(ABC):
     def _attach_hooks(self):
         self.plugin_ios.clear()
         self._hook_handles = []
-        for module in (m for ml in self.get_plugin_modules().values() for m in ml):
+        suffix2modules = self.get_plugin_modules()
+        if isinstance(suffix2modules, list):
+            iter_modules = suffix2modules
+        else:
+            iter_modules = (m for ml in suffix2modules.values() for m in ml)
+        for module in iter_modules:
             self._hook_handles.append(
                 module.register_forward_pre_hook(self._input_pre_hook, with_kwargs=True)
             )
@@ -55,3 +66,6 @@ class HookRegisterInterface(ABC):
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+
+
+__all__ = ["HookRegisterInterface"]

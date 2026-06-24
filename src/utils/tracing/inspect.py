@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from utils.tracing.tensor_metadata import INPUT_SPECS_TYPE
+from utils.tracing.tensor_metadata import TensorSpec, INPUT_SPECS_TYPE
 
 
 @dataclass
@@ -23,10 +23,28 @@ class FwdSpec:
     count: int = 1
 
     def resolve_unknown(self, input_specs: INPUT_SPECS_TYPE) -> "FwdSpec":
-        """Resolve unknown FwdSpec using `input_specs` (actual observed tensor)"""
-        if self.kind == "unknown":
-            input_spec = input_specs.get(self.name, None)
-            # TODO: update FwdSpec based on input_specs
+        """Resolve a 'unknown' kind by classifying the actual observed value.
+
+        - missing or None            → optional_tensor (count=1)
+        - empty TensorSpec           → optional_tensor (count=1)
+        - non-empty TensorSpec       → tensor (count=1)
+        - non-empty (list/tuple of TensorSpec) → tuple_tensor (count=len(non-empty))
+        Anything else is left unchanged (caller still sees kind='unknown').
+        """
+        if self.kind != "unknown":
+            return self
+        val = input_specs.get(self.name)
+        if val is None:
+            return FwdSpec(name=self.name, kind="optional_tensor", count=1)
+        if isinstance(val, TensorSpec):
+            if val.is_empty:
+                return FwdSpec(name=self.name, kind="optional_tensor", count=1)
+            return FwdSpec(name=self.name, kind="tensor", count=1)
+        if isinstance(val, (list, tuple)):
+            non_empty = [v for v in val if isinstance(v, TensorSpec) and not v.is_empty]
+            if non_empty:
+                return FwdSpec(name=self.name, kind="tuple_tensor", count=len(non_empty))
+            return FwdSpec(name=self.name, kind="optional_tensor", count=1)
         return self
 
 def fwdspecs2kwargs(fwdspecs: List[FwdSpec], flat: list) -> dict:
