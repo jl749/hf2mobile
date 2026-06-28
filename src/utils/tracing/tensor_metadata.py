@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 import transformers
 
-from utils.constant import _CACHE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
+from constant import KV_CACHE_PARAM_NAME, _NON_HASHABLE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
 
 
 _STR_TO_DTYPE = {
@@ -51,11 +51,13 @@ def convert_dtype(inp: Union[torch.Tensor, torch.dtype, str]) -> Union[str, torc
 @dataclass
 class TensorSpec:
     """
-    Dataclass storing each param info observed from the fwd hook
+    Dataclass storing each param info observed from the forward hook
     Args:
         dtype: observed tensor dtype in normalized string (see `_STR_TO_DTYPE`)
         shape: observed tensor shape
         scalar: in case the observed value is a scalar
+    Example:
+        >> TensorSpec.from_tensor(value={...IO_param_from_hook...})
     """
     dtype: str | None
     shape: Tuple[int, ...] | None = None
@@ -87,7 +89,7 @@ class TensorSpec:
             - value is python obj (list, tuple, dict, ... etc)
         Args:
             value: value passed to the fwd call (fetched by the torch hook)
-            module: (optional) used for metadata in order to encode value to TensorSpec
+            module: (optional) sometimes metadata is required in order to encode value to TensorSpec
         Returns:
             `TensorSpec` or `TensorSpec` wrapped around python obj
         """
@@ -142,32 +144,6 @@ class TensorSpec:
                 raise ValueError("`TensorSpec` does not allow partially initialized form. Please specify both `shape` and `dtype`.")
         
 
-def _strip_cache_inputs(specs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Drop cache-only keys (e.g., past_key_values) from each captured input dict."""
-    return [{k: v for k, v in s.items() if k not in _CACHE_PARAMS} for s in specs]
-
-
-def _hashable_spec(value: Any) -> Any:
-    """Recursively canonicalize an IO spec value into a hashable form"""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, TensorSpec):
-        shape = value.shape if value.shape is not None else None
-        return ("TensorSpec", value.dtype, shape, value.scalar)
-    if isinstance(value, dict):
-        return tuple(sorted(
-            ((k, _hashable_spec(v)) for k, v in value.items()),
-            key=lambda kv: kv[0],
-        ))
-    if isinstance(value, (list, tuple)):
-        return tuple(_hashable_spec(v) for v in value)
-    try:
-        hash(value)
-        return value
-    except TypeError:
-        return repr(value)
-
-
 @dataclass
 class ModuleIOSpec:
     """
@@ -175,51 +151,124 @@ class ModuleIOSpec:
     Args:
         cls_name: torch.nn.Module class name
         module_name: torch module name
-        input_specs: collected input specs
-        output_specs: collected output specs
+        obsvd_input_specs: collected input specs during the trace
+        obsvd_output_specs: collected output specs during the trace
     """
     cls_name: str
     module_name: str
-    input_specs: List[INPUT_SPECS_TYPE] = None
-    output_specs: List[OUTPUT_SPECS_TYPE] = None
+    obsvd_input_specs: List[INPUT_SPECS_TYPE] = None
+    obsvd_output_specs: List[OUTPUT_SPECS_TYPE] = None
 
-    def _key(self) -> Tuple[Any, ...]:
+    @staticmethod
+    def flatten_io_specs(specs: INPUT_SPECS_TYPE | OUTPUT_SPECS_TYPE, skip_empty=False) -> Tuple[List[TensorSpec], torch.utils._pytree.TreeSpec]:
+        if skip_empty:
+            def filter_empty_specs(node):
+                """Recursively removes empty specs from dicts, lists, and tuples."""
+                if isinstance(node, dict):
+                    return {
+                        k: filter_empty_specs(v) 
+                        for k, v in node.items() 
+                        if not (hasattr(v, 'is_empty') and v.is_empty)
+                    }
+                elif isinstance(node, (list, tuple)):
+                    return type(node)([
+                        filter_empty_specs(v) 
+                        for v in node 
+                        if not (hasattr(v, 'is_empty') and v.is_empty)
+                    ])
+                return node
+            specs = filter_empty_specs(specs)
+        try:
+            leaves, _tree_spec = torch.utils._pytree.tree_flatten(specs)
+            flatten_specs = [v for v in leaves]
+        except:
+            raise ValueError(f"`{specs=}` cannot be flattened with pytree")
+        assert all(isinstance(v, TensorSpec) for v in flatten_specs), f"Non TensorSpec object inside {specs=}"
+        return flatten_specs, _tree_spec
+
+    @staticmethod
+    def _get_hashable_obsvd_specs(obsvd_specs: List[INPUT_SPECS_TYPE] | List[OUTPUT_SPECS_TYPE]) -> tuple:
+        hashable_obj = []
+        for specs in obsvd_specs:
+            flatten_specs, _ = ModuleIOSpec.flatten_io_specs(specs, skip_empty=False)
+            hashable_obj.append(tuple(("TensorSpec", ts.dtype, ts.shape, ts.scalar) for ts in flatten_specs))
+        return tuple(hashable_obj)
+
+    @property
+    def unique_obsvd_input_specs(self) -> List[INPUT_SPECS_TYPE]:
+        """Some input param names are ignored when considering the uniquness of the module IO (e.g. past_key_values)"""
+        return [{k: v for k, v in s.items() if k not in _NON_HASHABLE_PARAMS} for s in self.obsvd_input_specs]
+
+    @property
+    def hashable_obsvd_input_specs(self):
+        return self._get_hashable_obsvd_specs(self.obsvd_input_specs),
+
+    @property
+    def hashable_obsvd_output_specs(self):
+        return self._get_hashable_obsvd_specs(self.obsvd_output_specs),
+
+    def _unique_key(self) -> Tuple[Any, ...]:
         """Canonical comparable key — shared by __hash__ and __eq__."""
         return (
             self.cls_name,
-            _hashable_spec(_strip_cache_inputs(self.input_specs)),
-            _hashable_spec(self.output_specs),
+            self.module_name,
+            self.hashable_obsvd_input_specs,
+            self.hashable_obsvd_output_specs,
         )
 
     def __hash__(self) -> int:
-        return hash(self._key())
+        return hash(self._unique_key())
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, ModuleIOSpec):
             return NotImplemented
-        return self._key() == other._key()
+        return self._unique_key() == other._unique_key()
 
     def __post_init__(self):
-        self.input_specs = self.input_specs or []
-        self.output_specs = self.output_specs or []
+        self.obsvd_input_specs = self.obsvd_input_specs or []
+        self.obsvd_output_specs = self.obsvd_output_specs or []
 
     def unique_ios(self) -> Tuple[Tuple[INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE], ...]:
-        """Return unique (input_spec, output_spec) pairs sorted by query seq_len desc."""
-        def _drop_empty_dict(d):
-            return {k: v for k, v in d.items() if not (isinstance(v, TensorSpec) and v.is_empty)}
-        def _drop_empty_tuple(t):
-            return tuple(v for v in t if not (isinstance(v, TensorSpec) and v.is_empty))
+        """
+        Return unique (input_specs, output_specs) pairs
+        When considering the uniqness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
+        Output tuple will always return the metadata pairs in observation order
+        e.g. 
+            when `generate` is called on the transformers CausalLM models
+            prefill runs first taking index 0 for both `obsvd_input_specs` and `obsvd_output_specs`
+            this means `unique_ios` returned tuple also contains 
+            prefill profile at idx 0 and generation profile at idx 1
+        """
+        unique_io_paris = []
         _seen = set()
-        out: List[Tuple[INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE]] = []
-        for inp, outp in zip(self.input_specs, self.output_specs):
-            inp = _drop_empty_dict(inp)
-            outp = _drop_empty_tuple(outp)
-            inp_filtered = {k: v for k, v in inp.items() if k not in _CACHE_PARAMS}
-            _key = (_hashable_spec(inp_filtered), _hashable_spec(outp))
-            if _key not in _seen:
+        for input_specs, output_specs in zip(self.obsvd_input_specs, self.obsvd_output_specs):
+            flat_i_specs, i_tree = self.flatten_io_specs(specs=input_specs, skip_empty=True)
+            flat_o_specs, o_tree = self.flatten_io_specs(specs=output_specs, skip_empty=True)
+            input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(flat_i_specs, i_tree)
+            output_specs: OUTPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(flat_o_specs, o_tree)
+            _key = (*self._get_hashable_obsvd_specs([input_specs]), *self._get_hashable_obsvd_specs([output_specs]))
+            if _key in _seen:
+                continue
+            else:
                 _seen.add(_key)
-                out.append((inp, outp))
-        return tuple(out)
+                unique_io_paris.append((input_specs, output_specs))
+        return tuple(unique_io_paris)
 
 
-__all__ = ["convert_dtype", "TensorSpec", "ModuleIOSpec"] 
+def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[TensorSpec, TensorSpec] | Tuple[()]:
+    """Search `KV_CACHE_PARAM_NAME` from the provided `input_specs` and return the K,V TensorSpec pair in len=2 tuple"""
+    spec = input_specs.get(KV_CACHE_PARAM_NAME, None)
+    if spec:
+        if isinstance(spec, TensorSpec) and spec.is_empty:
+            return ()
+        try:
+            k_spec, v_spec = spec
+        except:
+            raise ValueError(f"Expecting tuple of k and v `TensorSpec`s... `{spec=}`")
+        return k_spec, v_spec
+    else:
+        return ()
+
+
+
+__all__ = ["convert_dtype", "TensorSpec", "ModuleIOSpec", "get_kv_specs_from_input_specs"] 

@@ -57,13 +57,17 @@ def main():
     tracer = CausalLMTracer(
         model,
         plugin_suffix=("Attention", "RotaryEmbedding"),
+        # plugin_suffix=("RotaryEmbedding"),
+    )
+    tracer.trace_graph(
+        model_inputs={
+            "input_ids": model_inputs["input_ids"],
+            "attention_mask": model_inputs["attention_mask"]
+        },
         max_new_tokens=2,
         do_sample=False,
     )
-    tracer.trace_graph(model_inputs={
-        "input_ids": model_inputs["input_ids"],
-        "attention_mask": model_inputs["attention_mask"],
-    })
+    return  # TODO: remove
 
     # Build a populated KV cache by running one prefill pass through the (now
     # patched-but-pass-through) model; we need it for case-1 (decode) export.

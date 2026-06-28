@@ -22,34 +22,46 @@ class FwdSpec:
     kind: str
     count: int = 1
 
-    def resolve_unknown(self, input_specs: INPUT_SPECS_TYPE) -> "FwdSpec":
-        """Resolve a 'unknown' kind by classifying the actual observed value.
 
-        - missing or None            → optional_tensor (count=1)
-        - empty TensorSpec           → optional_tensor (count=1)
-        - non-empty TensorSpec       → tensor (count=1)
-        - non-empty (list/tuple of TensorSpec) → tuple_tensor (count=len(non-empty))
-        Anything else is left unchanged (caller still sees kind='unknown').
-        """
-        if self.kind != "unknown":
-            return self
-        val = input_specs.get(self.name)
-        if val is None:
-            return FwdSpec(name=self.name, kind="optional_tensor", count=1)
-        if isinstance(val, TensorSpec):
-            if val.is_empty:
-                return FwdSpec(name=self.name, kind="optional_tensor", count=1)
-            return FwdSpec(name=self.name, kind="tensor", count=1)
-        if isinstance(val, (list, tuple)):
-            non_empty = [v for v in val if isinstance(v, TensorSpec) and not v.is_empty]
-            if non_empty:
-                return FwdSpec(name=self.name, kind="tuple_tensor", count=len(non_empty))
-            return FwdSpec(name=self.name, kind="optional_tensor", count=1)
-        return self
+def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPECS_TYPE) -> List[FwdSpec]:
+    """
+    Initial `fwd_specs` only contains type hint inferred parameter info. It is not aware of the actual input values.
+    We create a new `fwd_specs` based on the `input_specs` variable which represents the actual inference input metadata.
+        - update the "unknown" `FwdSpec` kinds by inspecting the input `TensorSpec`s
+        - drop the unused params from `fwd_specs` based on `input_specs` observation
+    Args:
+        fwd_specs: list of the `FwdSpec`s collected by inspecting the forward signatures
+        input_specs: list of the `TensorSpec`s containing the input activation info
+    Returns:
+        new `fwd_specs` now covering the specific `input_specs` case
+    """
+    updated_fwdspecs: List[FwdSpec] = []
+    for fs in fwd_specs:
+        spec = input_specs.get(fs.name, None)
+        if spec is None:
+            continue  # mismatch between `fwd_specs` and `input_specs` -> SKIP
+        if fs.kind == "unknown":
+            if isinstance(spec, TensorSpec):
+                if spec.is_empty:
+                    f_spec = FwdSpec(name=fs.name, kind="optional_tensor", count=1)
+                else:
+                    f_spec = FwdSpec(name=fs.name, kind="tensor", count=1)
+            else:
+                leaves, _ = torch.utils._pytree.tree_flatten(spec)
+                flat_specs = [ts for ts in leaves if isinstance(ts, TensorSpec) and not ts.is_empty]
+                if len(flat_specs) == 0:
+                    f_spec = FwdSpec(name=fs.name, kind="optional_tensor", count=1)
+                else:
+                    f_spec = FwdSpec(name=fs.name, kind="tuple_tensor", count=len(flat_specs))
+            updated_fwdspecs.append(f_spec)
+        else:
+            updated_fwdspecs.append(FwdSpec(name=fs.name, kind=fs.kind, count=fs.count))
+    return updated_fwdspecs
+
 
 def fwdspecs2kwargs(fwdspecs: List[FwdSpec], flat: list) -> dict:
     """
-    Reconstruct a kwargs dict from the flat op input list (inverse of _flatten_call_args).
+    Reconstruct a kwargs dict from the flat op input list
     Args:
         fwdspecs: list of FwdSpec representing function input sig
         flat: function inputs in args format
@@ -67,8 +79,8 @@ def fwdspecs2kwargs(fwdspecs: List[FwdSpec], flat: list) -> dict:
             idx += fs.count
     return kwargs
 
-# TODO: change name to fwdspecs2args
-def _flatten_call_args(fwdspecs: List[FwdSpec], bound_args: dict) -> list:
+
+def fwdspecs2args(fwdspecs: List[FwdSpec], bound_args: dict) -> list:
     """Expand bound_args into a flat list matching the op schema."""
     flat = []
     for fs in fwdspecs:
@@ -113,7 +125,7 @@ def _classify_ann(ann: type | Any) -> tuple | None:
 
 def sig2fwdspecs(sig: inspect.Signature) -> List[FwdSpec]:
     """Based on the passed signature build `List[FwdSpec]`"""
-    specs = []
+    full_fwdspecs = []
     for name, param in sig.parameters.items():
         if (name == "self") or (param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)):
             # skip self, *args, **kwargs
@@ -123,25 +135,18 @@ def sig2fwdspecs(sig: inspect.Signature) -> List[FwdSpec]:
 
         # NOTE: type hint does not exist
         if ann is inspect.Parameter.empty:
-            specs.append(FwdSpec(name=name, kind="unknown"))
+            full_fwdspecs.append(FwdSpec(name=name, kind="unknown"))
             continue
 
-        classified_ann: tuple | None= _classify_ann(ann)
+        classified_ann: tuple | None = _classify_ann(ann)
 
-        # NOTE: type hint with elipsis e.g. Tuple[Tensor, ...]
+        # NOTE: _classify_ann failed (`Tuple[Tensor, ...]`, `Optional[Cache]`, ...)
+        #   keep if "unknown" for now. fix it with `FwdSpec.resolve_unknown` later
         if classified_ann is None:
-            _inner_args = typing.get_args(ann)
-            if (
-                typing.get_origin(ann) is tuple
-                and len(_inner_args) == 2
-                and _inner_args[1] is Ellipsis
-                and isinstance(_inner_args[0], type)
-                and issubclass(_inner_args[0], torch.Tensor)
-            ):
-                specs.append(FwdSpec(name=name, kind="unknown"))
+            full_fwdspecs.append(FwdSpec(name=name, kind="unknown"))
             continue
-        specs.append(FwdSpec(name=name, kind=classified_ann[0], count=classified_ann[1]))
-    return specs
+        full_fwdspecs.append(FwdSpec(name=name, kind=classified_ann[0], count=classified_ann[1]))
+    return full_fwdspecs
 
 
 def sig2num_outputs(sig: inspect.Signature) -> int:
@@ -158,4 +163,4 @@ def sig2num_outputs(sig: inspect.Signature) -> int:
     return 1
 
 
-__all__ = ["FwdSpec", "fwdspecs2kwargs", "_flatten_call_args", "sig2fwdspecs", "sig2num_outputs"]
+__all__ = ["FwdSpec", "apply_input_specs2fwd_specs", "fwdspecs2kwargs", "fwdspecs2args", "sig2fwdspecs", "sig2num_outputs"]

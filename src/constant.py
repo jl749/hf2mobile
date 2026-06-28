@@ -7,6 +7,7 @@ CUSTOM_LIB = torch.library.Library(CUSTOM_LIB_NAME, "DEF")
 ONNX_DOMAIN_NAME = "com.jerry"
 
 # tensor_metadata.py
-_CACHE_PARAMS: frozenset = frozenset({"past_key_values"})
+KV_CACHE_PARAM_NAME = "past_key_values"
+_NON_HASHABLE_PARAMS: frozenset = frozenset({KV_CACHE_PARAM_NAME,})
 INPUT_SPECS_TYPE = Dict[str, "TensorSpec | Any"]
 OUTPUT_SPECS_TYPE = Tuple[Any, ...]
