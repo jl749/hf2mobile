@@ -12,8 +12,8 @@ from torch.onnx._internal.exporter import _core as _onnx_core
 
 from .tensor_metadata import TensorSpec, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, get_kv_specs_from_input_specs
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, sig2fwdspecs, fwdspecs2args
-from constant import CUSTOM_LIB_NAME, CUSTOM_LIB, ONNX_DOMAIN_NAME, KV_CACHE_PARAM_NAME
-from utils.py_helper import check_parent_field
+from hf2hw.constant import CUSTOM_LIB_NAME, CUSTOM_LIB, ONNX_DOMAIN_NAME, KV_CACHE_PARAM_NAME
+from hf2hw.utils.py_helper import check_parent_field
 
 
 
@@ -131,6 +131,7 @@ def _make_plugin_forward(
         else:
             cache_param_name = None
 
+        breakpoint()  # TODO: fwdspecs2kwargs instead?
         flat = fwdspecs2args(case_fwd_specs, bound_args)
         result = op(id(self_module), *flat)
 

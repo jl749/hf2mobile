@@ -1,8 +1,7 @@
 import torch
 import transformers
-from transformers.cache_utils import DynamicCache
 
-from wrapper import CausalLMTracer
+from hf2hw import CausalLMExporter
 
 
 def main():
@@ -23,12 +22,12 @@ def main():
 
     # Phase 1 + 2: observe a short generation to capture per-case IO profiles,
     # then patch the plugin modules' forward in place.
-    tracer = CausalLMTracer(
+    tracer = CausalLMExporter(
         model,
         plugin_suffix=("Attention", "RotaryEmbedding"),
         # plugin_suffix=("RotaryEmbedding"),
     )
-    tracer.trace_graph(
+    tracer.trace_plugin_io(
         model_inputs={
             "input_ids": model_inputs["input_ids"],
             "attention_mask": model_inputs["attention_mask"]

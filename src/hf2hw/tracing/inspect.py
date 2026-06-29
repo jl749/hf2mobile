@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from utils.tracing.tensor_metadata import TensorSpec, INPUT_SPECS_TYPE
+from .tensor_metadata import TensorSpec, INPUT_SPECS_TYPE
 
 
 @dataclass
@@ -80,11 +80,11 @@ def fwdspecs2kwargs(fwd_specs: List[FwdSpec], flat: list) -> dict:
     return kwargs
 
 
-def fwdspecs2args(fwd_specs: List[FwdSpec], bound_args: dict) -> list:
-    """Expand bound_args into a flat list matching the op schema."""
+def fwdspecs2args(fwd_specs: List[FwdSpec], input_dict: dict) -> list:
+    """Flatten `input_dict` in a way that it respects `FwdSpec.kind`"""
     flat = []
     for fs in fwd_specs:
-        value = bound_args.get(fs.name)
+        value = input_dict.get(fs.name, None)
         if fs.kind in ("tensor", "optional_tensor"):
             flat.append(value)
         elif fs.kind == "tuple_tensor":
@@ -149,6 +149,7 @@ def sig2fwdspecs(sig: inspect.Signature) -> List[FwdSpec]:
 
 
 def sig2num_outputs(sig: inspect.Signature) -> int:
+    """Inspect number of the outputs from `sig.return_annotation`"""
     ret = sig.return_annotation
     if ret is inspect.Parameter.empty:
         return 1

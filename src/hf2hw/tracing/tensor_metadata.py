@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 import transformers
 
-from constant import KV_CACHE_PARAM_NAME, _NON_HASHABLE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
+from hf2hw.constant import KV_CACHE_PARAM_NAME, _NON_HASHABLE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
 
 
 _STR_TO_DTYPE = {
