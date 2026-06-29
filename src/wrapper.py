@@ -5,9 +5,9 @@ import transformers
 from transformers.cache_utils import DynamicCache
 
 from utils import ModuleIOSpec, PluginRegisterInterface
-from utils.constant import _NON_HASHABLE_PARAMS
+from constant import _NON_HASHABLE_PARAMS
 from utils.tracing.hooks import HookRegisterInterface
-from utils.tracing.register import export_case
+from utils.tracing.register import export_case, register_dynamic_cache_pytree
 
 
 class _DecodeWrapper(torch.nn.Module):
@@ -75,6 +75,8 @@ class CausalLMTracer(PluginRegisterInterface, HookRegisterInterface):
         return suffix2modules
 
     def trace_graph(self, model_inputs: Dict[str, Any], **generate_kwargs):
+        register_dynamic_cache_pytree()
+
         # Phase 1: observe original (unpatched) modules during generation
         self._attach_hooks()
         self.model.generate(**model_inputs, **generate_kwargs)
@@ -119,6 +121,7 @@ class CausalLMTracer(PluginRegisterInterface, HookRegisterInterface):
                     opset_version=opset_version,
                     custom_translation_table=self.custom_onnx_translation,
                 )
+                breakpoint()
             finally:
                 export_case.reset(token)
             print(f"ONNX export successful (case {i + 1}): {path}")

@@ -1,39 +1,8 @@
 import torch
-import torch.utils._pytree as pytree
 import transformers
 from transformers.cache_utils import DynamicCache
 
 from wrapper import CausalLMTracer
-
-
-# Make DynamicCache a pytree leaf-container so torch.export accepts it as input.
-def _flatten_dynamic_cache(cache):
-    leaves = []
-    for layer in cache.layers:
-        leaves.append(layer.keys)
-        leaves.append(layer.values)
-    return leaves, len(cache.layers)
-
-
-def _unflatten_dynamic_cache(values, num_layers):
-    ddp_data = [(values[2 * i], values[2 * i + 1]) for i in range(num_layers)]
-    return DynamicCache(ddp_cache_data=ddp_data)
-
-
-def _flatten_with_keys_dynamic_cache(cache):
-    leaves = []
-    for li, layer in enumerate(cache.layers):
-        leaves.append((pytree.SequenceKey(2 * li), layer.keys))
-        leaves.append((pytree.SequenceKey(2 * li + 1), layer.values))
-    return leaves, len(cache.layers)
-
-
-pytree.register_pytree_node(
-    DynamicCache,
-    _flatten_dynamic_cache,
-    _unflatten_dynamic_cache,
-    flatten_with_keys_fn=_flatten_with_keys_dynamic_cache,
-)
 
 
 def main():
@@ -67,7 +36,6 @@ def main():
         max_new_tokens=2,
         do_sample=False,
     )
-    return  # TODO: remove
 
     # Build a populated KV cache by running one prefill pass through the (now
     # patched-but-pass-through) model; we need it for case-1 (decode) export.
@@ -105,6 +73,7 @@ def main():
     ]
 
     tracer.export_graphs(case_inputs=case_inputs, path_template="case{i}.onnx")
+    breakpoint()
 
 
 if __name__ == "__main__":

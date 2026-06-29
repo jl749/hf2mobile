@@ -35,7 +35,7 @@ def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPE
     Returns:
         new `fwd_specs` now covering the specific `input_specs` case
     """
-    updated_fwdspecs: List[FwdSpec] = []
+    updated_fwd_specs: List[FwdSpec] = []
     for fs in fwd_specs:
         spec = input_specs.get(fs.name, None)
         if spec is None:
@@ -53,24 +53,24 @@ def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPE
                     f_spec = FwdSpec(name=fs.name, kind="optional_tensor", count=1)
                 else:
                     f_spec = FwdSpec(name=fs.name, kind="tuple_tensor", count=len(flat_specs))
-            updated_fwdspecs.append(f_spec)
+            updated_fwd_specs.append(f_spec)
         else:
-            updated_fwdspecs.append(FwdSpec(name=fs.name, kind=fs.kind, count=fs.count))
-    return updated_fwdspecs
+            updated_fwd_specs.append(FwdSpec(name=fs.name, kind=fs.kind, count=fs.count))
+    return updated_fwd_specs
 
 
-def fwdspecs2kwargs(fwdspecs: List[FwdSpec], flat: list) -> dict:
+def fwdspecs2kwargs(fwd_specs: List[FwdSpec], flat: list) -> dict:
     """
     Reconstruct a kwargs dict from the flat op input list
     Args:
-        fwdspecs: list of FwdSpec representing function input sig
+        fwd_specs: list of FwdSpec representing function input sig
         flat: function inputs in args format
     Returns:
         reconstructed kwargs in dict
     """
     kwargs = {}
     idx = 0
-    for fs in fwdspecs:
+    for fs in fwd_specs:
         if fs.kind in ("tensor", "optional_tensor"):
             kwargs[fs.name] = flat[idx]
             idx += 1
@@ -80,17 +80,16 @@ def fwdspecs2kwargs(fwdspecs: List[FwdSpec], flat: list) -> dict:
     return kwargs
 
 
-def fwdspecs2args(fwdspecs: List[FwdSpec], bound_args: dict) -> list:
+def fwdspecs2args(fwd_specs: List[FwdSpec], bound_args: dict) -> list:
     """Expand bound_args into a flat list matching the op schema."""
     flat = []
-    for fs in fwdspecs:
-        val = bound_args.get(fs.name)
+    for fs in fwd_specs:
+        value = bound_args.get(fs.name)
         if fs.kind in ("tensor", "optional_tensor"):
-            flat.append(val)
+            flat.append(value)
         elif fs.kind == "tuple_tensor":
-            flat.extend(val)
+            flat.extend(value)
     return flat
-
 
 
 def _classify_ann(ann: type | Any) -> tuple | None:

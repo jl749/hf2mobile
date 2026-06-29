@@ -6,20 +6,77 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 import onnx_ir
 import torch
+import transformers
+from transformers.cache_utils import DynamicCache
 from torch.onnx._internal.exporter import _core as _onnx_core
 
 from .tensor_metadata import TensorSpec, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, get_kv_specs_from_input_specs
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, sig2fwdspecs, fwdspecs2args
-from constant import CUSTOM_LIB_NAME, CUSTOM_LIB, ONNX_DOMAIN_NAME, _NON_HASHABLE_PARAMS
+from constant import CUSTOM_LIB_NAME, CUSTOM_LIB, ONNX_DOMAIN_NAME, KV_CACHE_PARAM_NAME
 from utils.py_helper import check_parent_field
 
 
-# Case index threaded by `export_graphs` so each module's `plugin_forward`
-# picks the right per-case op.  `None` means generation/inference (no export
-# in progress) — `plugin_forward` falls straight through to `orig_cls.forward`.
+
+_CACHE_PYTREE_REGISTERED = False
+
+# case index threaded by `CausalLMTracer.export_graphs`
+# each module's `plugin_forward` picks the right per-case op.
+# `None` means no export in progress -> `plugin_forward` falls straight through to `orig_cls.forward`.
 export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
     "export_case", default=None
 )
+
+
+def register_dynamic_cache_pytree() -> None:
+    """
+    Register DynamicCache as a pytree whose direct children are per-layer (K, V) pairs.
+    tree_flatten(cache) -> leaves [K0, V0, K1, V1, ...]
+    Layer i: (leaves[2*i], leaves[2*i+1])
+    """
+    global _CACHE_PYTREE_REGISTERED
+    if _CACHE_PYTREE_REGISTERED:
+        return
+
+    def _flatten(cache: DynamicCache):
+        return [(layer.keys, layer.values) for layer in cache.layers], len(cache.layers)
+
+    def _unflatten(pairs, num_layers):
+        return DynamicCache(ddp_cache_data=list(pairs))
+
+    def _flatten_with_keys(cache: DynamicCache):
+        return [
+            (pytree.SequenceKey(li), (layer.keys, layer.values))
+            for li, layer in enumerate(cache.layers)
+        ], len(cache.layers)
+
+    torch.utils._pytree.register_pytree_node(
+        DynamicCache,
+        _flatten,
+        _unflatten,
+        flatten_with_keys_fn=_flatten_with_keys,
+    )
+    _CACHE_PYTREE_REGISTERED = True
+
+
+def _update_input_cache(input_dict: dict, layer_idx: int) -> str | None:
+    """
+    Update Attention.forward input KV cache so that it see the relevant cache index only
+    Args:
+        input_dict: .forward inputs with default entries
+            `dict(sig.bound_partial(*args, **kwargs).apply_defaults().arguments())`
+        layer_idx: in order to extract the local cache from `transformers.Cache` object
+            we need to know the exact layer_idx (local cache location)
+    Returns:
+        updated input KV cache param name or None
+    """
+    cache_param_name = None
+    value = input_dict.get(KV_CACHE_PARAM_NAME , None)
+    if isinstance(value, transformers.Cache):
+        flat, _ = torch.utils._pytree.tree_flatten(value)
+        kv_cache_tuple = (flat[2 * layer_idx], flat[2 * layer_idx + 1])
+        input_dict[KV_CACHE_PARAM_NAME] = kv_cache_tuple
+        cache_param_name = KV_CACHE_PARAM_NAME
+    return cache_param_name
 
 
 def _make_plugin_forward(
@@ -64,47 +121,38 @@ def _make_plugin_forward(
 
         bound = sig_wo_self.bind_partial(*args, **kwargs)
         bound.apply_defaults()
-        bound_args = dict(bound.arguments)
+        bound_args = dict(bound.arguments)  # copy bound
 
-        # KV-cache params arrive as `transformers.Cache` objects but the op
-        # signature expects (K, V) tensors.  Pull this layer's K, V out before
-        # flattening.
-        cache_param_name = None
-        for fs in case_fwd_specs:
-            if fs.name in _NON_HASHABLE_PARAMS:
-                val = bound_args.get(fs.name)
-                if val is not None and hasattr(val, "layers"):
-                    layer_idx = getattr(self_module, "layer_idx", 0)
-                    layer_cache = val.layers[layer_idx]
-                    bound_args[fs.name] = (layer_cache.keys, layer_cache.values)
-                    cache_param_name = fs.name
-                break
+        if has_kv:
+            layer_idx = getattr(self_module, "layer_idx", None)
+            assert layer_idx is not None, f"Attribute `{self_module.__class__.__name__}.layer_idx` does not exist (id={id(self_module)})."
+            cache_param_name = _update_input_cache(bound_args, self_module.layer_idx)
+            assert cache_param_name is not None, f"No cache params found under `bound_args`"
+        else:
+            cache_param_name = None
 
         flat = fwdspecs2args(case_fwd_specs, bound_args)
         result = op(id(self_module), *flat)
 
         if has_kv:
-            # result = (attn_out, K, V[, ...]) → repackage to (attn_out, (K, V))
+            # result contains `(attn_out, K, V)`
             attn_out = result[0]
-            k_new, v_new = result[1], result[2]
-            # Write back so the outer wrapper (which reads cache.layers[i].keys/.values
-            # after model.forward returns) sees the *new* K, V flowing to the graph
-            # outputs.  Without this the K, V get DCE'd from the final ONNX graph.
-            if cache_param_name is not None:
-                cache = bound.arguments.get(cache_param_name)
-                if cache is not None and hasattr(cache, "layers"):
-                    layer_idx = getattr(self_module, "layer_idx", 0)
-                    cache.layers[layer_idx].keys = k_new
-                    cache.layers[layer_idx].values = v_new
-            return attn_out, (k_new, v_new)
+            latest_k, latest_v = result[1:]
 
-        # Match the original `(output, weights)` 2-tuple convention if applicable
-        ret_ann = sig.return_annotation
-        if isinstance(ret_ann, type) and issubclass(ret_ann, torch.Tensor):
+            # update the KV cache...
+            # without this KV outputs get DCE'd from the final ONNX graph
+            cache_obj = bound.arguments[cache_param_name]
+            assert isinstance(cache_obj, transformers.Cache), f"Parameter '{cache_param_name}' is not containing the transformers Cache object"
+            cache_obj.layers[layer_idx].keys = latest_k
+            cache_obj.layers[layer_idx].values = latest_v
+            return attn_out, (latest_k, latest_v)
+
+        if "Attention" in self_module.__class__.__name__:
+            # NOTE: attentions return -> (attn_out, attn_weight)
+            # TODO: assert using `sig.return_annotation` if it exist
+            return result, None
+        else:
             return result
-        if isinstance(result, tuple):
-            return result + (None,) * (2 - len(result))
-        return result, None
 
     return _plugin_forward
 
@@ -273,7 +321,6 @@ class PluginRegisterInterface(ABC):
                     })
                 orig_m._trace_metadata = trace_metadata
 
-                breakpoint()
                 traceable_fwd = _make_plugin_forward(orig_cls=orig_cls, module=orig_m)
                 orig_m.__class__ = type(
                     f"Traceable{orig_cls.__name__}",
@@ -283,7 +330,7 @@ class PluginRegisterInterface(ABC):
 
 
 __all__ = [
-    "CUSTOM_LIB_NAME",
-    "PluginRegisterInterface",
     "export_case",
+    "register_dynamic_cache_pytree",
+    "PluginRegisterInterface",
 ]
