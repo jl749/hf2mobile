@@ -28,7 +28,7 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
 
     @contextmanager
     def _adapt_model_for_case(self, input_dict: INPUT_KWARGS):
-        """By replacing the generation forward prevent DCE from dropping the KV cache IOs"""
+        """By replacing the generation forward prevent DCE from dropping the KV cache IOs."""
         pkv = input_dict.pop(KV_CACHE_PARAM_NAME, None)
 
         if pkv and isinstance(pkv, list) and isinstance(pkv[0], tuple):
@@ -36,6 +36,10 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
             orig_cls = self.model.__class__
             input_dict["past_keys"] = [k for k, _ in pkv]
             input_dict["past_values"] = [v for _, v in pkv]
+            n = len(pkv)
+            output_names = (
+                ["logits"] + [f"past_keys_{i}_out" for i in range(n)] + [f"past_values_{i}_out" for i in range(n)]
+            )
 
             def _traceable_forward(self_inner, past_keys, past_values, **kwargs):
                 cache = transformers.DynamicCache(ddp_cache_data=list(zip(past_keys, past_values)))
@@ -52,13 +56,13 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
                 {"forward": _traceable_forward},
             )
             try:
-                yield input_dict
+                yield input_dict, output_names
             finally:
                 self.model.__class__ = orig_cls
         else:
             # =========== trace prefill =========== #
             input_dict["use_cache"] = False
-            yield input_dict
+            yield input_dict, None
             return
 
     @HookRegisterInterface.register_plugin_io_hooks()
@@ -80,13 +84,14 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
             path = path_template.format(i=i + 1)
             token = export_case.set(i)
             try:
-                with self._adapt_model_for_case(inputs) as export_kwargs:
+                with self._adapt_model_for_case(inputs) as (export_kwargs, output_names):
                     torch.onnx.export(
                         self.model,
                         args=(),
                         kwargs=export_kwargs,
                         f=path,
                         opset_version=opset_version,
+                        output_names=output_names,
                         custom_translation_table=self.custom_onnx_translation,
                     )
             finally:
