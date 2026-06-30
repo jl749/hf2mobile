@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 import transformers
 
-from hf2hw.constant import KV_CACHE_PARAM_NAME, _NON_HASHABLE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
+from hf2hw.constant import INPUT_KWARGS, KV_CACHE_PARAM_NAME, _NON_HASHABLE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
 
 
 _STR_TO_DTYPE = {
@@ -275,7 +275,7 @@ class ModuleIOSpec:
                 unique_io_paris.append((input_specs, output_specs))
         return tuple(unique_io_paris)
 
-    def build_pseudo_unique_inputs(self) -> List[INPUT_SPECS_TYPE]:
+    def pseudo_unique_inputs(self) -> List[INPUT_KWARGS]:
         """
         Materialize each unique input_specs into concrete tensors / scalars.
         Walks the nested structure via `tree_map` and replaces every `TensorSpec` leaf with:
@@ -299,14 +299,6 @@ class ModuleIOSpec:
             torch.utils._pytree.tree_map(_materialize, input_specs)
             for input_specs, _ in self.unique_ios()
         ]
-
-        # replace KV_CACHE_PARAM_NAME entry from `[(k, v), (k, v), ...]` to `DynamicCache`
-        for input_dict in input_cases:
-            pkv = input_dict.get(KV_CACHE_PARAM_NAME, None)
-            if pkv and isinstance(pkv, list) and isinstance(pkv[0], tuple):
-                input_dict[KV_CACHE_PARAM_NAME] = transformers.DynamicCache(ddp_cache_data=pkv)
-            else:
-                input_dict["use_cache"] = False
         return input_cases
 
 

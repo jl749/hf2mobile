@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
 from typing import Sequence, Dict, List, Any
+from contextlib import contextmanager
 
 import torch
 import transformers
+
 from .tensor_metadata import ModuleIOSpec
+from hf2hw.constant import INPUT_KWARGS
 
 
 class TracerInterface(ABC):
@@ -37,4 +40,9 @@ class TracerInterface(ABC):
     def trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
         """Inference steps to export"""
         pass
+
+    @contextmanager
+    @abstractmethod
+    def _adapt_model_for_case(self, input_dict: INPUT_KWARGS):
+        yield
 
