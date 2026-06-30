@@ -6,6 +6,7 @@ import torch
 import transformers
 
 from hf2hw.constant import INPUT_KWARGS
+from hf2hw.utils.logger import logger
 
 from .tensor_metadata import ModuleIOSpec
 
@@ -18,6 +19,10 @@ class TracerInterface(ABC):
         self.model = model
         self._module2name = {mod: name for name, mod in model.named_modules()}
         self._id2module = {id(mod): mod for mod in model.modules()}
+        logger.info(
+            f"{self.__class__.__name__} initialized on {model.__class__.__name__} "
+            f"(plugin_suffix={tuple(self.plugin_suffix)}, {len(self._module2name)} named modules)"
+        )
 
     def get_plugin_modules(
         self,

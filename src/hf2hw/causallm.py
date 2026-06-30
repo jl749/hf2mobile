@@ -12,6 +12,7 @@ from .tracing import (
     export_case,
     register_dynamic_cache_pytree,
 )
+from .utils.logger import logger
 
 
 class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInterface):
@@ -77,11 +78,17 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
         **kwargs,
     ):
         """Export HF model to ONNX (export 2 unique cases - prefill, generation)"""
+        logger.info("Stage 1/3: tracing plugin IOs via model.generate(...)")
         self.trace_plugin_ios(model_inputs, **kwargs)
+
+        logger.info("Stage 2/3: registering custom plugin ops")
         self.register_plugins()  # requires `trace_plugin_ios` to be ran first
 
-        for i, input_dict in enumerate(self.model_ios.pseudo_unique_inputs()):
+        cases = self.model_ios.pseudo_unique_inputs()
+        logger.info(f"Stage 3/3: exporting {len(cases)} ONNX case(s)")
+        for i, input_dict in enumerate(cases):
             path = path_template.format(i=i + 1)
+            logger.info(f"  case {i + 1}/{len(cases)} → {path}")
             token = export_case.set(i)
             try:
                 with self._adapt_model_for_case(input_dict) as (export_kwargs, output_names):
@@ -96,4 +103,4 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
                     )
             finally:
                 export_case.reset(token)
-            print(f"ONNX export successful (case {i + 1}): {path}")
+            logger.info(f"  case {i + 1}/{len(cases)} ✓ written: {path}")

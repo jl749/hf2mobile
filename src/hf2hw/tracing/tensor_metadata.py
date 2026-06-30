@@ -5,6 +5,7 @@ import torch
 import transformers
 
 from hf2hw.constant import _NON_HASHABLE_PARAMS, INPUT_KWARGS, INPUT_SPECS_TYPE, KV_CACHE_PARAM_NAME, OUTPUT_SPECS_TYPE
+from hf2hw.utils.logger import logger
 
 _STR_TO_DTYPE = {
     # Floats
@@ -147,8 +148,12 @@ class TensorSpec:
                     try:
                         t = torch.tensor(t)
                         _flat_leaves[i] = cls(shape=t.shape, dtype=t.dtype)
-                    except Exception:
-                        # TODO: throw looger warning
+                    except Exception as e:
+                        logger.warning(
+                            f"TensorSpec.from_tensor: could not coerce "
+                            f"{type(t).__name__}({repr(t)[:80]}) to torch.Tensor ({e}); "
+                            f"storing as empty TensorSpec."
+                        )
                         _flat_leaves[i] = cls(shape=None, dtype=None)
             return torch.utils._pytree.tree_unflatten(_flat_leaves, spec)
 
@@ -303,6 +308,10 @@ class ModuleIOSpec:
             else:
                 _seen.add(_key)
                 unique_io_paris.append((input_specs, output_specs))
+        logger.debug(
+            f"unique_ios[{self.cls_name}::{self.module_name}]: "
+            f"{len(self.obsvd_input_specs)} observations → {len(unique_io_paris)} unique case(s)"
+        )
         return tuple(unique_io_paris)
 
     def pseudo_unique_inputs(self) -> List[INPUT_KWARGS]:

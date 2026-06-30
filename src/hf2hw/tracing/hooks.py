@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import torch
 
+from hf2hw.utils.logger import logger
 from hf2hw.utils.py_helper import check_parent_field
 
 from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, ModuleIOSpec, TensorSpec
@@ -85,17 +86,23 @@ class HookRegisterInterface(ABC):
         # NOTE: plugin IO catcher
         suffix2modules = self.get_plugin_modules()
         if isinstance(suffix2modules, list):
-            iter_modules = suffix2modules
+            iter_modules = list(suffix2modules)
         else:
-            iter_modules = (m for ml in suffix2modules.values() for m in ml)
+            iter_modules = [m for ml in suffix2modules.values() for m in ml]
         for module in iter_modules:
             self._hook_handles.append(module.register_forward_pre_hook(self._input_pre_hook, with_kwargs=True))
             self._hook_handles.append(module.register_forward_hook(self._output_post_hook, with_kwargs=True))
+        logger.debug(
+            f"Attached hooks: 1 model + {len(iter_modules)} plugin modules "
+            f"({len(self._hook_handles)} handles total)"
+        )
 
     def _detach_hooks(self):
+        n = len(self._hook_handles)
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+        logger.debug(f"Detached {n} hooks")
 
     @staticmethod
     def register_plugin_io_hooks():

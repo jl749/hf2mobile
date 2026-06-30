@@ -6,6 +6,8 @@ from typing import Any, List
 
 import torch
 
+from hf2hw.utils.logger import logger
+
 from .tensor_metadata import INPUT_SPECS_TYPE, TensorSpec
 
 
@@ -40,6 +42,10 @@ def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPE
     for fs in fwd_specs:
         spec = input_specs.get(fs.name, None)
         if spec is None:
+            logger.debug(
+                f"apply_input_specs2fwd_specs: param '{fs.name}' "
+                f"(kind={fs.kind!r}) had no matching input spec; dropping from case"
+            )
             continue  # mismatch between `fwd_specs` and `input_specs` -> SKIP
         if fs.kind == "unknown":
             if isinstance(spec, TensorSpec):
@@ -135,14 +141,16 @@ def sig2fwdspecs(sig: inspect.Signature) -> List[FwdSpec]:
 
         # NOTE: type hint does not exist
         if ann is inspect.Parameter.empty:
+            logger.debug(f"sig2fwdspecs: param '{name}' has no type annotation; kind='unknown'")
             full_fwdspecs.append(FwdSpec(name=name, kind="unknown"))
             continue
 
         classified_ann: tuple | None = _classify_ann(ann)
 
         # NOTE: _classify_ann failed (`Tuple[Tensor, ...]`, `Optional[Cache]`, ...)
-        #   keep if "unknown" for now. fix it with `FwdSpec.resolve_unknown` later
+        #   keep if "unknown" for now... fix it with `apply_input_specs2fwd_specs` later
         if classified_ann is None:
+            logger.debug(f"sig2fwdspecs: param '{name}: {ann}' could not be classified; kind='unknown'")
             full_fwdspecs.append(FwdSpec(name=name, kind="unknown"))
             continue
         full_fwdspecs.append(FwdSpec(name=name, kind=classified_ann[0], count=classified_ann[1]))

@@ -11,6 +11,7 @@ from torch.onnx._internal.exporter import _core as _onnx_core
 from transformers.cache_utils import DynamicCache
 
 from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, KV_CACHE_PARAM_NAME, ONNX_DOMAIN_NAME
+from hf2hw.utils.logger import logger
 from hf2hw.utils.py_helper import check_parent_field
 
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, fwdspecs2args, sig2fwdspecs
@@ -253,16 +254,22 @@ class PluginRegisterInterface(ABC):
         # NOTE: mark both `torchlib_op_name` and `onnx_op_name` as registered
         self.torchlibop2onnxop[torchlib_op_name] = onnx_op_name
         self.onnxop2torchlibop[onnx_op_name].add(torchlib_op_name)
+        logger.debug(f"registered custom op {torchlib_op_name} → {onnx_op_name} ({num_outputs} outputs)")
 
     def register_plugins(self):
         """Register custom op that can replace the module"""
         name2modules_dict = self.get_plugin_modules(plugin_suffix=self.plugin_suffix)
         if isinstance(name2modules_dict, list):
             name2modules_dict = {self.plugin_suffix[0]: name2modules_dict}
+        logger.info(
+            "register_plugins: " + ", ".join(f"{s!r}={len(ms)} module(s)" for s, ms in name2modules_dict.items())
+        )
+        n_ops_before = len(self.torchlibop2onnxop)
         for suffix, modules in name2modules_dict.items():
             onnx_op_name = f"Custom{suffix}"
             if not modules:
-                continue  # TODO: logger warning
+                logger.warning(f"No modules found for plugin_suffix={suffix!r}; skipping")
+                continue
             cls_names = set(m.__class__.__name__ for m in modules)
             if len(cls_names) > 1:
                 raise RuntimeError(f"More than one class candidate for suffix '{suffix}': {cls_names}")
@@ -274,6 +281,13 @@ class PluginRegisterInterface(ABC):
 
                 name = self._module2name[orig_m]
                 unique_io_cases = self.plugin_ios[f"{orig_cls.__name__}::{name}"].unique_ios()
+                if not unique_io_cases:
+                    logger.warning(
+                        f"{orig_cls.__name__}::{name} has no observed IOs; "
+                        f"_plugin_forward will raise at export time. "
+                        f"Did `trace_plugin_ios` run? Is this module reached during generate()?"
+                    )
+                    continue
 
                 trace_metadata: List[Dict[str, Any]] = []
                 for i, (input_specs, output_specs) in enumerate(unique_io_cases):
@@ -309,6 +323,7 @@ class PluginRegisterInterface(ABC):
                     (orig_cls,),
                     {"forward": traceable_fwd},
                 )
+        logger.info(f"register_plugins: registered {len(self.torchlibop2onnxop) - n_ops_before} custom op(s)")
 
 
 __all__ = [
