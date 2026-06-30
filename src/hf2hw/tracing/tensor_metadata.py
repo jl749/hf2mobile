@@ -221,9 +221,9 @@ class ModuleIOSpec:
             specs = filter_empty_specs(specs)
         try:
             leaves, _tree_spec = torch.utils._pytree.tree_flatten(specs)
-            flatten_specs = [v for v in leaves]
-        except:
-            raise ValueError(f"`{specs=}` cannot be flattened with pytree")
+            flatten_specs = leaves
+        except Exception as e:
+            raise ValueError(f"`{specs=}` cannot be flattened with pytree") from e
         assert all(isinstance(v, TensorSpec) for v in flatten_specs), f"Non TensorSpec object inside {specs=}"
         return flatten_specs, _tree_spec
 
@@ -241,12 +241,12 @@ class ModuleIOSpec:
         return [{k: v for k, v in s.items() if k not in _NON_HASHABLE_PARAMS} for s in self.obsvd_input_specs]
 
     @property
-    def hashable_obsvd_input_specs(self):
-        return (self._get_hashable_obsvd_specs(self.obsvd_input_specs),)
+    def hashable_obsvd_input_specs(self) -> tuple:
+        return self._get_hashable_obsvd_specs(self.obsvd_input_specs)
 
     @property
-    def hashable_obsvd_output_specs(self):
-        return (self._get_hashable_obsvd_specs(self.obsvd_output_specs),)
+    def hashable_obsvd_output_specs(self) -> tuple:
+        return self._get_hashable_obsvd_specs(self.obsvd_output_specs)
 
     def _unique_key(self) -> Tuple[Any, ...]:
         """Canonical comparable key — shared by __hash__ and __eq__."""
@@ -307,13 +307,14 @@ class ModuleIOSpec:
 
     def pseudo_unique_inputs(self) -> List[INPUT_KWARGS]:
         """
-        Materialize each unique input_specs into concrete tensors / scalars.
-        Walks the nested structure via `tree_map` and replaces every `TensorSpec` leaf with:
-          - `None`                                if it is empty
-          - its `.scalar` value                   if it is a scalar
-          - `torch.zeros(shape, dtype=...)`       otherwise
-
-        Non-`TensorSpec` leaves (already-materialized values) pass through.
+        Create pseudo unique inputs based on `unique_ios` output.
+        e.g.
+        {
+            "input_ids": Tensor((1, 1), dtype=int64),
+            "position_ids": Tensor((1, 16), dtype=int64),
+            "past_kv_values": [(Tensor, Tensor), (Tensor, Tensor), ...]
+            "use_cache": True
+        }
         """
 
         def _materialize(s):
@@ -326,7 +327,7 @@ class ModuleIOSpec:
             return torch.zeros(s.shape, dtype=s.torch_dtype)
 
         # build unique pseudo inputs
-        input_cases: List[Dict[str, torch.Tesnor | int | float | None]] = [
+        input_cases: List[INPUT_KWARGS] = [
             torch.utils._pytree.tree_map(_materialize, input_specs) for input_specs, _ in self.unique_ios()
         ]
         return input_cases
@@ -340,8 +341,8 @@ def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[Tensor
             return ()
         try:
             k_spec, v_spec = spec
-        except:
-            raise ValueError(f"Expecting tuple of k and v `TensorSpec`s... `{spec=}`")
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Expecting tuple of k and v `TensorSpec`s... `{spec=}`") from e
         return k_spec, v_spec
     else:
         return ()

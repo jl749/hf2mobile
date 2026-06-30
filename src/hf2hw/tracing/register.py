@@ -72,15 +72,12 @@ def _make_plugin_forward(
     orig_cls: Any,
     module: torch.nn.Module,
 ):
-    """Build a replacement ``forward`` that dispatches per export case.
+    """
+    Plugin forward factory function
+    Returned forward function overwrites existing plugin `nn.Module` forward
 
-    - ``export_case`` is None → call the original forward unchanged.
-    - ``export_case`` is i    → flatten args via the case-i fwd_specs and call
-      the registered op stored on ``module._case_ops[i]``.
-
-    For cases where the op was augmented with KV outputs, the result is
-    repackaged into ``(attn_out, (K, V))`` so the ONNX node's KV outputs
-    survive downstream consumption.
+    - `export_case` is None -> call original forward (no change)
+    - `export_case` is i    -> call registered op with fwd_specs (both from `module._trace_metadata[i]`)
     """
     sig = inspect.signature(orig_cls.forward)
     params_no_self = [p for n, p in sig.parameters.items() if n != "self"]
@@ -118,7 +115,7 @@ def _make_plugin_forward(
                 layer_idx is not None
             ), f"Attribute `{self_module.__class__.__name__}.layer_idx` does not exist (id={id(self_module)})."
             cache_param_name = _update_input_cache(bound_args, self_module.layer_idx)
-            assert cache_param_name is not None, f"No cache params found under `bound_args`"
+            assert cache_param_name is not None, "No cache params found under `bound_args`"
         else:
             cache_param_name = None
 
@@ -212,14 +209,14 @@ class PluginRegisterInterface(ABC):
             return
 
         leaves, _ = torch.utils._pytree.tree_flatten(output_specs)
-        flat_os: List[TensorSpec] = [v for v in leaves]
-        num_outputs = len(flat_os)
+        flatten_specs: List[TensorSpec] = leaves
+        num_outputs = len(flatten_specs)
 
         assert all(
-            isinstance(spec, TensorSpec) for spec in flat_os
+            isinstance(spec, TensorSpec) for spec in flatten_specs
         ), f"{_err_msg} we detected non `TesnorSpec` object under `output_specs`. This is likely a bug please report it with repro codes to the dev."
         assert all(
-            spec.is_empty is False for spec in flat_os
+            spec.is_empty is False for spec in flatten_specs
         ), f"{_err_msg} we detected `output_specs` is containing empty `TensorSpec`. Please call `ModuleIOSpec.unique_ios()` before running `_register_custom_op` in order to obtain None filtered `TensorSpec` observations."
         assert (
             num_outputs > 0
@@ -231,7 +228,7 @@ class PluginRegisterInterface(ABC):
         @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{torchlib_op_name}")
         def _abstract_impl(module_id, *flat_tensors):
             device = next(t for t in flat_tensors if t is not None).device
-            outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flat_os)
+            outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flatten_specs)
             return outs[0] if num_outputs == 1 else outs
 
         def _onnx_translation(module_id, *flat_tensors):

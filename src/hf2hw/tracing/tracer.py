@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from typing import Any, Dict, List, Sequence
 
 import torch
@@ -40,7 +40,12 @@ class TracerInterface(ABC):
         """Inference steps to export"""
         pass
 
-    @contextmanager
     @abstractmethod
-    def _adapt_model_for_case(self, input_dict: INPUT_KWARGS):
-        yield
+    def _adapt_model_for_case(self, input_dict: INPUT_KWARGS) -> AbstractContextManager:
+        """Return a context manager that adapts `self.model` for the given case.
+
+        Subclasses typically implement this with `@contextmanager`; the context
+        block yields ``(export_kwargs, output_names)`` and restores any model
+        mutations on exit.
+        """
+        ...
