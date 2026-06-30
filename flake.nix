@@ -15,18 +15,19 @@
       UV_CACHE_DIR = "./.uv_cache";
       UV_PYTHON_DOWNLOADS = "never";
       LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-        pkgs.stdenv.cc.cc.lib 
+        pkgs.stdenv.cc.cc.lib
         pkgs.zlib
       ];
     };
   in {
-    devShells.${system}.default = 
+    devShells.${system}.default =
       pkgs.mkShell {
         nativeBuildInputs = [];
         buildInputs = with pkgs; [
           pkgs.python312
           pkgs.pyright
           pkgs.uv
+          pkgs.pre-commit
         ];
         env = envVars;
         packages = [];

@@ -1,17 +1,18 @@
 from abc import ABC, abstractmethod
-from typing import Sequence, Dict, List, Any
 from contextlib import contextmanager
+from typing import Any, Dict, List, Sequence
 
 import torch
 import transformers
 
-from .tensor_metadata import ModuleIOSpec
 from hf2hw.constant import INPUT_KWARGS
+
+from .tensor_metadata import ModuleIOSpec
 
 
 class TracerInterface(ABC):
     def __init__(self, model: transformers.PreTrainedModel, plugin_suffix: Sequence[str]):
-        self.plugin_suffix = (plugin_suffix,) if isinstance(plugin_suffix, str) else plugin_suffix 
+        self.plugin_suffix = (plugin_suffix,) if isinstance(plugin_suffix, str) else plugin_suffix
         self.plugin_ios: Dict[str, ModuleIOSpec] = {}
 
         self.model = model
@@ -29,9 +30,7 @@ class TracerInterface(ABC):
             plugin_suffix = [plugin_suffix]
         suffix2modules = {}
         for suffix in plugin_suffix:
-            suffix2modules[suffix] = [
-                m for m in self.model.modules() if suffix in m.__class__.__name__
-            ]
+            suffix2modules[suffix] = [m for m in self.model.modules() if suffix in m.__class__.__name__]
         if len(suffix2modules) == 1:
             return next(iter(suffix2modules.values()))
         return suffix2modules
@@ -45,4 +44,3 @@ class TracerInterface(ABC):
     @abstractmethod
     def _adapt_model_for_case(self, input_dict: INPUT_KWARGS):
         yield
-

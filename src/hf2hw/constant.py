@@ -1,4 +1,5 @@
-from typing import Tuple, Any, Dict
+from typing import Any, Dict, Tuple
+
 import torch
 
 # register.py

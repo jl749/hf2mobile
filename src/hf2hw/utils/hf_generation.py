@@ -1,5 +1,7 @@
 import time
+
 import transformers
+
 
 class TokenSpeedStreamer(transformers.generation.streamers.BaseStreamer):
     def __init__(self):
@@ -14,7 +16,7 @@ class TokenSpeedStreamer(transformers.generation.streamers.BaseStreamer):
 
         num_tokens = value.numel()
         self.token_count += num_tokens
-        
+
         elapsed = time.perf_counter() - self.start_time
         if elapsed > 0:
             current_speed = self.token_count / elapsed

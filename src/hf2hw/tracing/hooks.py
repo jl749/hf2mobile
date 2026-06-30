@@ -6,7 +6,8 @@ from typing import Dict, List
 import torch
 
 from hf2hw.utils.py_helper import check_parent_field
-from .tensor_metadata import TensorSpec, ModuleIOSpec, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
+
+from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, ModuleIOSpec, TensorSpec
 
 
 class HookRegisterInterface(ABC):
@@ -29,8 +30,7 @@ class HookRegisterInterface(ABC):
         name2val = name2val | name2val.pop("kwargs", {})
 
         obsvd_inputs: INPUT_SPECS_TYPE = {
-            param_name: TensorSpec.from_tensor(value, module=module)
-            for param_name, value in name2val.items()
+            param_name: TensorSpec.from_tensor(value, module=module) for param_name, value in name2val.items()
         }
         if self.model_ios is None:
             self.model_ios = ModuleIOSpec(_cls_name, _module_name)
@@ -55,8 +55,7 @@ class HookRegisterInterface(ABC):
         assert name2val, f"Empty `{_cls_name}.forward` input"
 
         obsvd_inputs: INPUT_SPECS_TYPE = {
-            param_name: TensorSpec.from_tensor(value, module=module)
-            for param_name, value in name2val.items()
+            param_name: TensorSpec.from_tensor(value, module=module) for param_name, value in name2val.items()
         }
         ms = self.plugin_ios.setdefault(
             f"{_cls_name}::{_module_name}",
@@ -80,12 +79,8 @@ class HookRegisterInterface(ABC):
         self._hook_handles = []
 
         # NOTE: model IO catcher
-        self._hook_handles.append(
-            self.model.register_forward_pre_hook(self._model_pre_hook, with_kwargs=True)
-        )
-        self._hook_handles.append(
-            self.model.register_forward_hook(self._model_post_hook, with_kwargs=True)
-        )
+        self._hook_handles.append(self.model.register_forward_pre_hook(self._model_pre_hook, with_kwargs=True))
+        self._hook_handles.append(self.model.register_forward_hook(self._model_post_hook, with_kwargs=True))
 
         # NOTE: plugin IO catcher
         suffix2modules = self.get_plugin_modules()
@@ -94,12 +89,8 @@ class HookRegisterInterface(ABC):
         else:
             iter_modules = (m for ml in suffix2modules.values() for m in ml)
         for module in iter_modules:
-            self._hook_handles.append(
-                module.register_forward_pre_hook(self._input_pre_hook, with_kwargs=True)
-            )
-            self._hook_handles.append(
-                module.register_forward_hook(self._output_post_hook, with_kwargs=True)
-            )
+            self._hook_handles.append(module.register_forward_pre_hook(self._input_pre_hook, with_kwargs=True))
+            self._hook_handles.append(module.register_forward_hook(self._output_post_hook, with_kwargs=True))
 
     def _detach_hooks(self):
         for handle in self._hook_handles:
@@ -116,7 +107,9 @@ class HookRegisterInterface(ABC):
                     return fn(self, *args, **kwargs)
                 finally:
                     self._detach_hooks()
+
             return wrapper
+
         return decorator
 
 

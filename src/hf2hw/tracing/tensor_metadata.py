@@ -1,26 +1,41 @@
-from typing import Union, List, Tuple, Any, Dict
 from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_KWARGS, KV_CACHE_PARAM_NAME, _NON_HASHABLE_PARAMS, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE
-
+from hf2hw.constant import _NON_HASHABLE_PARAMS, INPUT_KWARGS, INPUT_SPECS_TYPE, KV_CACHE_PARAM_NAME, OUTPUT_SPECS_TYPE
 
 _STR_TO_DTYPE = {
     # Floats
-    "float32": torch.float32, "float": torch.float32, "torch.float32": torch.float32,
-    "float16": torch.float16, "half": torch.float16, "torch.float16": torch.float16,
-    "bfloat16": torch.bfloat16, "torch.bfloat16": torch.bfloat16,
-    "float64": torch.float64, "double": torch.float64, "torch.float64": torch.float64,
+    "float32": torch.float32,
+    "float": torch.float32,
+    "torch.float32": torch.float32,
+    "float16": torch.float16,
+    "half": torch.float16,
+    "torch.float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "torch.bfloat16": torch.bfloat16,
+    "float64": torch.float64,
+    "double": torch.float64,
+    "torch.float64": torch.float64,
     # Integers
-    "int32": torch.int32, "int": torch.int32, "torch.int32": torch.int32,
-    "int64": torch.int64, "long": torch.int64, "torch.int64": torch.int64,
-    "int16": torch.int16, "short": torch.int16, "torch.int16": torch.int16,
-    "int8": torch.int8, "torch.int8": torch.int8,
-    "uint8": torch.uint8, "torch.uint8": torch.uint8,
+    "int32": torch.int32,
+    "int": torch.int32,
+    "torch.int32": torch.int32,
+    "int64": torch.int64,
+    "long": torch.int64,
+    "torch.int64": torch.int64,
+    "int16": torch.int16,
+    "short": torch.int16,
+    "torch.int16": torch.int16,
+    "int8": torch.int8,
+    "torch.int8": torch.int8,
+    "uint8": torch.uint8,
+    "torch.uint8": torch.uint8,
     # Booleans
-    "bool": torch.bool, "torch.bool": torch.bool,
+    "bool": torch.bool,
+    "torch.bool": torch.bool,
 }
 
 
@@ -33,7 +48,7 @@ def convert_dtype(inp: Union[torch.Tensor, torch.dtype, str]) -> Union[str, torc
     # Case 1: Input is a Tensor (extract its dtype first)
     if isinstance(inp, torch.Tensor):
         inp = inp.dtype
-        
+
     # Case 2: Input is a torch.dtype -> Convert to clean String
     if isinstance(inp, torch.dtype):
         return str(inp).replace("torch.", "")
@@ -59,6 +74,7 @@ class TensorSpec:
     Example:
         >> TensorSpec.from_tensor(value={...IO_param_from_hook...})
     """
+
     dtype: str | None
     shape: Tuple[int, ...] | None = None
     scalar: int | float | None = None
@@ -105,9 +121,11 @@ class TensorSpec:
         elif isinstance(value, transformers.Cache):
             flat_leaves, _ = torch.utils._pytree.tree_flatten(value)
             flat_specs = [
-                cls(shape=t.shape, dtype=t.dtype)
-                if (isinstance(t, torch.Tensor) and t.numel() > 0)
-                else cls(shape=None, dtype=None)
+                (
+                    cls(shape=t.shape, dtype=t.dtype)
+                    if (isinstance(t, torch.Tensor) and t.numel() > 0)
+                    else cls(shape=None, dtype=None)
+                )
                 for t in flat_leaves
             ]
             if module is not None and hasattr(module, "layer_idx"):
@@ -147,8 +165,10 @@ class TensorSpec:
             elif both_none:
                 pass
             else:
-                raise ValueError("`TensorSpec` does not allow partially initialized form. Please specify both `shape` and `dtype`.")
-        
+                raise ValueError(
+                    "`TensorSpec` does not allow partially initialized form. Please specify both `shape` and `dtype`."
+                )
+
 
 @dataclass
 class ModuleIOSpec:
@@ -160,14 +180,18 @@ class ModuleIOSpec:
         obsvd_input_specs: collected input specs during the trace
         obsvd_output_specs: collected output specs during the trace
     """
+
     cls_name: str
     module_name: str
     obsvd_input_specs: List[INPUT_SPECS_TYPE] = None
     obsvd_output_specs: List[OUTPUT_SPECS_TYPE] = None
 
     @staticmethod
-    def flatten_io_specs(specs: INPUT_SPECS_TYPE | OUTPUT_SPECS_TYPE, skip_empty=False) -> Tuple[List[TensorSpec], torch.utils._pytree.TreeSpec]:
+    def flatten_io_specs(
+        specs: INPUT_SPECS_TYPE | OUTPUT_SPECS_TYPE, skip_empty=False
+    ) -> Tuple[List[TensorSpec], torch.utils._pytree.TreeSpec]:
         if skip_empty:
+
             def is_filterable(v) -> bool:
                 # empty TensorSpec leaf, OR container that became empty after filtering
                 if hasattr(v, "is_empty") and v.is_empty:
@@ -193,6 +217,7 @@ class ModuleIOSpec:
                             out.append(fv)
                     return type(node)(out)
                 return node
+
             specs = filter_empty_specs(specs)
         try:
             leaves, _tree_spec = torch.utils._pytree.tree_flatten(specs)
@@ -217,11 +242,11 @@ class ModuleIOSpec:
 
     @property
     def hashable_obsvd_input_specs(self):
-        return self._get_hashable_obsvd_specs(self.obsvd_input_specs),
+        return (self._get_hashable_obsvd_specs(self.obsvd_input_specs),)
 
     @property
     def hashable_obsvd_output_specs(self):
-        return self._get_hashable_obsvd_specs(self.obsvd_output_specs),
+        return (self._get_hashable_obsvd_specs(self.obsvd_output_specs),)
 
     def _unique_key(self) -> Tuple[Any, ...]:
         """Canonical comparable key — shared by __hash__ and __eq__."""
@@ -249,16 +274,18 @@ class ModuleIOSpec:
         Return unique (input_specs, output_specs) pairs
         When considering the uniqness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
         Output tuple will always return the metadata pairs in observation order
-        e.g. 
+        e.g.
             when `generate` is called on the transformers CausalLM models
             prefill runs first taking index 0 for both `obsvd_input_specs` and `obsvd_output_specs`
-            this means `unique_ios` returned tuple also contains 
+            this means `unique_ios` returned tuple also contains
             prefill profile at idx 0 and generation profile at idx 1
         """
         unique_io_paris = []
         _seen = set()
-        for _unq_input_specs, input_specs, output_specs in zip(self.unique_obsvd_input_specs, self.obsvd_input_specs, self.obsvd_output_specs):
-            # when considering the uniqness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs` 
+        for _unq_input_specs, input_specs, output_specs in zip(
+            self.unique_obsvd_input_specs, self.obsvd_input_specs, self.obsvd_output_specs
+        ):
+            # when considering the uniqness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs`
             _flat_unq_is, _unq_tree = self.flatten_io_specs(specs=_unq_input_specs, skip_empty=True)
             _unq_input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(_flat_unq_is, _unq_tree)
 
@@ -267,7 +294,10 @@ class ModuleIOSpec:
             flat_o_specs, o_tree = self.flatten_io_specs(specs=output_specs, skip_empty=True)
             input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(flat_i_specs, i_tree)
             output_specs: OUTPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(flat_o_specs, o_tree)
-            _key = (*self._get_hashable_obsvd_specs([_unq_input_specs]), *self._get_hashable_obsvd_specs([output_specs]))
+            _key = (
+                *self._get_hashable_obsvd_specs([_unq_input_specs]),
+                *self._get_hashable_obsvd_specs([output_specs]),
+            )
             if _key in _seen:
                 continue
             else:
@@ -285,6 +315,7 @@ class ModuleIOSpec:
 
         Non-`TensorSpec` leaves (already-materialized values) pass through.
         """
+
         def _materialize(s):
             if not isinstance(s, TensorSpec):
                 return s
@@ -296,8 +327,7 @@ class ModuleIOSpec:
 
         # build unique pseudo inputs
         input_cases: List[Dict[str, torch.Tesnor | int | float | None]] = [
-            torch.utils._pytree.tree_map(_materialize, input_specs)
-            for input_specs, _ in self.unique_ios()
+            torch.utils._pytree.tree_map(_materialize, input_specs) for input_specs, _ in self.unique_ios()
         ]
         return input_cases
 
@@ -317,5 +347,4 @@ def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[Tensor
         return ()
 
 
-
-__all__ = ["convert_dtype", "TensorSpec", "ModuleIOSpec", "get_kv_specs_from_input_specs"] 
+__all__ = ["convert_dtype", "TensorSpec", "ModuleIOSpec", "get_kv_specs_from_input_specs"]

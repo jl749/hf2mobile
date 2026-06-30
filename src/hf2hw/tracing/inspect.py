@@ -1,12 +1,12 @@
 import inspect
 import types
 import typing
-from typing import List, Any
 from dataclasses import dataclass
+from typing import Any, List
 
 import torch
 
-from .tensor_metadata import TensorSpec, INPUT_SPECS_TYPE
+from .tensor_metadata import INPUT_SPECS_TYPE, TensorSpec
 
 
 @dataclass
@@ -18,6 +18,7 @@ class FwdSpec:
         kind: "tensor" | "optional_tensor" | "tuple_tensor" | "unknown"
         count: number of flat tensors (>1 only for tuple_tensor)
     """
+
     name: str
     kind: str
     count: int = 1
@@ -75,7 +76,7 @@ def fwdspecs2kwargs(fwd_specs: List[FwdSpec], flat: list) -> dict:
             kwargs[fs.name] = flat[idx]
             idx += 1
         elif fs.kind == "tuple_tensor":
-            kwargs[fs.name] = tuple(flat[idx:idx + fs.count])
+            kwargs[fs.name] = tuple(flat[idx : idx + fs.count])
             idx += fs.count
     return kwargs
 
@@ -163,4 +164,11 @@ def sig2num_outputs(sig: inspect.Signature) -> int:
     return 1
 
 
-__all__ = ["FwdSpec", "apply_input_specs2fwd_specs", "fwdspecs2kwargs", "fwdspecs2args", "sig2fwdspecs", "sig2num_outputs"]
+__all__ = [
+    "FwdSpec",
+    "apply_input_specs2fwd_specs",
+    "fwdspecs2kwargs",
+    "fwdspecs2args",
+    "sig2fwdspecs",
+    "sig2num_outputs",
+]

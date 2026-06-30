@@ -1,30 +1,27 @@
-from collections import defaultdict
 import contextvars
 import inspect
 from abc import ABC
-from typing import Any, Dict, List, Optional, Tuple, Set
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import onnx_ir
 import torch
 import transformers
-from transformers.cache_utils import DynamicCache
 from torch.onnx._internal.exporter import _core as _onnx_core
+from transformers.cache_utils import DynamicCache
 
-from .tensor_metadata import TensorSpec, INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, get_kv_specs_from_input_specs
-from .inspect import FwdSpec, apply_input_specs2fwd_specs, sig2fwdspecs, fwdspecs2args
-from hf2hw.constant import CUSTOM_LIB_NAME, CUSTOM_LIB, ONNX_DOMAIN_NAME, KV_CACHE_PARAM_NAME
+from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, KV_CACHE_PARAM_NAME, ONNX_DOMAIN_NAME
 from hf2hw.utils.py_helper import check_parent_field
 
-
+from .inspect import FwdSpec, apply_input_specs2fwd_specs, fwdspecs2args, sig2fwdspecs
+from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_input_specs
 
 _CACHE_PYTREE_REGISTERED = False
 
 # case index threaded by `CausalLMTracer.export_graphs`
 # each module's `plugin_forward` picks the right per-case op.
 # `None` means no export in progress -> `plugin_forward` falls straight through to `orig_cls.forward`.
-export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
-    "export_case", default=None
-)
+export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("export_case", default=None)
 
 
 def register_dynamic_cache_pytree() -> None:
@@ -62,7 +59,7 @@ def _update_input_cache(input_dict: dict, layer_idx: int) -> str | None:
         updated input KV cache param name or None
     """
     cache_param_name = None
-    value = input_dict.get(KV_CACHE_PARAM_NAME , None)
+    value = input_dict.get(KV_CACHE_PARAM_NAME, None)
     if isinstance(value, transformers.Cache):
         flat, _ = torch.utils._pytree.tree_flatten(value)
         kv_cache_tuple = (flat[2 * layer_idx], flat[2 * layer_idx + 1])
@@ -117,7 +114,9 @@ def _make_plugin_forward(
 
         if has_kv:
             layer_idx = getattr(self_module, "layer_idx", None)
-            assert layer_idx is not None, f"Attribute `{self_module.__class__.__name__}.layer_idx` does not exist (id={id(self_module)})."
+            assert (
+                layer_idx is not None
+            ), f"Attribute `{self_module.__class__.__name__}.layer_idx` does not exist (id={id(self_module)})."
             cache_param_name = _update_input_cache(bound_args, self_module.layer_idx)
             assert cache_param_name is not None, f"No cache params found under `bound_args`"
         else:
@@ -134,7 +133,9 @@ def _make_plugin_forward(
             # update the KV cache...
             # without this KV outputs get DCE'd from the final ONNX graph
             cache_obj = bound.arguments[cache_param_name]
-            assert isinstance(cache_obj, transformers.Cache), f"Parameter '{cache_param_name}' is not containing the transformers Cache object"
+            assert isinstance(
+                cache_obj, transformers.Cache
+            ), f"Parameter '{cache_param_name}' is not containing the transformers Cache object"
             cache_obj.layers[layer_idx].keys = latest_k
             cache_obj.layers[layer_idx].values = latest_v
             return attn_out, (latest_k, latest_v)
@@ -163,7 +164,7 @@ class PluginRegisterInterface(ABC):
         Create a torch library function schema string in order to define a new custom operator
         Args:
             torchlib_op_name: custom op name
-            fwd_specs: actual fwd signatures returned by 
+            fwd_specs: actual fwd signatures returned by
                 `apply_input_specs2fwd_specs(fwd_specs, `ModuleIOSpec.unique_ios()[i][0]`)
             num_outputs: length of the `ModuleIOSpec.unique_ios()` filtered output_specs
         Returns:
@@ -190,13 +191,13 @@ class PluginRegisterInterface(ABC):
     ) -> None:
         """
         Register an export-only op (schema + fake impl + ONNX translation).
-        No CPU kernel is registered: these ops exist purely to be captured by `torch.onnx.export`.  
+        No CPU kernel is registered: these ops exist purely to be captured by `torch.onnx.export`.
         The trace path goes through the fake impl (shape inference) and the ONNX translation (node emission)
 
         Args:
             torchlib_op_name: custom op name that defines random `torch.nn.Module`
             onnx_op_name: custom onnx op_type name to map `torchlib_op_name`
-            fwd_specs: actual fwd signatures returned by 
+            fwd_specs: actual fwd signatures returned by
                 `apply_input_specs2fwd_specs(fwd_specs, `ModuleIOSpec.unique_ios()[i][0]`)
             output_specs: module outputs observed by the hook
                 `_, output_specs = ModuleIOSpec.unique_ios()[i]`
@@ -205,18 +206,24 @@ class PluginRegisterInterface(ABC):
 
         _onnx_op_name_mapped = self.torchlibop2onnxop.get(torchlib_op_name, None)
         if _onnx_op_name_mapped:
-            assert _onnx_op_name_mapped == onnx_op_name, f"{_err_msg} we noticed `{torchlib_op_name=}` is already mapped to `onnx_op_name={_onnx_op_name_mapped}`. However, user is trying to map it again to `{onnx_op_name=}`"
+            assert (
+                _onnx_op_name_mapped == onnx_op_name
+            ), f"{_err_msg} we noticed `{torchlib_op_name=}` is already mapped to `onnx_op_name={_onnx_op_name_mapped}`. However, user is trying to map it again to `{onnx_op_name=}`"
             return
-        
+
         leaves, _ = torch.utils._pytree.tree_flatten(output_specs)
         flat_os: List[TensorSpec] = [v for v in leaves]
         num_outputs = len(flat_os)
 
-        assert all(isinstance(spec, TensorSpec) for spec in flat_os), f"{_err_msg} we detected non `TesnorSpec` object under `output_specs`. This is likely a bug please report it with repro codes to the dev."
-        assert all(spec.is_empty is False for spec in flat_os), f"{_err_msg} we detected `output_specs` is containing empty `TensorSpec`. Please call `ModuleIOSpec.unique_ios()` before running `_register_custom_op` in order to obtain None filtered `TensorSpec` observations."
-        assert num_outputs > 0, (
-            f"{_err_msg} we noticed `output_specs` is containing 0 `TensorSpec`. In order to trace the ONNX at least one output `TensorSpec` is required."
-        )
+        assert all(
+            isinstance(spec, TensorSpec) for spec in flat_os
+        ), f"{_err_msg} we detected non `TesnorSpec` object under `output_specs`. This is likely a bug please report it with repro codes to the dev."
+        assert all(
+            spec.is_empty is False for spec in flat_os
+        ), f"{_err_msg} we detected `output_specs` is containing empty `TensorSpec`. Please call `ModuleIOSpec.unique_ios()` before running `_register_custom_op` in order to obtain None filtered `TensorSpec` observations."
+        assert (
+            num_outputs > 0
+        ), f"{_err_msg} we noticed `output_specs` is containing 0 `TensorSpec`. In order to trace the ONNX at least one output `TensorSpec` is required."
 
         schema = self._create_schema_str(torchlib_op_name, fwd_specs, num_outputs)
         CUSTOM_LIB.define(schema)
@@ -224,10 +231,7 @@ class PluginRegisterInterface(ABC):
         @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{torchlib_op_name}")
         def _abstract_impl(module_id, *flat_tensors):
             device = next(t for t in flat_tensors if t is not None).device
-            outs = tuple(
-                torch.empty(ts.shape, dtype=ts.torch_dtype, device=device)
-                for ts in flat_os
-            )
+            outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flat_os)
             return outs[0] if num_outputs == 1 else outs
 
         def _onnx_translation(module_id, *flat_tensors):
@@ -264,9 +268,7 @@ class PluginRegisterInterface(ABC):
                 continue  # TODO: logger warning
             cls_names = set(m.__class__.__name__ for m in modules)
             if len(cls_names) > 1:
-                raise RuntimeError(
-                    f"More than one class candidate for suffix '{suffix}': {cls_names}"
-                )
+                raise RuntimeError(f"More than one class candidate for suffix '{suffix}': {cls_names}")
 
             for orig_m in modules:
                 orig_cls = orig_m.__class__
@@ -294,12 +296,14 @@ class PluginRegisterInterface(ABC):
 
                     # e.g. <OpOverloadPacket(op='hf_module2plugin.Qwen3Attention____model__layers__0__self_attn____case0')>
                     op = getattr(torch.ops.hf_module2plugin, torchlib_op_name)
-                    trace_metadata.append({
-                        "op": op, 
-                        "fwd_specs": case_fwd_specs, 
-                        "unique_io_specs": (input_specs, output_specs),
-                        "has_kv": len(_kv_specs) > 0
-                    })
+                    trace_metadata.append(
+                        {
+                            "op": op,
+                            "fwd_specs": case_fwd_specs,
+                            "unique_io_specs": (input_specs, output_specs),
+                            "has_kv": len(_kv_specs) > 0,
+                        }
+                    )
                 orig_m._trace_metadata = trace_metadata
 
                 traceable_fwd = _make_plugin_forward(orig_cls=orig_cls, module=orig_m)
