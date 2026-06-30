@@ -285,7 +285,7 @@ class ModuleIOSpec:
             this means `unique_ios` returned tuple also contains
             prefill profile at idx 0 and generation profile at idx 1
         """
-        unique_io_paris = []
+        unique_io_pairs = []
         _seen = set()
         for _unq_input_specs, input_specs, output_specs in zip(
             self.unique_obsvd_input_specs, self.obsvd_input_specs, self.obsvd_output_specs
@@ -307,12 +307,12 @@ class ModuleIOSpec:
                 continue
             else:
                 _seen.add(_key)
-                unique_io_paris.append((input_specs, output_specs))
+                unique_io_pairs.append((input_specs, output_specs))
         logger.debug(
             f"unique_ios[{self.cls_name}::{self.module_name}]: "
-            f"{len(self.obsvd_input_specs)} observations → {len(unique_io_paris)} unique case(s)"
+            f"{len(self.obsvd_input_specs)} observations → {len(unique_io_pairs)} unique case(s)"
         )
-        return tuple(unique_io_paris)
+        return tuple(unique_io_pairs)
 
     def pseudo_unique_inputs(self) -> List[INPUT_KWARGS]:
         """

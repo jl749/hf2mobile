@@ -94,7 +94,7 @@ def _make_plugin_forward(
         if trace_metadata is None:
             raise RuntimeError(
                 f"No trace metadata has been registered for `{case=}` on `{orig_cls.__name__}`(id={id(module)})."
-                f"Pleae check the logics under `PluginRegisterInterface.register_plugins(...)`."
+                f"Please check the logics under `PluginRegisterInterface.register_plugins(...)`."
             )
         elif case >= len(trace_metadata):
             raise RuntimeError(
@@ -215,7 +215,7 @@ class PluginRegisterInterface(ABC):
 
         assert all(
             isinstance(spec, TensorSpec) for spec in flatten_specs
-        ), f"{_err_msg} we detected non `TesnorSpec` object under `output_specs`. This is likely a bug please report it with repro codes to the dev."
+        ), f"{_err_msg} we detected non `TensorSpec` object under `output_specs`. This is likely a bug please report it with repro codes to the dev."
         assert all(
             spec.is_empty is False for spec in flatten_specs
         ), f"{_err_msg} we detected `output_specs` is containing empty `TensorSpec`. Please call `ModuleIOSpec.unique_ios()` before running `_register_custom_op` in order to obtain None filtered `TensorSpec` observations."
