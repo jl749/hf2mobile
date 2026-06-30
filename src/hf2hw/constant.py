@@ -8,6 +8,6 @@ ONNX_DOMAIN_NAME = "com.jerry"
 
 # tensor_metadata.py
 KV_CACHE_PARAM_NAME = "past_key_values"
-_NON_HASHABLE_PARAMS: frozenset = frozenset({KV_CACHE_PARAM_NAME,})
+_NON_HASHABLE_PARAMS: frozenset = frozenset({KV_CACHE_PARAM_NAME, "attention_mask", "cache_position"})
 INPUT_SPECS_TYPE = Dict[str, "TensorSpec | Any"]
 OUTPUT_SPECS_TYPE = Tuple[Any, ...]

@@ -4,8 +4,11 @@ import torch
 import transformers
 from transformers.cache_utils import DynamicCache
 
-from .constant import _NON_HASHABLE_PARAMS
-from .tracing import TracerInterface, PluginRegisterInterface, HookRegisterInterface, export_case, register_dynamic_cache_pytree
+from .constant import _NON_HASHABLE_PARAMS, KV_CACHE_PARAM_NAME
+from .tracing import (
+    TracerInterface, PluginRegisterInterface, HookRegisterInterface,
+    export_case, register_dynamic_cache_pytree,
+)
 
 
 class _DecodeWrapper(torch.nn.Module):
@@ -51,32 +54,43 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
         register_dynamic_cache_pytree()
 
     @HookRegisterInterface.register_plugin_io_hooks()
-    def trace_plugin_io(self, model_inputs: Dict[str, Any], **generate_kwargs) -> None:
+    def trace_plugin_ios(self, model_inputs: Dict[str, Any], **generate_kwargs) -> None:
         self.model.generate(**model_inputs, **generate_kwargs)
+
+    # def _build_case_inputs(self) -> List[Dict[str, Any]]:
+    #     """Build concrete model kwargs for each unique case.
+
+    #     ``model_ios.build_pseudo_unique_inputs()`` already materializes every
+    #     captured `TensorSpec` into a `torch.zeros` (or scalar) leaf, preserving
+    #     the nested `past_key_values=[(K, V), ...]` structure.  Two model-level
+    #     adjustments remain:
+    #       - If `past_key_values` is present (decode), wrap the list of pairs
+    #         in a `DynamicCache` so the model can consume it.
+    #       - Otherwise (prefill), set `use_cache=False` so the model doesn't
+    #         emit a `DynamicCache` with empty K/V layers, which breaks FX
+    #         decomposition.
+    #     """
+    #     breakpoint()
+    #     cases = self.model_ios.build_pseudo_unique_inputs()
+    #     for tensors in cases:
+    #         pkv = tensors.get(KV_CACHE_PARAM_NAME)
+    #         if isinstance(pkv, list) and pkv and isinstance(pkv[0], tuple):
+    #             tensors[KV_CACHE_PARAM_NAME] = DynamicCache(ddp_cache_data=pkv)
+    #         else:
+    #             tensors["use_cache"] = False
+    #     return cases
 
     def export(
         self,
-        case_inputs: List[Dict[str, Any]],
+        model_inputs: Dict[str, Any],
         path_template: str = "case{i}.onnx",
-        opset_version: int = 21,
+        opset_version: int = 22,
+        **kwargs,
     ):
-        """Export one ONNX graph per case in ``case_inputs``.
+        self.trace_plugin_ios(model_inputs, **kwargs)
+        self.register_plugins()  # requires `trace_plugin_ios` to be ran first
 
-        ``case_inputs[i]`` is the kwargs dict used to drive the trace for case
-        ``i`` — its shapes must match the i-th entry of every plugin module's
-        ``unique_ios()`` (e.g. case 0 = prefill kwargs, case 1 = decode kwargs
-        with a populated KV cache).  The library makes no assumption about what
-        "case i" means — caller picks the inputs that match the captured profile.
-
-        If any case includes a ``DynamicCache`` under a KV key, the model is
-        transparently wrapped in ``_DecodeWrapper`` and the cache is splayed
-        into ``past_keys`` / ``past_values`` list[Tensor] kwargs so the export
-        graph carries them as named, flat inputs.
-        """
-        self.trace_plugin_io(model_inputs, **kwargs)
-        self.register_plugins()
-
-        for i, inputs in enumerate(case_inputs):
+        for i, inputs in enumerate(self.model_ios.build_pseudo_unique_inputs()):
             path = path_template.format(i=i + 1)
             export_target, export_kwargs = self._maybe_unwrap_cache(inputs)
             token = export_case.set(i)
@@ -89,7 +103,6 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
                     opset_version=opset_version,
                     custom_translation_table=self.custom_onnx_translation,
                 )
-                breakpoint()
             finally:
                 export_case.reset(token)
             print(f"ONNX export successful (case {i + 1}): {path}")

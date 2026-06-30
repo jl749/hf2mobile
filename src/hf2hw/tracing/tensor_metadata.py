@@ -99,18 +99,24 @@ class TensorSpec:
             return cls(dtype=torch.tensor(value).dtype, scalar=value)
         elif isinstance(value, torch.Tensor):
             return cls(shape=value.shape, dtype=value.dtype)
+        elif isinstance(value, transformers.utils.ModelOutput):
+            # only return tensor objects as an output (e.g. Qwen3ForCausalLM)
+            return {k: cls(shape=v.shape, dtype=v.dtype) for k, v in value.items() if isinstance(v, torch.Tensor)}
         elif isinstance(value, transformers.Cache):
-            # NOTE: only works when "Attention" in _cls_name
-            _i = getattr(module, "layer_idx")
-            try:
-                _layer_cache = value.layers[_i]
-                k, v = _layer_cache.keys, _layer_cache.values
-                if k is not None and v is not None and k.numel() > 0:
-                    return (cls(shape=k.shape, dtype=k.dtype), cls(shape=v.shape, dtype=v.dtype))
-                else:
-                    return cls(shape=None, dtype=None)
-            except (IndexError, AttributeError):
-                return cls(shape=None, dtype=None)
+            flat_leaves, _ = torch.utils._pytree.tree_flatten(value)
+            flat_specs = [
+                cls(shape=t.shape, dtype=t.dtype)
+                if (isinstance(t, torch.Tensor) and t.numel() > 0)
+                else cls(shape=None, dtype=None)
+                for t in flat_leaves
+            ]
+            if module is not None and hasattr(module, "layer_idx"):
+                # `Attention`: return only this layer's (K, V) pair
+                i = module.layer_idx
+                return (flat_specs[2 * i], flat_specs[2 * i + 1])
+            else:
+                # `Model-level`: return [(k1, v1), (k2, v2), ...] per layer
+                return [(flat_specs[2 * i], flat_specs[2 * i + 1]) for i in range(len(flat_specs) // 2)]
         else:
             # NOTE: handles Tensors in python native dtypes (list, tuple, nested, ...)
             _flat_leaves, spec = torch.utils._pytree.tree_flatten(value)
@@ -162,20 +168,30 @@ class ModuleIOSpec:
     @staticmethod
     def flatten_io_specs(specs: INPUT_SPECS_TYPE | OUTPUT_SPECS_TYPE, skip_empty=False) -> Tuple[List[TensorSpec], torch.utils._pytree.TreeSpec]:
         if skip_empty:
+            def is_filterable(v) -> bool:
+                # empty TensorSpec leaf, OR container that became empty after filtering
+                if hasattr(v, "is_empty") and v.is_empty:
+                    return True
+                if isinstance(v, (list, tuple, dict)) and len(v) == 0:
+                    return True
+                return False
+
             def filter_empty_specs(node):
-                """Recursively removes empty specs from dicts, lists, and tuples."""
+                """Recursively removes empty specs and collections that become empty."""
                 if isinstance(node, dict):
-                    return {
-                        k: filter_empty_specs(v) 
-                        for k, v in node.items() 
-                        if not (hasattr(v, 'is_empty') and v.is_empty)
-                    }
+                    out = {}
+                    for k, v in node.items():
+                        fv = filter_empty_specs(v)
+                        if not is_filterable(fv):
+                            out[k] = fv
+                    return out
                 elif isinstance(node, (list, tuple)):
-                    return type(node)([
-                        filter_empty_specs(v) 
-                        for v in node 
-                        if not (hasattr(v, 'is_empty') and v.is_empty)
-                    ])
+                    out = []
+                    for v in node:
+                        fv = filter_empty_specs(v)
+                        if not is_filterable(fv):
+                            out.append(fv)
+                    return type(node)(out)
                 return node
             specs = filter_empty_specs(specs)
         try:
@@ -241,18 +257,57 @@ class ModuleIOSpec:
         """
         unique_io_paris = []
         _seen = set()
-        for input_specs, output_specs in zip(self.obsvd_input_specs, self.obsvd_output_specs):
+        for _unq_input_specs, input_specs, output_specs in zip(self.unique_obsvd_input_specs, self.obsvd_input_specs, self.obsvd_output_specs):
+            # when considering the uniqness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs` 
+            _flat_unq_is, _unq_tree = self.flatten_io_specs(specs=_unq_input_specs, skip_empty=True)
+            _unq_input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(_flat_unq_is, _unq_tree)
+
+            # when returning the unique IOs use `self.obsvd_input_specs` and `self.obsvd_output_specs`
             flat_i_specs, i_tree = self.flatten_io_specs(specs=input_specs, skip_empty=True)
             flat_o_specs, o_tree = self.flatten_io_specs(specs=output_specs, skip_empty=True)
             input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(flat_i_specs, i_tree)
             output_specs: OUTPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(flat_o_specs, o_tree)
-            _key = (*self._get_hashable_obsvd_specs([input_specs]), *self._get_hashable_obsvd_specs([output_specs]))
+            _key = (*self._get_hashable_obsvd_specs([_unq_input_specs]), *self._get_hashable_obsvd_specs([output_specs]))
             if _key in _seen:
                 continue
             else:
                 _seen.add(_key)
                 unique_io_paris.append((input_specs, output_specs))
         return tuple(unique_io_paris)
+
+    def build_pseudo_unique_inputs(self) -> List[INPUT_SPECS_TYPE]:
+        """
+        Materialize each unique input_specs into concrete tensors / scalars.
+        Walks the nested structure via `tree_map` and replaces every `TensorSpec` leaf with:
+          - `None`                                if it is empty
+          - its `.scalar` value                   if it is a scalar
+          - `torch.zeros(shape, dtype=...)`       otherwise
+
+        Non-`TensorSpec` leaves (already-materialized values) pass through.
+        """
+        def _materialize(s):
+            if not isinstance(s, TensorSpec):
+                return s
+            if s.is_empty:
+                return None
+            if s.is_scalar:
+                return s.scalar
+            return torch.zeros(s.shape, dtype=s.torch_dtype)
+
+        # build unique pseudo inputs
+        input_cases: List[Dict[str, torch.Tesnor | int | float | None]] = [
+            torch.utils._pytree.tree_map(_materialize, input_specs)
+            for input_specs, _ in self.unique_ios()
+        ]
+
+        # replace KV_CACHE_PARAM_NAME entry from `[(k, v), (k, v), ...]` to `DynamicCache`
+        for input_dict in input_cases:
+            pkv = input_dict.get(KV_CACHE_PARAM_NAME, None)
+            if pkv and isinstance(pkv, list) and isinstance(pkv[0], tuple):
+                input_dict[KV_CACHE_PARAM_NAME] = transformers.DynamicCache(ddp_cache_data=pkv)
+            else:
+                input_dict["use_cache"] = False
+        return input_cases
 
 
 def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[TensorSpec, TensorSpec] | Tuple[()]:

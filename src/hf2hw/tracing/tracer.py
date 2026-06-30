@@ -34,7 +34,7 @@ class TracerInterface(ABC):
         return suffix2modules
 
     @abstractmethod
-    def trace(self, model_inputs: Dict[str, Any], **kwargs) -> None:
+    def trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
         """Inference steps to export"""
         pass
 

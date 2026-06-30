@@ -7,34 +7,30 @@ from hf2hw import CausalLMExporter
 def main():
     model_name = "Qwen/Qwen3-0.6B"
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="auto",
-    ).cpu()
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto").cpu()
     model.eval()
 
-    prompt = "Hello"
+    prompt = "Where is Paris located?"
     messages = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True,
     )
     model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-    # Phase 1 + 2: observe a short generation to capture per-case IO profiles,
-    # then patch the plugin modules' forward in place.
-    tracer = CausalLMExporter(
-        model,
+    exporter = CausalLMExporter(
+        model=model,
         plugin_suffix=("Attention", "RotaryEmbedding"),
-        # plugin_suffix=("RotaryEmbedding"),
     )
-    tracer.trace_plugin_io(
-        model_inputs={
-            "input_ids": model_inputs["input_ids"],
-            "attention_mask": model_inputs["attention_mask"]
-        },
-        max_new_tokens=2,
+    exporter.export(
+        model_inputs=model_inputs,
+        path_template="case{i}.onnx",
+        opset_version=22,
+        max_new_tokens=10,
         do_sample=False,
     )
+    breakpoint()
 
     # Build a populated KV cache by running one prefill pass through the (now
     # patched-but-pass-through) model; we need it for case-1 (decode) export.

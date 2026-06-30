@@ -43,18 +43,10 @@ def register_dynamic_cache_pytree() -> None:
     def _unflatten(pairs, num_layers):
         return DynamicCache(ddp_cache_data=list(pairs))
 
-    def _flatten_with_keys(cache: DynamicCache):
-        return [
-            (pytree.SequenceKey(li), (layer.keys, layer.values))
-            for li, layer in enumerate(cache.layers)
-        ], len(cache.layers)
-
-    torch.utils._pytree.register_pytree_node(
-        DynamicCache,
-        _flatten,
-        _unflatten,
-        flatten_with_keys_fn=_flatten_with_keys,
-    )
+    try:
+        torch.utils._pytree.register_pytree_node(DynamicCache, _flatten, _unflatten)
+    except ValueError:
+        pass  # already registered (newer transformers registers DynamicCache itself)
     _CACHE_PYTREE_REGISTERED = True
 
 
@@ -131,7 +123,6 @@ def _make_plugin_forward(
         else:
             cache_param_name = None
 
-        breakpoint()  # TODO: fwdspecs2kwargs instead?
         flat = fwdspecs2args(case_fwd_specs, bound_args)
         result = op(id(self_module), *flat)
 
@@ -263,18 +254,7 @@ class PluginRegisterInterface(ABC):
         self.onnxop2torchlibop[onnx_op_name].add(torchlib_op_name)
 
     def register_plugins(self):
-        """Patch each plugin module's ``forward`` and register one op per case.
-
-        For every module in ``get_plugin_modules()``:
-            - Pull ``unique_ios()`` for that ``(cls_name, module_name)`` — for
-              CausalLM this is 2 cases (prefill, decode); generically N cases.
-            - Per case, filter the signature's fwd_specs against the captured
-              ``sinput_spec`` so case 0 (no KV) and case 1 (with KV) get
-              distinct schemas.
-            - Register the op (schema + fake + ONNX translation).
-            - Attach ``_case_ops`` to the module so ``plugin_forward`` can
-              dispatch by ``export_case.get()``.
-        """
+        """Register custom op that can replace the module"""
         name2modules_dict = self.get_plugin_modules(plugin_suffix=self.plugin_suffix)
         if isinstance(name2modules_dict, list):
             name2modules_dict = {self.plugin_suffix[0]: name2modules_dict}
