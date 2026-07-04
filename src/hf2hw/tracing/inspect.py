@@ -33,10 +33,10 @@ def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPE
         - update the "unknown" `FwdSpec` kinds by inspecting the input `TensorSpec`s
         - drop the unused params from `fwd_specs` based on `input_specs` observation
     Args:
-        fwd_specs: list of the `FwdSpec`s collected by inspecting the forward signatures
+        fwd_specs: list of the `FwdSpec`s collected by inspecting the forward signatures (PyTorch inputs)
         input_specs: list of the `TensorSpec`s containing the input activation info
     Returns:
-        new `fwd_specs` now covering the specific `input_specs` case
+        new `fwd_specs` now covering the specific `input_specs` case (ONNX inputs)
     """
     updated_fwd_specs: List[FwdSpec] = []
     for fs in fwd_specs:

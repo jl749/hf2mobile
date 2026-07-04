@@ -8,6 +8,10 @@ already stamped on the placeholder, so wiring is 1:1.
 NOTE: weights from the standalone ONNX are inlined as ``Constant`` nodes inside
 the FunctionProto (FunctionProto has no graph-level initializers). This grows
 file size — optimize later by hoisting weights to the parent model.
+
+Norm fusion is *not* performed here: subblock norms are already fused inside
+``submodules/attention.py`` at export time, and main-graph norm fusion is done
+explicitly by ``SubgraphExporterInterface._merge_subgraphs_into_main_graph``.
 """
 
 from typing import Dict, List
@@ -15,10 +19,8 @@ from typing import Dict, List
 import onnx
 from onnx import FunctionProto, ModelProto, helper
 
-from hf2hw.constant import ONNX_DOMAIN_NAME
-from hf2hw.utils.logger import logger
-
-from .fuse import fuse_rms_norm
+from ...constant import ONNX_DOMAIN_NAME
+from ...utils.logger import logger
 
 _PLACEHOLDER_ATTR = "torchlib_op_name"
 
@@ -27,22 +29,13 @@ def onnx_to_function(
     submodule_onnx_path: str,
     function_name: str,
     domain: str = ONNX_DOMAIN_NAME,
-    fuse_norms: bool = True,
 ) -> FunctionProto:
     """Load a standalone submodule ONNX and convert its graph to a FunctionProto.
 
     Initializers are inlined as ``Constant`` nodes prepended to the function body,
     since FunctionProto does not accept graph-level initializers.
-
-    If ``fuse_norms`` is True, RMSNorm subgraphs inside the standalone ONNX are
-    fused into opset-23 ``RMSNormalization`` nodes before packing.
     """
     m = onnx.load(submodule_onnx_path, load_external_data=True)
-
-    if fuse_norms:
-        m, n_fused = fuse_rms_norm(m)
-        if n_fused:
-            logger.debug(f"onnx_to_function: fused {n_fused} RMSNorm(s) in {function_name!r}")
 
     g = m.graph
     init_nodes = [
@@ -67,28 +60,28 @@ def onnx_to_function(
     return func
 
 
-def merge_subblocks_into_model(
+def merge_subgraphs_into_model(
     case_path: str,
     torchlib_op_to_submodule_path: Dict[str, str],
-    placeholder_op_type: str,
     domain: str = ONNX_DOMAIN_NAME,
     out_path: str | None = None,
-    fuse_subblock_norms: bool = True,
-    fuse_main_graph_norms: bool = True,
 ) -> str:
     """Rewrite placeholder nodes in ``case_path`` to call inlined FunctionProtos.
 
-    For every node whose ``op_type == placeholder_op_type``:
-        1. Read its ``torchlib_op_name`` attribute.
-        2. Look up the matching standalone ONNX in ``torchlib_op_to_submodule_path``.
-        3. Build a FunctionProto named after ``torchlib_op_name``.
-        4. Rewrite the node's ``op_type`` to ``torchlib_op_name`` (domain unchanged).
-        5. Append the FunctionProto to ``model.functions``.
+    A placeholder node is any node in ``domain`` carrying a ``torchlib_op_name``
+    attribute. For each such node whose ``torchlib_op_name`` is present in
+    ``torchlib_op_to_submodule_path``:
+        1. Build a FunctionProto named after ``torchlib_op_name`` from its
+           standalone ONNX (once per unique name).
+        2. Rewrite the node's ``op_type`` to ``torchlib_op_name`` (domain unchanged).
+        3. Append the FunctionProto to ``model.functions``.
+
+    Nodes whose ``torchlib_op_name`` is not in the mapping (e.g. a different case,
+    or an unimplemented plugin type) are left untouched.
 
     Args:
         case_path: existing ``case{i}.onnx`` to patch.
         torchlib_op_to_submodule_path: ``{torchlib_op_name: standalone_onnx_path}``.
-        placeholder_op_type: e.g. ``"CustomAttention"``.
         domain: ONNX domain for both placeholder nodes and emitted functions.
         out_path: target path; defaults to ``case_path`` (in-place).
 
@@ -103,30 +96,24 @@ def merge_subblocks_into_model(
     seen_fn_names = {(f.domain, f.name) for f in model.functions}
 
     for node in model.graph.node:
-        if node.op_type != placeholder_op_type or node.domain != domain:
+        if node.domain != domain:
             continue
         attr = next((a for a in node.attribute if a.name == _PLACEHOLDER_ATTR), None)
         if attr is None:
-            logger.warning(
-                f"merge_subblocks_into_model: placeholder node {node.name or '?'} of "
-                f"type {placeholder_op_type!r} has no {_PLACEHOLDER_ATTR!r} attribute; skipping."
-            )
             continue
         torchlib_op_name = attr.s.decode() if isinstance(attr.s, (bytes, bytearray)) else str(attr.s)
 
         sub_path = torchlib_op_to_submodule_path.get(torchlib_op_name)
         if sub_path is None:
             logger.warning(
-                f"merge_subblocks_into_model: no standalone ONNX provided for "
+                f"merge_subgraphs_into_model: no standalone ONNX provided for "
                 f"{torchlib_op_name!r}; leaving placeholder in place."
             )
             continue
 
         # Build & register the function (skip if a same-named function is already present).
         if (domain, torchlib_op_name) not in seen_fn_names:
-            func = onnx_to_function(
-                sub_path, function_name=torchlib_op_name, domain=domain, fuse_norms=fuse_subblock_norms
-            )
+            func = onnx_to_function(sub_path, function_name=torchlib_op_name, domain=domain)
             _ensure_opset_imports(model, func.opset_import)
             model.functions.append(func)
             seen_fn_names.add((domain, torchlib_op_name))
@@ -151,17 +138,10 @@ def merge_subblocks_into_model(
         _clear_attributes(node, names={_PLACEHOLDER_ATTR})
         rewritten += 1
 
-    # Fuse RMSNorm expansions in the main graph (input_layernorm, post_attention_layernorm, …).
-    n_main_fused = 0
-    if fuse_main_graph_norms:
-        model, n_main_fused = fuse_rms_norm(model)
-
     onnx.save(model, out_path)
     logger.info(
-        f"merge_subblocks_into_model: {case_path} → {out_path} "
-        f"({rewritten} node(s) rewritten, {len(appended_fn_names)} function(s) appended"
-        + (f", {n_main_fused} main-graph RMSNorm(s) fused" if n_main_fused else "")
-        + ")"
+        f"merge_subgraphs_into_model: {case_path} → {out_path} "
+        f"({rewritten} node(s) rewritten, {len(appended_fn_names)} function(s) appended)"
     )
     return out_path
 
@@ -184,4 +164,4 @@ def _clear_attributes(node, names) -> None:
     node.attribute.extend(keep)
 
 
-__all__ = ["onnx_to_function", "merge_subblocks_into_model"]
+__all__ = ["onnx_to_function", "merge_subgraphs_into_model"]

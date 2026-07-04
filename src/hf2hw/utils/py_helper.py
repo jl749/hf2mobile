@@ -3,7 +3,7 @@ import io
 import logging
 import os
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 
@@ -12,6 +12,11 @@ def check_parent_field(obj: object, field_name: str):
         raise AttributeError(
             f"{obj.__class__.__name__} is missing required field `{field_name}`. Please make sure you set `self.{field_name}` before calling ABC initialization."
         )
+
+
+def create_torchlib_op_name(cls_name: str, module_name: str, case_idx: int) -> str:
+    torchlib_op_name = f"{cls_name}____{module_name.replace('.', '__')}____case{case_idx}"
+    return torchlib_op_name
 
 
 def with_temp_dir(method):
@@ -34,7 +39,7 @@ def suppress_onnx_export_logs():
         lg.setLevel(logging.WARNING)
     _buf = io.StringIO()
     try:
-        with contextlib.redirect_stdout(_buf):
+        with redirect_stdout(_buf):
             yield
     finally:
         for lg, lvl in zip(_loggers, _orig_levels):

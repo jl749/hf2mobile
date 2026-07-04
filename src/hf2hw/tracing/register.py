@@ -2,7 +2,7 @@ import contextvars
 import inspect
 from abc import ABC
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import onnx_ir
 import torch
@@ -10,7 +10,7 @@ import transformers
 from torch.onnx._internal.exporter import _core as _onnx_core
 
 from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, ONNX_DOMAIN_NAME
-from hf2hw.utils import check_parent_field, register_dynamic_cache_pytree, update_input_cache
+from hf2hw.utils import check_parent_field, create_torchlib_op_name, register_dynamic_cache_pytree, update_input_cache
 from hf2hw.utils.logger import logger
 
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, fwdspecs2args, sig2fwdspecs
@@ -25,7 +25,7 @@ export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("exp
 def _make_plugin_forward(
     orig_cls: Any,
     module: torch.nn.Module,
-):
+) -> Callable:
     """
     Plugin forward factory function
     Returned forward function overwrites existing plugin `nn.Module` forward
@@ -232,20 +232,20 @@ class PluginRegisterInterface(ABC):
                 sig = inspect.signature(orig_cls.forward)
                 fwd_specs: List[FwdSpec] = sig2fwdspecs(sig)
 
-                name = self._module2name[orig_m]
-                unique_io_cases = self.plugin_ios[f"{orig_cls.__name__}::{name}"].unique_ios()
+                module_name = self._module2name[orig_m]
+                unique_io_cases = self.plugin_ios[f"{orig_cls.__name__}::{module_name}"].unique_ios()
                 if not unique_io_cases:
                     logger.warning(
-                        f"{orig_cls.__name__}::{name} has no observed IOs; "
+                        f"{orig_cls.__name__}::{module_name} has no observed IOs; "
                         f"_plugin_forward will raise at export time. "
                         f"Did `trace_plugin_ios` run? Is this module reached during generate()?"
                     )
                     continue
 
                 trace_metadata: List[Dict[str, Any]] = []
-                for i, (input_specs, output_specs) in enumerate(unique_io_cases):
+                for case_idx, (input_specs, output_specs) in enumerate(unique_io_cases):
                     case_fwd_specs = apply_input_specs2fwd_specs(fwd_specs, input_specs)
-                    torchlib_op_name = f"{orig_cls.__name__}____{name.replace('.', '__')}____case{i}"
+                    torchlib_op_name = create_torchlib_op_name(orig_cls.__name__, module_name, case_idx + 1)
 
                     # NOTE: in case KV caches are observed under `input_specs` append KV to `output_specs` (ONNX tracing purpose)
                     _kv_specs = get_kv_specs_from_input_specs(input_specs)

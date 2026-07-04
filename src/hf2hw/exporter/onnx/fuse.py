@@ -67,7 +67,14 @@ def _scalar(val: ir.Value) -> float | None:
 def _cast_rule(cast_back_to: int) -> pattern.RewriteRule:
     """Rule for non-fp32 models: Cast-in → … → Cast-out → Mul(scale)."""
 
-    def pat(op, x, scale, pow_exp, axes, epsilon):
+    def pat(
+        op: pattern.OpsetPatternBuilder,
+        x: pattern.Var,
+        scale: pattern.Var,
+        pow_exp: pattern.Var,
+        axes: pattern.Var,
+        epsilon: pattern.Var,
+    ):
         x_f32 = op.Cast(x, to=onnx.TensorProto.FLOAT)
         sq = op.Pow(x_f32, pow_exp)
         mean_sq = op.ReduceMean(sq, axes)
@@ -78,11 +85,25 @@ def _cast_rule(cast_back_to: int) -> pattern.RewriteRule:
         normed_bc = op.Cast(normed, to=cast_back_to)
         return op.Mul(scale, normed_bc)
 
-    def repl(op, x, scale, pow_exp, axes, epsilon):
+    def repl(
+        op: pattern.RewriterContext,
+        x: ir.Value,
+        scale: ir.Value,
+        pow_exp: ir.Value,
+        axes: ir.Value,
+        epsilon: ir.Value,
+    ):
         eps = _scalar(epsilon) or 1e-6
         return op.RMSNormalization(x, scale, epsilon=eps, stash_type=onnx.TensorProto.FLOAT, axis=-1)
 
-    def cond(context, x, scale, pow_exp, axes, epsilon):
+    def cond(
+        context: "MatchContext",
+        x: ir.Value,
+        scale: ir.Value,
+        pow_exp: ir.Value,
+        axes: ir.Value,
+        epsilon: ir.Value,
+    ):
         p = _scalar(pow_exp)
         return p is not None and abs(p - 2.0) < 1e-6
 
@@ -92,7 +113,14 @@ def _cast_rule(cast_back_to: int) -> pattern.RewriteRule:
 def _fp32_rule() -> pattern.RewriteRule:
     """Rule for fp32 models: no surrounding Cast nodes."""
 
-    def pat(op, x, scale, pow_exp, axes, epsilon):
+    def pat(
+        op: pattern.OpsetPatternBuilder,
+        x: pattern.Var,
+        scale: pattern.Var,
+        pow_exp: pattern.Var,
+        axes: pattern.Var,
+        epsilon: pattern.Var,
+    ):
         sq = op.Pow(x, pow_exp)
         mean_sq = op.ReduceMean(sq, axes)
         added = op.Add(mean_sq, epsilon)
@@ -101,11 +129,25 @@ def _fp32_rule() -> pattern.RewriteRule:
         normed = op.Mul(x, rsqrt)
         return op.Mul(scale, normed)
 
-    def repl(op, x, scale, pow_exp, axes, epsilon):
+    def repl(
+        op: pattern.RewriterContext,
+        x: ir.Value,
+        scale: ir.Value,
+        pow_exp: ir.Value,
+        axes: ir.Value,
+        epsilon: ir.Value,
+    ):
         eps = _scalar(epsilon) or 1e-6
         return op.RMSNormalization(x, scale, epsilon=eps, stash_type=onnx.TensorProto.FLOAT, axis=-1)
 
-    def cond(context, x, scale, pow_exp, axes, epsilon):
+    def cond(
+        context: "MatchContext",
+        x: ir.Value,
+        scale: ir.Value,
+        pow_exp: ir.Value,
+        axes: ir.Value,
+        epsilon: ir.Value,
+    ):
         p = _scalar(pow_exp)
         return p is not None and abs(p - 2.0) < 1e-6
 
@@ -143,7 +185,17 @@ def _rope_rule() -> pattern.RewriteRule:
     axis condition is applied — the structural pattern is distinctive enough.
     """
 
-    def pat(op, x, cos_us, sin_us, start_a, half_a, end_a, axes_a, steps_a):
+    def pat(
+        op: pattern.OpsetPatternBuilder,
+        x: pattern.Var,
+        cos_us: pattern.Var,
+        sin_us: pattern.Var,
+        start_a: pattern.Var,
+        half_a: pattern.Var,
+        end_a: pattern.Var,
+        axes_a: pattern.Var,
+        steps_a: pattern.Var,
+    ):
         x_cos = op.Mul(x, cos_us)
         x_first = op.Slice(x, start_a, half_a, axes_a, steps_a)
         x_second = op.Slice(x, half_a, end_a, axes_a, steps_a)
@@ -152,7 +204,17 @@ def _rope_rule() -> pattern.RewriteRule:
         rot_sin = op.Mul(rotated, sin_us)
         return op.Add(x_cos, rot_sin)
 
-    def repl(op, x, cos_us, sin_us, start_a, half_a, end_a, axes_a, steps_a):
+    def repl(
+        op: pattern.RewriterContext,
+        x: ir.Value,
+        cos_us: ir.Value,
+        sin_us: ir.Value,
+        start_a: ir.Value,
+        half_a: ir.Value,
+        end_a: ir.Value,
+        axes_a: ir.Value,
+        steps_a: ir.Value,
+    ):
         cos = _unwrap_unsqueeze(cos_us) or cos_us
         sin = _unwrap_unsqueeze(sin_us) or sin_us
         return op.RotaryEmbedding(x, cos, sin)
@@ -171,7 +233,7 @@ def fuse_rms_norm(model: onnx.ModelProto) -> Tuple[onnx.ModelProto, int]:
         model: input ONNX model (modified in-place via onnx_ir round-trip).
 
     Returns:
-        `(patched_model, n_fusions)`
+        `(patched_model, num_fusions)`
     """
     model_ir = ir.from_proto(model)
     new_model_ir = rewriter.rewrite(model_ir, pattern_rewrite_rules=_RMS_RULE_SET)
@@ -198,7 +260,7 @@ def fuse_rope(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
         model: input ONNX model.
 
     Returns:
-        ``(patched_model, n_fusions)``
+        `(patched_model, num_fusions)`
     """
     rule_set = pattern.RewriteRuleSet([_rope_rule()])
     model_ir = ir.from_proto(model)

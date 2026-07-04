@@ -15,6 +15,7 @@ class TracerInterface(ABC):
     def __init__(self, model: transformers.PreTrainedModel, plugin_suffix: Sequence[str]):
         self.plugin_suffix = (plugin_suffix,) if isinstance(plugin_suffix, str) else plugin_suffix
         # TODO: evaluate plugin_suffix -> Attention, RotaryEmbedding supported for now ...
+        # TODO: plugin_suffix cannot be empty
         self.plugin_ios: Dict[str, ModuleIOSpec] = {}
 
         self.model = model
@@ -42,7 +43,7 @@ class TracerInterface(ABC):
         return suffix2modules
 
     @abstractmethod
-    def trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
+    def _trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
         """Inference steps to export"""
         pass
 

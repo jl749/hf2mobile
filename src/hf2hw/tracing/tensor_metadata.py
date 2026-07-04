@@ -181,6 +181,21 @@ class TensorSpec:
                 )
 
 
+def input_specs2pseudo_inputs(input_specs: INPUT_SPECS_TYPE) -> INPUT_KWARGS_TYPE:
+    """Create fake input tensors: INPUT_SPECS_TYPE -> INPUT_KWARGS_TYPE"""
+
+    def _materialize(s):
+        if not isinstance(s, TensorSpec):
+            return s
+        if s.is_empty:
+            return None
+        if s.is_scalar:
+            return s.scalar
+        return torch.zeros(s.shape, dtype=s.torch_dtype)
+
+    return torch.utils._pytree.tree_map(_materialize, input_specs)
+
+
 @dataclass
 class ModuleIOSpec:
     """
@@ -285,7 +300,7 @@ class ModuleIOSpec:
         """
         Return unique (input_specs, output_specs) pairs
         When considering the uniqness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
-        Output tuple will always return the IO metadata pairs in observed order
+        Output tuple will always return the IO metadata pairs in observation order
         e.g.
             when `generate` is called on the transformers CausalLM models
             prefill runs first taking index 0 for both `obsvd_input_specs` and `obsvd_output_specs`
@@ -339,21 +354,7 @@ class ModuleIOSpec:
             ...
         ]
         """
-
-        def _materialize(s):
-            if not isinstance(s, TensorSpec):
-                return s
-            if s.is_empty:
-                return None
-            if s.is_scalar:
-                return s.scalar
-            return torch.zeros(s.shape, dtype=s.torch_dtype)
-
-        # build unique pseudo inputs
-        input_cases: List[INPUT_KWARGS_TYPE] = [
-            torch.utils._pytree.tree_map(_materialize, input_specs) for input_specs, _ in self.unique_ios()
-        ]
-        return input_cases
+        return [input_specs2pseudo_inputs(specs) for specs, _ in self.unique_ios()]
 
 
 def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[TensorSpec, TensorSpec] | Tuple[()]:
@@ -371,4 +372,4 @@ def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[Tensor
         return ()
 
 
-__all__ = ["convert_dtype", "TensorSpec", "ModuleIOSpec", "get_kv_specs_from_input_specs"]
+__all__ = ["convert_dtype", "TensorSpec", "input_specs2pseudo_inputs", "ModuleIOSpec", "get_kv_specs_from_input_specs"]
