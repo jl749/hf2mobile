@@ -25,7 +25,7 @@ def main():
     exporter.export(
         model_inputs=model_inputs,
         path_template="case{i}.onnx",
-        opset_version=22,
+        opset_version=25,
         max_new_tokens=10,
         do_sample=False,
     )

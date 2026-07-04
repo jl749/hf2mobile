@@ -5,16 +5,16 @@ from typing import Dict, List
 
 import torch
 
+from hf2hw.utils import check_parent_field
 from hf2hw.utils.logger import logger
-from hf2hw.utils.py_helper import check_parent_field
 
 from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, ModuleIOSpec, TensorSpec
 
 
 class HookRegisterInterface(ABC):
     def __init__(self):
-        self.model_ios: ModuleIOSpec | None = None
-        self.plugin_ios: Dict[str, ModuleIOSpec] = {}
+        self.model_ios: ModuleIOSpec | None = None  # HF model IO pairs
+        self.plugin_ios: Dict[str, ModuleIOSpec] = {}  # User specified plugin IO paris
         self._hook_handles: List[torch.utils.hooks.RemovableHook] = []
         check_parent_field(self, "_module2name")
         check_parent_field(self, "model")

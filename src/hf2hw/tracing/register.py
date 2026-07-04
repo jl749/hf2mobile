@@ -2,71 +2,24 @@ import contextvars
 import inspect
 from abc import ABC
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import onnx_ir
 import torch
 import transformers
 from torch.onnx._internal.exporter import _core as _onnx_core
-from transformers.cache_utils import DynamicCache
 
-from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, KV_CACHE_PARAM_NAME, ONNX_DOMAIN_NAME
+from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, ONNX_DOMAIN_NAME
+from hf2hw.utils import check_parent_field, register_dynamic_cache_pytree, update_input_cache
 from hf2hw.utils.logger import logger
-from hf2hw.utils.py_helper import check_parent_field
 
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, fwdspecs2args, sig2fwdspecs
-from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_input_specs
-
-_CACHE_PYTREE_REGISTERED = False
+from .tensor_metadata import OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_input_specs
 
 # case index threaded by `CausalLMTracer.export_graphs`
 # each module's `plugin_forward` picks the right per-case op.
 # `None` means no export in progress -> `plugin_forward` falls straight through to `orig_cls.forward`.
 export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("export_case", default=None)
-
-
-def register_dynamic_cache_pytree() -> None:
-    """
-    Register DynamicCache as a pytree whose direct children are per-layer (K, V) pairs.
-    tree_flatten(cache) -> leaves [K0, V0, K1, V1, ...]
-    Layer i: (leaves[2*i], leaves[2*i+1])
-    """
-    global _CACHE_PYTREE_REGISTERED
-    if _CACHE_PYTREE_REGISTERED:
-        return
-
-    def _flatten(cache: DynamicCache):
-        return [(layer.keys, layer.values) for layer in cache.layers], len(cache.layers)
-
-    def _unflatten(pairs, num_layers):
-        return DynamicCache(ddp_cache_data=list(pairs))
-
-    try:
-        torch.utils._pytree.register_pytree_node(DynamicCache, _flatten, _unflatten)
-    except ValueError:
-        pass  # already registered (newer transformers registers DynamicCache itself)
-    _CACHE_PYTREE_REGISTERED = True
-
-
-def _update_input_cache(input_dict: dict, layer_idx: int) -> str | None:
-    """
-    Update Attention.forward input KV cache so that it see the relevant cache index only
-    Args:
-        input_dict: .forward inputs with default entries
-            `dict(sig.bound_partial(*args, **kwargs).apply_defaults().arguments())`
-        layer_idx: in order to extract the local cache from `transformers.Cache` object
-            we need to know the exact layer_idx (local cache location)
-    Returns:
-        updated input KV cache param name or None
-    """
-    cache_param_name = None
-    value = input_dict.get(KV_CACHE_PARAM_NAME, None)
-    if isinstance(value, transformers.Cache):
-        flat, _ = torch.utils._pytree.tree_flatten(value)
-        kv_cache_tuple = (flat[2 * layer_idx], flat[2 * layer_idx + 1])
-        input_dict[KV_CACHE_PARAM_NAME] = kv_cache_tuple
-        cache_param_name = KV_CACHE_PARAM_NAME
-    return cache_param_name
 
 
 def _make_plugin_forward(
@@ -108,19 +61,19 @@ def _make_plugin_forward(
 
         bound = sig_wo_self.bind_partial(*args, **kwargs)
         bound.apply_defaults()
-        bound_args = dict(bound.arguments)  # copy bound
+        input_dict = dict(bound.arguments)  # copy bound
 
         if has_kv:
             layer_idx = getattr(self_module, "layer_idx", None)
             assert (
                 layer_idx is not None
             ), f"Attribute `{self_module.__class__.__name__}.layer_idx` does not exist (id={id(self_module)})."
-            cache_param_name = _update_input_cache(bound_args, self_module.layer_idx)
-            assert cache_param_name is not None, "No cache params found under `bound_args`"
+            cache_param_name = update_input_cache(input_dict, self_module.layer_idx)
+            assert cache_param_name is not None, "No cache params found under `input_dict`"
         else:
             cache_param_name = None
 
-        flat = fwdspecs2args(case_fwd_specs, bound_args)
+        flat = fwdspecs2args(case_fwd_specs, input_dict)
         result = op(id(self_module), *flat)
 
         if has_kv:
