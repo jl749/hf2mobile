@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import tempfile
+import warnings
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
@@ -39,7 +40,12 @@ def suppress_onnx_export_logs():
         lg.setLevel(logging.WARNING)
     _buf = io.StringIO()
     try:
-        with redirect_stdout(_buf):
+        with warnings.catch_warnings(), redirect_stdout(_buf):
+            warnings.filterwarnings(
+                "ignore",
+                category=FutureWarning,
+                message=r"`(isinstance\(treespec, LeafSpec\)|treespec\.children_specs).*",
+            )
             yield
     finally:
         for lg, lvl in zip(_loggers, _orig_levels):

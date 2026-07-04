@@ -22,7 +22,6 @@ Shapes set explicitly (inference cannot cross FunctionProto boundaries):
 from typing import Sequence
 
 import onnx
-from onnx import ModelProto, TensorProto, shape_inference
 
 from hf2hw.utils.logger import logger
 
@@ -36,7 +35,7 @@ def _set_dim(vi: onnx.ValueInfoProto, axis: int, symbol: str) -> None:
     dim.dim_param = symbol
 
 
-def _drop_inputs(model: ModelProto, names: Sequence[str]) -> None:
+def _drop_inputs(model: onnx.ModelProto, names: Sequence[str]) -> None:
     """Remove named entries from graph.input (assumes they have no consumers)."""
     drop = set(names)
     keep = [vi for vi in model.graph.input if vi.name not in drop]
@@ -47,7 +46,7 @@ def _drop_inputs(model: ModelProto, names: Sequence[str]) -> None:
 # ── per-case logic ────────────────────────────────────────────────────────────
 
 
-def _apply_prefill(model: ModelProto, seq_sym: str) -> None:
+def _apply_prefill(model: onnx.ModelProto, seq_sym: str) -> None:
     """Rewrite case1 (prefill) inputs in-place."""
     for vi in model.graph.input:
         if vi.name in ("input_ids", "position_ids"):
@@ -56,7 +55,7 @@ def _apply_prefill(model: ModelProto, seq_sym: str) -> None:
 
 
 def _apply_generation(
-    model: ModelProto,
+    model: onnx.ModelProto,
     prev_sym: str,
     curr_sym: str,
 ) -> None:
@@ -77,7 +76,7 @@ def _apply_generation(
             _set_dim(vi, 2, curr_sym)
 
 
-def _is_generation(model: ModelProto) -> bool:
+def _is_generation(model: onnx.ModelProto) -> bool:
     return any(vi.name.startswith("past_keys_") for vi in model.graph.input)
 
 
@@ -85,12 +84,12 @@ def _is_generation(model: ModelProto) -> bool:
 
 
 def make_dynamic_shapes(
-    model: ModelProto,
+    model: onnx.ModelProto,
     *,
     seq_sym: str = "L",
     prev_sym: str = "L_prev",
     curr_sym: str = "L_curr",
-) -> ModelProto:
+) -> onnx.ModelProto:
     """Rewrite static traced shapes to symbolic dims and re-run shape inference.
 
     Automatically detects prefill vs generation by the presence of
@@ -121,7 +120,7 @@ def make_dynamic_shapes(
     # Note: shape inference cannot cross FunctionProto subblock boundaries,
     # so only main-graph intermediates between subblocks are updated.
     del model.graph.value_info[:]
-    model = shape_inference.infer_shapes(model, check_type=True, strict_mode=False)
+    model = onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=False)
 
     n_vi = len(model.graph.value_info)
     logger.debug(f"make_dynamic_shapes: shape inference filled {n_vi} value_info entries")

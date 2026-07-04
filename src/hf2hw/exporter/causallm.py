@@ -126,7 +126,7 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
             logger.info(f"  case {i + 1}/{num_uniq_cases} ✓ written: {path}")
             case_paths.append(path)
 
-        logger.info("Stage 5/6: merging SubBlocks into case graphs + fusing main-graph norms")
+        logger.info("Stage 5/6: merging Subgraphs into the main graphs")
         self._merge_subgraphs_into_main_graph(case_paths, subgraph_paths)
 
         logger.info("Stage 6/6: making shapes dynamic + re-running shape inference")

@@ -13,3 +13,6 @@ _NON_HASHABLE_PARAMS: frozenset = frozenset({KV_CACHE_PARAM_NAME, "attention_mas
 INPUT_KWARGS_TYPE = Dict[str, Any]
 INPUT_SPECS_TYPE = Dict[str, "TensorSpec | Any"]
 OUTPUT_SPECS_TYPE = Tuple[Any, ...]
+
+# subgraph.py
+SUBGRAPH_MAP_TYPE = Dict[int, Dict[str, str]]
