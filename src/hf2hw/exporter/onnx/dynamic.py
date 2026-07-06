@@ -14,15 +14,28 @@ Shapes set explicitly (inference cannot cross FunctionProto boundaries):
   case2 – generation
     inputs:   past_keys_*[1,H,L_prev,E], past_values_*[1,H,L_prev,E]
     dropped:  attention_mask
-    outputs:  past_keys_*_out[1,H,L_curr,E], past_values_*_out[1,H,L_curr,E]
-              (L_curr = L_prev+1; expressed as a distinct symbol because ONNX
-               dim_param is a free string, not arithmetic)
+    outputs:  past_keys_*_out[1,H,L_prev+1,E], past_values_*_out[1,H,L_prev+1,E]
+              ("L_prev+1" is used as a literal dim_param label — ONNX dim_param is a
+               free string, not arithmetic — to document the past+current relation)
+
+Frozen reshapes (two coupled fixes):
+  ``torch.onnx.export`` bakes the traced sequence length into its Reshape target shapes
+  (e.g. ``[1, 123, -1, 64]``) AND stamps the node with ``allowzero=1``. To un-freeze the
+  seq dim we:
+    1. rewrite the sentinel trace length (``constant.TRACE_L``) to ``0`` in Reshape shape
+       constants — a ``0`` means "copy the input's dim at that axis"; and
+    2. reset ``allowzero=0`` so that ``0`` is honored as a copy instead of a literal
+       zero-size dim.
+  With both, the reshape copies the (now dynamic) input seq dim and inference propagates
+  it instead of the frozen value.
 """
 
 from typing import Sequence
 
 import onnx
+from onnx import numpy_helper
 
+from hf2hw.constant import TRACE_L
 from hf2hw.utils.logger import logger
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -66,7 +79,7 @@ def _apply_generation(
             _set_dim(vi, 2, prev_sym)
     _drop_inputs(model, ["attention_mask"])
 
-    # Outputs: updated KV dim-2 → L_curr  (= L_prev + 1)
+    # Outputs: updated KV dim-2 → "L_prev+1" (past + current token)
     for vi in model.graph.output:
         if (
             vi.name.endswith(("_keys_out", "_values_out"))
@@ -80,6 +93,81 @@ def _is_generation(model: onnx.ModelProto) -> bool:
     return any(vi.name.startswith("past_keys_") for vi in model.graph.input)
 
 
+def _rebind_reshape_trace_seq(model: onnx.ModelProto, trace_len: int = TRACE_L) -> int:
+    """Rewrite the baked trace sequence length to ``0`` in Reshape shape constants.
+
+    We trace with the unique sentinel ``trace_len`` (``constant.TRACE_L``), so any
+    ``trace_len`` inside a Reshape's shape tensor is the frozen sequence dim. Rewriting it
+    to ``0`` makes ONNX copy that dim from the (dynamic) Reshape *input* at the same axis
+    (paired with ``allowzero=0``; see ``_reshape_allowzero_off``). Both the main graph and
+    every ``FunctionProto`` body are scanned — the attention/RoPE reshapes live inside the
+    merged subblock functions. Returns the number of rewritten values.
+    """
+    n_vals = 0
+
+    def _patch(tp: onnx.TensorProto) -> None:
+        nonlocal n_vals
+        arr = numpy_helper.to_array(tp)
+        if trace_len not in arr:
+            return
+        n_vals += int((arr == trace_len).sum())
+        patched = arr.copy()
+        patched[patched == trace_len] = 0
+        tp.CopyFrom(numpy_helper.from_array(patched, tp.name))
+
+    def _rebind(nodes, initializers=()) -> None:
+        shape_inputs = {n.input[1] for n in nodes if n.op_type == "Reshape" and len(n.input) >= 2}
+        for init in initializers:
+            if init.name in shape_inputs:
+                _patch(init)
+        for node in nodes:
+            if node.op_type == "Constant" and node.output and node.output[0] in shape_inputs:
+                for attr in node.attribute:
+                    if attr.name == "value":
+                        _patch(attr.t)
+
+    _rebind(model.graph.node, model.graph.initializer)
+    for func in model.functions:  # FunctionProto has no graph-level initializers
+        _rebind(func.node)
+
+    if n_vals:
+        logger.debug(f"make_dynamic_shapes: rebound {n_vals} baked seq ({trace_len}) → 0 in Reshape shape(s)")
+    return n_vals
+
+
+def _reshape_allowzero_off(model: onnx.ModelProto) -> int:
+    """Reset ``allowzero=0`` on every ``Reshape`` node (main graph + FunctionProto bodies).
+
+    ``torch.onnx.export`` puts a ``0`` at the (dynamic) sequence axis of its Reshape target
+    shapes — which normally means "copy the input's dim at that axis" — but ships the node
+    with ``allowzero=1``, turning that ``0`` into a literal zero-size dim. Shape inference
+    then can't resolve the reshape (NO-SHAPE) once the input seq dim is symbolic. Setting
+    ``allowzero=0`` restores copy semantics so the sequence dim follows the dynamic input.
+
+    Attention/RoPE reshapes live inside the merged subblock functions, so the function
+    bodies are scanned too. Returns the number of nodes changed.
+    """
+    n = 0
+
+    def _fix(nodes) -> None:
+        nonlocal n
+        for node in nodes:
+            if node.op_type != "Reshape":
+                continue
+            for attr in node.attribute:
+                if attr.name == "allowzero" and attr.i != 0:
+                    attr.i = 0
+                    n += 1
+
+    _fix(model.graph.node)
+    for func in model.functions:
+        _fix(func.node)
+
+    if n:
+        logger.debug(f"make_dynamic_shapes: reset allowzero=0 on {n} Reshape node(s)")
+    return n
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 
@@ -88,7 +176,7 @@ def make_dynamic_shapes(
     *,
     seq_sym: str = "L",
     prev_sym: str = "L_prev",
-    curr_sym: str = "L_curr",
+    curr_sym: str = "L_prev+1",
 ) -> onnx.ModelProto:
     """Rewrite static traced shapes to symbolic dims and re-run shape inference.
 
@@ -115,6 +203,11 @@ def make_dynamic_shapes(
     else:
         _apply_prefill(model, seq_sym)
         logger.debug(f"make_dynamic_shapes: prefill — seq → {seq_sym!r}, attention_mask dropped")
+
+    # Un-freeze the baked seq dim in Reshape shapes: rewrite TRACE_L → 0 (copy-from-input),
+    # then reset allowzero=0 so that 0 is honored as a copy. Both are needed together.
+    _rebind_reshape_trace_seq(model)
+    _reshape_allowzero_off(model)
 
     # Clear stale intermediate shapes and re-propagate.
     # Note: shape inference cannot cross FunctionProto subblock boundaries,

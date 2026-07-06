@@ -6,7 +6,7 @@ import onnx
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME
+from hf2hw.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, TRACE_L
 from hf2hw.tracing import (
     HookRegisterInterface,
     PluginRegisterInterface,
@@ -42,8 +42,17 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
 
     # ================ ABSTRACT METHODS  ================ #
     @HookRegisterInterface.register_plugin_io_hooks()
-    def trace_plugin_ios(self, model_inputs: Dict[str, Any], **generate_kwargs) -> None:
-        self.model.generate(**model_inputs, **generate_kwargs)
+    def trace_plugin_ios(self) -> None:
+        """Model inference logic for tracing"""
+        trace_input_ids = torch.LongTensor(
+            [
+                [
+                    57,
+                ]
+                * TRACE_L
+            ]
+        )
+        self.model.generate(input_ids=trace_input_ids, max_new_tokens=3)
 
     @contextmanager
     def adapt_model_for_case(self, input_dict: INPUT_KWARGS_TYPE):
@@ -95,14 +104,12 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
     # ================ CausalLMExporter METHODS  ================ #
     def export(
         self,
-        model_inputs: INPUT_KWARGS_TYPE,
         path_template: str = "case{i}.onnx",
         opset_version: int = 25,
-        **kwargs,
     ):
         """Export HF model to ONNX (export 2 unique cases - prefill, generation)"""
         logger.info("Stage 1/6: tracing plugin IOs via model.generate(...)")
-        self.trace_plugin_ios(model_inputs, **kwargs)
+        self.trace_plugin_ios()
         uniq_input_dicts: List[INPUT_KWARGS_TYPE] = self.model_ios.pseudo_unique_inputs()
         num_uniq_cases = len(uniq_input_dicts)
         assert (

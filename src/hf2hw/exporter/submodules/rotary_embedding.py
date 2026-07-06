@@ -10,7 +10,6 @@ from hf2hw.constant import INPUT_SPECS_TYPE
 from hf2hw.tracing import (
     apply_input_specs2fwd_specs,
     fwdspecs2args,
-    fwdspecs2kwargs,
     input_specs2pseudo_inputs,
     sig2fwdspecs,
 )
