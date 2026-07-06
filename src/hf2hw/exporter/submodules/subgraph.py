@@ -1,6 +1,10 @@
+import logging
+import os
+import shutil
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from os import PathLike
+from pathlib import Path
 from typing import List
 
 from hf2hw.constant import INPUT_SPECS_TYPE, ONNX_DOMAIN_NAME, SUBGRAPH_MAP_TYPE
@@ -48,6 +52,10 @@ class SubgraphExporterInterface(ABC):
 
             self._post_process_final_onnx(case_path)
 
+        # clean up subgraph onnx
+        if (logger.isEnabledFor(logging.DEBUG) is False) and (self._subgraph_dir.exists()):
+            shutil.rmtree(self._subgraph_dir)
+
     def export_plugin_subgraphs(self, opset_version: int = 25) -> SUBGRAPH_MAP_TYPE:
         """
         Export plugin modules(subgraphs) to ONNX ...
@@ -57,6 +65,8 @@ class SubgraphExporterInterface(ABC):
             `node_qwen3rotary_embedding____model__rotary_emb____case1`
             ...
         """
+        self._subgraph_dir = Path(os.getcwd()).joinpath("__onnx_subgraphs")
+        self._subgraph_dir.mkdir(exist_ok=True)
         if len(self.plugin_ios) == 0:
             raise RuntimeError(
                 "`self.plugin_ios` is empty, Nothing to export. Make sure `self.plugin_suffix` is not empty and call `self.trace_plugin_ios(model_inputs, **kwargs)` in advance."
@@ -72,7 +82,7 @@ class SubgraphExporterInterface(ABC):
 
             for case_idx, input_specs in enumerate(uniqe_input_specs):
                 torchlib_op_name = create_torchlib_op_name(cls_name, module_name, case_idx + 1)
-                onnx_path = f"{torchlib_op_name}.onnx"
+                onnx_path = str(self._subgraph_dir.joinpath(f"{torchlib_op_name}.onnx"))
                 logger.debug(f"Export: {plugin_name=} → {onnx_path}")
                 with suppress_onnx_export_logs():
                     if "Attention" in cls_name:
