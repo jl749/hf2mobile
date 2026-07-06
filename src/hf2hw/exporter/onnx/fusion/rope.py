@@ -94,7 +94,7 @@ def fuse_rope(model: onnx.ModelProto) -> Tuple[onnx.ModelProto, int]:
     """
     Fuse rotate_half RoPE subgraphs into opset-23 RotaryEmbedding nodes.
 
-    Every explicit subgraphs — `x*cos + rotate_half(x)*sin` — is replaced by a
+    Each explicit subgraph — `x*cos + rotate_half(x)*sin` — is replaced by a
     single standard `RotaryEmbedding(X, cos_cache, sin_cache)` node (opset 23, default ONNX domain).
     The rule fires independently for Q and K, so two fusions are expected per attention layer.
     The Unsqueeze nodes that PyTorch inserts to broadcast cos/sin over heads are looked through

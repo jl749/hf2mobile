@@ -6,7 +6,7 @@ _ONNX_OUTPUT_NAME = ""
 
 @contextmanager
 def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYPE):
-    """Temporarily overwrite RotaryEwbed.forward for ONNX tracing"""
+    """Temporarily overwrite RotaryEmbedding.forward for ONNX tracing"""
     orig_cls = module.__class__
     layer_idx = getattr(module, "layer_idx", None)
     assert layer_idx is not None, f"Attribute `{orig_cls.__name__}.layer_idx` does not exist (id={id(module)})."

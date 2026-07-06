@@ -32,7 +32,7 @@ def update_opset(model: onnx.ModelProto, domain: str, version: int) -> None:
 
 
 def drop_attributes(node: onnx.NodeProto, names_to_drop: Set[str]) -> None:
-    """Drop AttributeProtos by its names from the passed NodeProto"""
+    """Drop AttributeProtos by their names from the passed NodeProto"""
     keep = [a for a in node.attribute if a.name not in names_to_drop]
     del node.attribute[:]
     node.attribute.extend(keep)

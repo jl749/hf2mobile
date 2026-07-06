@@ -264,7 +264,7 @@ class ModuleIOSpec:
 
     @property
     def unique_obsvd_input_specs(self) -> List[INPUT_SPECS_TYPE]:
-        """Some input param names are ignored when considering the uniquness of the module IO (e.g. past_key_values)"""
+        """Some input param names are ignored when considering the uniqueness of the module IO (e.g. past_key_values)"""
         return [{k: v for k, v in s.items() if k not in _NON_HASHABLE_PARAMS} for s in self.obsvd_input_specs]
 
     @property
@@ -299,7 +299,7 @@ class ModuleIOSpec:
     def unique_ios(self) -> Tuple[Tuple[INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE], ...]:
         """
         Return unique (input_specs, output_specs) pairs
-        When considering the uniqness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
+        When considering the uniqueness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
         Output tuple will always return the IO metadata pairs in observation order
         e.g.
             when `generate` is called on the transformers CausalLM models
@@ -311,7 +311,7 @@ class ModuleIOSpec:
         for _unq_input_specs, input_specs, output_specs in zip(
             self.unique_obsvd_input_specs, self.obsvd_input_specs, self.obsvd_output_specs
         ):
-            # when considering the uniqness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs`
+            # when considering the uniqueness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs`
             _flat_unq_is, _unq_tree = self.flatten_io_specs(specs=_unq_input_specs, skip_empty=True)
             _unq_input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(_flat_unq_is, _unq_tree)
 

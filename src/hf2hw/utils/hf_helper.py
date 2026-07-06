@@ -62,7 +62,7 @@ def register_dynamic_cache_pytree() -> None:
 
 def update_input_cache(input_dict: dict, layer_idx: int) -> str | None:
     """
-    `Attentino.forward` parameter `past_key_values: Cache` contains every global cache even after pytree flattening
+    `Attention.forward` parameter `past_key_values: Cache` contains every global cache even after pytree flattening
     This function updates `input_dict` so that KV_CACHE_PARAM_NAME("past_key_values") only contains the local cache index
     Args:
         input_dict: .forward inputs with default entries

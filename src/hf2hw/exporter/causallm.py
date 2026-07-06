@@ -28,8 +28,8 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
         plugin_suffix: Sequence[str],
     ):
         """
-        Every CausalLM models are expected to inherit this class
-        Based on target recpie and model choice we pass different hyperparams
+        Every CausalLM model is expected to inherit this class
+        Based on target recipe and model choice we pass different hyperparams
             * __init__(..., plugin_suffix)
             * export(..., model_inputs, **input_kwargs)
         """
@@ -47,7 +47,7 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
 
     @contextmanager
     def adapt_model_for_case(self, input_dict: INPUT_KWARGS_TYPE):
-        """By replacing the generation forward prevent DCE from dropping the KV cache IOs."""
+        """Replace the generation forward to prevent DCE from dropping the KV cache IOs."""
         input_dict = dict(input_dict)  # copy: caller's dict left unchanged
         pkv = input_dict.pop(KV_CACHE_PARAM_NAME, None)
 

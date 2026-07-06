@@ -18,7 +18,7 @@ def _onnx_to_function(
     Load a standalone submodule ONNX and convert its graph to a FunctionProto.
 
     FunctionProto does not accept graph-level initializers.
-    Hence, iInitializers are inlined as `Constant` nodes prepended to the function body.
+    Hence, initializers are inlined as `Constant` nodes prepended to the function body.
     """
     m = onnx.load(submodule_onnx_path, load_external_data=True)
 
@@ -51,7 +51,7 @@ def merge_subgraphs_into_model(
     output_path: str | None = None,
 ) -> str:
     """
-    Replace custom plugin nodes under the main ONNX graph (`cast_path`) using `torchlib_op2subgraph_path`.
+    Replace custom plugin nodes under the main ONNX graph (`case_path`) using `torchlib_op2subgraph_path`.
     Each subgraph will be represented in FunctionProto.
     `subgraph_path = torchlib_op2subgraph_path[plugin_node.attribute["torchlib_op_name"]]`
 
