@@ -244,6 +244,11 @@ class PluginRegisterInterface(ABC):
 
                 trace_metadata: List[Dict[str, Any]] = []
                 for case_idx, (input_specs, output_specs) in enumerate(unique_io_cases):
+                    # NOTE: drop x from RotaryEmbedding(x, position_ids)
+                    #   ONNX tracing only requires position_ids as an input edge
+                    if "RotaryEmbedding" in orig_cls.__name__:
+                        input_specs.pop("x")
+
                     case_fwd_specs = apply_input_specs2fwd_specs(fwd_specs, input_specs)
                     torchlib_op_name = create_torchlib_op_name(orig_cls.__name__, module_name, case_idx + 1)
 
