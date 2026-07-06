@@ -46,6 +46,11 @@ def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYP
     cos_table = cos_table.contiguous()[0]  # (1, max_len, head_dim) -> (max_len, head_dim)
     sin_table = sin_table.contiguous()[0]
 
+    # NOTE: onnx RotaryEmbedding op does half rotation itself
+    #   torch impl takes full head_dim where onnx takes head_dim//2
+    cos_table = cos_table[:, : hf_config.head_dim // 2]
+    sin_table = sin_table[:, : hf_config.head_dim // 2]
+
     def _traceable_forward(self_inner, position_ids: torch.Tensor):
         """ONNX takes `*args` (position_ids) as inputs and `cos_table`, `sin_table` as outputs"""
         cos = torch.nn.functional.embedding(position_ids, cos_table)
