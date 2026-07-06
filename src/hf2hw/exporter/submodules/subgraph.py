@@ -13,6 +13,7 @@ from hf2hw.utils import check_parent_field, create_torchlib_op_name, suppress_on
 from hf2hw.utils.logger import logger
 
 from .attention import export as attn_export
+from .rotary_embedding import export as rope_export
 
 
 class SubgraphExporterInterface(ABC):
@@ -88,9 +89,7 @@ class SubgraphExporterInterface(ABC):
                     if "Attention" in cls_name:
                         attn_export(module, input_specs, onnx_path, opset_version)
                     elif "RotaryEmbedding" in cls_name:
-                        # TODO: standalone RotaryEmbedding subgraph export not yet implemented;
-                        # placeholders are left in the main graph (unmerged) for now.
-                        continue
+                        rope_export(module, input_specs, onnx_path, opset_version)
                     else:
                         raise RuntimeError(f"`{cls_name=}` not recognized")
                 subgraph_map[case_idx][torchlib_op_name] = onnx_path

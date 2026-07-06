@@ -1,60 +1,58 @@
-from hf2hw.exporter.onnx.fusion import fuse_rms_norm, fuse_rope
+import inspect
+from contextlib import contextmanager
+from os import PathLike
+from pathlib import Path
+
+import torch
+import transformers
+
+from hf2hw.constant import INPUT_SPECS_TYPE
+from hf2hw.tracing import (
+    apply_input_specs2fwd_specs,
+    fwdspecs2args,
+    fwdspecs2kwargs,
+    input_specs2pseudo_inputs,
+    sig2fwdspecs,
+)
 from hf2hw.utils.logger import logger
 
-_ONNX_OUTPUT_NAME = ""
+_ONNX_OUTPUT_NAMES = ("cos", "sin")
 
 
 @contextmanager
 def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYPE):
-    """Temporarily overwrite RotaryEmbedding.forward for ONNX tracing"""
-    orig_cls = module.__class__
-    layer_idx = getattr(module, "layer_idx", None)
-    assert layer_idx is not None, f"Attribute `{orig_cls.__name__}.layer_idx` does not exist (id={id(module)})."
+    """
+    Temporarily overwrite RotaryEmbedding.forward for ONNX tracing.
 
+    RoPE is position-wise, so instead of tracing the "seq-length-specific" cos/sin computation
+    we precompute the full `(cos, sin)` tables over `[0, max_position_embeddings)` once,
+    bake them as constants, and trace a plain lookup such as `cos = table[position_ids]`.
+    """
+    orig_cls = module.__class__
+    hf_config: transformers.PretrainedConfig = module.config
+
+    input_specs.pop("x")  # torch takes (x, position_ids), ONNX required (position_ids,) only
     input_dict = input_specs2pseudo_inputs(input_specs)  # build fake input
     sig = inspect.signature(orig_cls.forward)
     fwd_specs = sig2fwdspecs(sig)
     case_fwd_specs = apply_input_specs2fwd_specs(fwd_specs, input_specs)
     flat_inputs = fwdspecs2args(case_fwd_specs, input_dict)
-    graph_input_names = {fs.name for fs in case_fwd_specs}
 
-    # everything else that `forward` needs but that is *not* a graph input
-    # e.g. position_ids, cache_position, attention_mask
-    extra_kwargs = {k: v for k, v in input_dict.items() if k not in graph_input_names}
-    for fs in fwd_specs:
-        if fs.name in graph_input_names or fs.name == KV_CACHE_PARAM_NAME:
-            # skip graph_input_names and KV_CACHE_PARAM_NAME
-            # e.g. "position_embeddings" is already included inside `graph_input_names`
-            continue
-        if sig.parameters[fs.name].default is inspect.Parameter.empty:
-            # forward does not specify default value -> set it None under `extra_kwargs`
-            # e.g. Qwen2Attention / Qwen3Attention / Phi3Attention do not specify `attention_mask=None`
-            #   1. `ModuleIOSpec.unique_ios()` drops empty `TensorSpec` - "attention_mask"
-            #   2. `apply_input_specs2fwd_specs` drops "attention_mask" from `List[FwdSpec]`
-            #   3. extra_kwargs["attention_mask"] = None
-            extra_kwargs.setdefault(fs.name, None)
+    full_position_ids = torch.arange(
+        hf_config.max_position_embeddings, dtype=input_dict["position_ids"].dtype
+    ).unsqueeze(0)
+    fake_x = torch.empty(0, dtype=torch.float32)
+    with torch.no_grad():
+        cos_table, sin_table = orig_cls.forward(module, fake_x, full_position_ids)
+    cos_table = cos_table.contiguous()[0]  # (1, max_len, head_dim) -> (max_len, head_dim)
+    sin_table = sin_table.contiguous()[0]
 
-    has_kv = KV_CACHE_PARAM_NAME in graph_input_names
-    output_names = (_ONNX_OUTPUT_NAME,) + (("new_key", "new_value") if has_kv else ())
+    def _traceable_forward(self_inner, position_ids: torch.Tensor):
+        """ONNX takes `*args` (position_ids) as inputs and `cos_table`, `sin_table` as outputs"""
+        cos = torch.nn.functional.embedding(position_ids, cos_table)
+        sin = torch.nn.functional.embedding(position_ids, sin_table)
 
-    # TODO: factory function returns different forward based on attention type (cross, sliding, moe ... etc)
-
-    def _traceable_forward(self_inner, *args):
-        """ONNX takes `*args` as inputs `attn_out`, `(optional){key_out, key_in}` as outputs"""
-        kwargs = fwdspecs2kwargs(case_fwd_specs, list(args))
-        kwargs.update(extra_kwargs)  # re-inject non ONNX input params
-        if has_kv:
-            past_key, past_value = kwargs.pop(KV_CACHE_PARAM_NAME)
-            _pad = [(torch.empty(0), torch.empty(0))] * layer_idx
-            cache = transformers.DynamicCache(ddp_cache_data=_pad + [(past_key, past_value)])
-            kwargs[KV_CACHE_PARAM_NAME] = cache
-
-        out = orig_cls.forward(self_inner, **kwargs)
-
-        attn_out = out[0] if isinstance(out, tuple) else out
-        if has_kv:
-            return attn_out, cache.layers[layer_idx].keys, cache.layers[layer_idx].values
-        return attn_out
+        return cos, sin
 
     module.__class__ = type(
         f"Traceable{orig_cls.__name__}",
@@ -62,7 +60,7 @@ def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYP
         {"forward": _traceable_forward},
     )
     try:
-        yield flat_inputs, output_names
+        yield flat_inputs, _ONNX_OUTPUT_NAMES
     finally:
         module.__class__ = orig_cls
 
@@ -73,7 +71,7 @@ def export(
     onnx_path: str | PathLike,
     opset_version: int,
 ) -> None:
-    onnx_path: Path = Path(onnx_path)
+    onnx_path = Path(onnx_path)
     with _adapt_module_for_case(module, input_specs) as (flat_inputs, output_names):
         torch.onnx.export(
             module,
@@ -81,8 +79,9 @@ def export(
             kwargs={},
             f=onnx_path,
             opset_version=opset_version,
-            output_names=output_names,
+            output_names=list(output_names),
         )
+    logger.debug(f"  exported RotaryEmbedding subgraph: {onnx_path.name}")
 
 
 __all__ = ["export"]

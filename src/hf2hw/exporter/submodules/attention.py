@@ -57,7 +57,7 @@ def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYP
     # TODO: factory function returns different forward based on attention type (cross, sliding, moe ... etc)
 
     def _traceable_forward(self_inner, *args):
-        """ONNX takes `*args` as inputs `attn_out`, `(optional){key_out, key_in}` as outputs"""
+        """ONNX takes `*args` as inputs and `attn_out`, `(optional){key_out, key_in}` as outputs"""
         kwargs = fwdspecs2kwargs(case_fwd_specs, list(args))
         kwargs.update(extra_kwargs)  # re-inject non ONNX input params
         if has_kv:
