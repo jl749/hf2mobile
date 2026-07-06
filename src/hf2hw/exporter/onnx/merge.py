@@ -2,9 +2,9 @@ from typing import Dict, List
 
 import onnx
 
-from ...constant import ONNX_DOMAIN_NAME
-from ...utils import drop_attributes, ensure_opset_imports
-from ...utils.logger import logger
+from hf2hw.constant import ONNX_DOMAIN_NAME
+from hf2hw.utils import drop_attributes, update_opset
+from hf2hw.utils.logger import logger
 
 _PLACEHOLDER_ATTR = "torchlib_op_name"
 
@@ -91,7 +91,8 @@ def merge_subgraphs_into_model(
         # build and register the function
         if (domain, torchlib_op_name) not in seen_fn_names:
             func: onnx.FunctionProto = _onnx_to_function(subgraph_path, function_name=torchlib_op_name, domain=domain)
-            ensure_opset_imports(model, func.opset_import)
+            for op in func.opset_import:
+                update_opset(model, op.domain, op.version)
             model.functions.append(func)
             seen_fn_names.add((domain, torchlib_op_name))
             appended_fn_names.append(torchlib_op_name)

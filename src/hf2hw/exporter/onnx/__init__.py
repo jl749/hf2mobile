@@ -1,3 +1,3 @@
 from .dynamic import *
-from .fuse import *
+from .fusion import *
 from .merge import *

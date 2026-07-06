@@ -1,29 +1,12 @@
-import inspect
-from contextlib import contextmanager
-from os import PathLike
-from pathlib import Path
-
-import onnx
-import torch
-import transformers
-
-from hf2hw.constant import INPUT_SPECS_TYPE, KV_CACHE_PARAM_NAME
 from hf2hw.exporter.onnx.fusion import fuse_rms_norm, fuse_rope
-from hf2hw.tracing import (
-    apply_input_specs2fwd_specs,
-    fwdspecs2args,
-    fwdspecs2kwargs,
-    input_specs2pseudo_inputs,
-    sig2fwdspecs,
-)
 from hf2hw.utils.logger import logger
 
-_ONNX_OUTPUT_NAME = "attn_output"
+_ONNX_OUTPUT_NAME = ""
 
 
 @contextmanager
 def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYPE):
-    """Temporarily overwrite Attention.forward for ONNX tracing"""
+    """Temporarily overwrite RotaryEwbed.forward for ONNX tracing"""
     orig_cls = module.__class__
     layer_idx = getattr(module, "layer_idx", None)
     assert layer_idx is not None, f"Attribute `{orig_cls.__name__}.layer_idx` does not exist (id={id(module)})."
@@ -100,14 +83,6 @@ def export(
             opset_version=opset_version,
             output_names=output_names,
         )
-    _m = onnx.load(str(onnx_path), load_external_data=True)
-    _m, _n_rms = fuse_rms_norm(_m)
-    _m, _n_rope = fuse_rope(_m)
-    onnx.save(_m, str(onnx_path))
-    if _n_rms:
-        logger.debug(f"  fused {_n_rms} RMSNorm(s) in {onnx_path.name}")
-    if _n_rope:
-        logger.debug(f"  fused {_n_rope} RotaryEmbedding(s) in {onnx_path.name}")
 
 
 __all__ = ["export"]

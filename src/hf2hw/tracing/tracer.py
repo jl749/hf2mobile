@@ -43,12 +43,12 @@ class TracerInterface(ABC):
         return suffix2modules
 
     @abstractmethod
-    def _trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
+    def trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
         """Inference steps to export"""
         pass
 
     @abstractmethod
-    def _adapt_model_for_case(self, input_dict: INPUT_KWARGS_TYPE) -> AbstractContextManager:
+    def adapt_model_for_case(self, input_dict: INPUT_KWARGS_TYPE) -> AbstractContextManager:
         """
         Subclasses typically implement this abstractmethod with `@contextmanager`
             * context block yields `(export_kwargs, output_names)`

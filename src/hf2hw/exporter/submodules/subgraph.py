@@ -1,13 +1,13 @@
-from abc import ABC
+from abc import ABC, abstractmethod
 from collections import defaultdict
+from os import PathLike
 from typing import List
 
-import onnx
+from hf2hw.constant import INPUT_SPECS_TYPE, ONNX_DOMAIN_NAME, SUBGRAPH_MAP_TYPE
+from hf2hw.exporter.onnx import merge_subgraphs_into_model
+from hf2hw.utils import check_parent_field, create_torchlib_op_name, suppress_onnx_export_logs
+from hf2hw.utils.logger import logger
 
-from ...constant import INPUT_SPECS_TYPE, ONNX_DOMAIN_NAME, SUBGRAPH_MAP_TYPE
-from ...utils import check_parent_field, create_torchlib_op_name, suppress_onnx_export_logs
-from ...utils.logger import logger
-from ..onnx import fuse_rms_norm, merge_subgraphs_into_model
 from .attention import export as attn_export
 
 
@@ -17,8 +17,13 @@ class SubgraphExporterInterface(ABC):
         check_parent_field(self, "_module2name")
         self._name2module = {name: m for m, name in self._module2name.items()}
 
-    @staticmethod
-    def _merge_subgraphs_into_main_graph(
+    @abstractmethod
+    def _post_process_final_onnx(self, onnx_path: str | PathLike):
+        """Postprocess method that optimizes the final merged ONNX graph"""
+        pass
+
+    def merge_subgraphs_into_main_graph(
+        self,
         case_paths: List[str],
         subgraph_map: SUBGRAPH_MAP_TYPE,
     ) -> None:
@@ -41,14 +46,9 @@ class SubgraphExporterInterface(ABC):
             else:
                 logger.warning(f"No plugin subgraph to merge for case {case_idx + 1}.")
 
-            # POSTPROCESS: main-graph RMSNorm fusion
-            model = onnx.load(case_path, load_external_data=True)
-            model, n_fused = fuse_rms_norm(model)
-            onnx.save(model, case_path)
-            if n_fused:
-                logger.info(f"  fused {n_fused} main-graph RMSNorm(s) in {case_path}")
+            self._post_process_final_onnx(case_path)
 
-    def _export_plugin_subgraphs(self, opset_version: int = 25) -> SUBGRAPH_MAP_TYPE:
+    def export_plugin_subgraphs(self, opset_version: int = 25) -> SUBGRAPH_MAP_TYPE:
         """
         Export plugin modules(subgraphs) to ONNX ...
         e.g.
@@ -59,7 +59,7 @@ class SubgraphExporterInterface(ABC):
         """
         if len(self.plugin_ios) == 0:
             raise RuntimeError(
-                "`self.plugin_ios` is empty, Nothing to export. Make sure `self.plugin_suffix` is not empty and call `self._trace_plugin_ios(model_inputs, **kwargs)` in advance."
+                "`self.plugin_ios` is empty, Nothing to export. Make sure `self.plugin_suffix` is not empty and call `self.trace_plugin_ios(model_inputs, **kwargs)` in advance."
             )
         subgraph_map: SUBGRAPH_MAP_TYPE = defaultdict(dict)
         for plugin_name, iospec in self.plugin_ios.items():
