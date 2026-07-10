@@ -21,6 +21,8 @@ from .tensor_metadata import OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_in
 # `None` means no export in progress -> `plugin_forward` falls straight through to `orig_cls.forward`.
 export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("export_case", default=None)
 
+_DEFINED_TORCHLIB_OPS: Set[str] = set()
+
 
 def _make_plugin_forward(
     orig_cls: Any,
@@ -177,14 +179,17 @@ class PluginRegisterInterface(ABC):
             num_outputs > 0
         ), f"{_err_msg} we noticed `output_specs` is containing 0 `TensorSpec`. In order to trace the ONNX at least one output `TensorSpec` is required."
 
-        schema = self._create_schema_str(torchlib_op_name, fwd_specs, num_outputs)
-        CUSTOM_LIB.define(schema)
+        if torchlib_op_name not in _DEFINED_TORCHLIB_OPS:
+            schema = self._create_schema_str(torchlib_op_name, fwd_specs, num_outputs)
+            CUSTOM_LIB.define(schema)
 
-        @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{torchlib_op_name}")
-        def _abstract_impl(module_id, *flat_tensors):
-            device = next(t for t in flat_tensors if t is not None).device
-            outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flatten_specs)
-            return outs[0] if num_outputs == 1 else outs
+            @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{torchlib_op_name}")
+            def _abstract_impl(module_id, *flat_tensors):
+                device = next(t for t in flat_tensors if t is not None).device
+                outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flatten_specs)
+                return outs[0] if num_outputs == 1 else outs
+
+            _DEFINED_TORCHLIB_OPS.add(torchlib_op_name)
 
         def _onnx_translation(module_id, *flat_tensors):
             # TODO: set attributes by reading self._id2module attributes
