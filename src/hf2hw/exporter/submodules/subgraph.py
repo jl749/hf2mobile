@@ -23,7 +23,7 @@ class SubgraphExporterInterface(ABC):
         self._name2module = {name: m for m, name in self._module2name.items()}
 
     @abstractmethod
-    def _post_process_final_onnx(self, onnx_path: str | PathLike):
+    def _post_process_final_onnx(self, case_idx: int, onnx_path: str | PathLike):
         """Postprocess method that optimizes the final merged ONNX graph"""
         pass
 
@@ -51,7 +51,7 @@ class SubgraphExporterInterface(ABC):
             else:
                 logger.warning(f"No plugin subgraph to merge for case {case_idx + 1}.")
 
-            self._post_process_final_onnx(case_path)
+            self._post_process_final_onnx(case_idx, case_path)
 
         # clean up subgraph onnx
         if (logger.isEnabledFor(logging.DEBUG) is False) and (self._subgraph_dir.exists()):

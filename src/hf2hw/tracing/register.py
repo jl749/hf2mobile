@@ -93,6 +93,7 @@ def _make_plugin_forward(
 
         if "Attention" in self_module.__class__.__name__:
             # NOTE: attentions return -> (attn_out, attn_weight)
+            #   attach None to onnx output so that it matches torch output
             # TODO: assert using `sig.return_annotation` if it exist
             return result, None
         else:

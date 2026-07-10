@@ -4,6 +4,7 @@ import torch
 
 # causallm.py
 TRACE_L = 123  # NOTE: unique number in order to locate ONNX reshape vals and replace with 0(dynamic)
+SUPPORTED_TARGETS = ["ORT", "QNN"]
 
 # register.py
 CUSTOM_LIB_NAME = "hf_module2plugin"

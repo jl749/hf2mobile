@@ -15,6 +15,7 @@ def main():
     exporter.export(
         path_template="case{i}.onnx",
         opset_version=25,
+        target="ORT",
     )
 
 
