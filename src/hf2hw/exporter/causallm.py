@@ -18,12 +18,18 @@ from hf2hw.tracing import (
 )
 from hf2hw.utils.logger import logger
 
-from .onnx import make_dynamic_shapes
+from .onnx.dynamic_shaper import CausalLMONNXShaper
 from .onnx.fusion import fuse_rms_norm
 from .submodules import SubgraphExporterInterface
 
 
-class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInterface, SubgraphExporterInterface):
+class CausalLMExporter(
+    TracerInterface,
+    PluginRegisterInterface,
+    HookRegisterInterface,
+    SubgraphExporterInterface,
+    CausalLMONNXShaper,
+):
     def __init__(
         self,
         model: transformers.PreTrainedModel,
@@ -39,6 +45,7 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
         PluginRegisterInterface.__init__(self)
         HookRegisterInterface.__init__(self)
         SubgraphExporterInterface.__init__(self)
+        CausalLMONNXShaper.__init__(self, model.config)
 
         register_dynamic_cache_pytree()
 
@@ -99,27 +106,27 @@ class CausalLMExporter(TracerInterface, PluginRegisterInterface, HookRegisterInt
 
         if self.target == "ORT":
             if case_idx == 0:
-                os.remove(onnx_path)
+                self.make_dynamic_onnx(onnx_path, mode="prefill", allow_zero=0)
             elif case_idx == 1:
+                self.make_dynamic_onnx(onnx_path, mode="generation", allow_zero=0)
                 model = onnx.load(onnx_path, load_external_data=True)
                 model, _n = fuse_rms_norm(model)
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
                 # TODO: GroupQueryAttention, SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
-                model = make_dynamic_shapes(model)  # NOTE: make gen graph generic (cover prefill)
                 onnx.save(model, onnx_path)
                 logger.info(f"  {LOG_PREFIX} dynamic shapes written: {onnx_path}")
         elif self.target == "QNN":
             return NotImplemented
-            model = onnx.load(onnx_path, load_external_data=True)
-            if case_idx == 0:
-                # TODO: make Attention K,V input as ONNX output for prefill caching
-                # TODO: copy quant params from the generation graph
-                pass
-            elif case_idx == 1:
-                pass
-            # TODO: extract subgraphs excluding GQA
-            onnx.save(model, onnx_path)
+            # model = onnx.load(onnx_path, load_external_data=True)
+            # if case_idx == 0:
+            #     # TODO: make Attention K,V input as ONNX output for prefill caching
+            #     # TODO: copy quant params from the generation graph
+            #     pass
+            # elif case_idx == 1:
+            #     pass
+            # # TODO: extract subgraphs excluding GQA
+            # onnx.save(model, onnx_path)
         else:
             raise RuntimeError(f"`CausalLMExporter.export(...)` has not assigned `self.target`.")
 

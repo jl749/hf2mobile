@@ -87,4 +87,9 @@ def update_input_cache(input_dict: dict, layer_idx: int) -> str | None:
     return cache_param_name
 
 
-__all__ = ["TokenSpeedStreamer", "register_dynamic_cache_pytree", "update_input_cache"]
+def get_head_dim(hf_config: transformers.PreTrainedConfig) -> int:
+    head_dim = getattr(hf_config, "head_dim", None)
+    return head_dim if head_dim else hf_config.hidden_size // hf_config.num_attention_heads
+
+
+__all__ = ["TokenSpeedStreamer", "register_dynamic_cache_pytree", "update_input_cache", "get_head_dim"]

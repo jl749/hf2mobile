@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, Tuple
 
 import torch
@@ -20,3 +21,6 @@ OUTPUT_SPECS_TYPE = Tuple[Any, ...]
 
 # subgraph.py
 SUBGRAPH_MAP_TYPE = Dict[int, Dict[str, str]]
+
+# causallm_shaper.py
+_CASE_SUFFIX_RE = re.compile(r"____case\d+$")

@@ -15,9 +15,11 @@ Replaced with (custom domain):
     RotaryEmbedding(x, cos_us, sin_us)
 
 cos_us / sin_us are typically Unsqueeze outputs from a shared Unsqueeze node
-(added by PyTorch to broadcast over the heads dimension).  The Unsqueeze nodes
-remain in the graph; downstream hardware reads cos_us/sin_us with shape
-[batch, 1, seq, head_dim].  The rule fires once for Q and once for K.
+(added by PyTorch to broadcast over the heads dimension).  The replacement looks
+through those Unsqueeze nodes to consume the raw cos/sin graph inputs directly
+(the Unsqueeze nodes become dead code).  The rule fires once for Q and once for K.
+Afterwards the cos/sin graph-input VIs are halved on the last axis: the opset-23
+RotaryEmbedding takes head_dim//2 caches, not the traced full-head_dim tensors.
 """
 
 from typing import Tuple
@@ -28,7 +30,7 @@ from onnxscript import rewriter
 from onnxscript.rewriter import pattern
 
 from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import update_opset
+from hf2hw.utils.onnx_helper import get_vi_axis, set_vi_axis, update_opset
 
 
 def _unwrap_unsqueeze(val: ir.Value) -> ir.Value | None:
@@ -90,6 +92,32 @@ def _rope_rule() -> pattern.RewriteRule:
     return pattern.RewriteRule(pat, repl)
 
 
+def _halve_cache_input_vis(model: onnx.ModelProto) -> None:
+    """
+    Halve the last axis of the graph-input VIs consumed as RotaryEmbedding cos/sin caches.
+
+    The torch rotate_half convention traces cos/sin at full `head_dim`,
+    so the subgraph's cos/sin graph inputs are declared `(1, L, head_dim)`.
+    The fused opset-23 `RotaryEmbedding` instead takes `head_dim//2` caches for both cos/sin caches
+    so the declared width must follow: `(1, L, head_dim)` -> `(1, L, head_dim//2)`.
+    Returns the number of VIs rewritten.
+    """
+    cache_names = set()
+    for node in model.graph.node:
+        if node.op_type == "RotaryEmbedding" and len(node.input) >= 3:
+            cache_names.update(node.input[1:3])
+
+    for vi in model.graph.input:
+        if vi.name not in cache_names:
+            continue
+        last_axis = len(vi.type.tensor_type.shape.dim) - 1
+        width = get_vi_axis(vi, last_axis)
+        if isinstance(width, int) and width % 2 == 0:
+            set_vi_axis(vi, last_axis, width // 2)
+        else:
+            logger.warning(f"fuse_rope: cannot halve cache input {vi.name!r} last axis ({width!r}); left as-is.")
+
+
 def fuse_rope(model: onnx.ModelProto) -> Tuple[onnx.ModelProto, int]:
     """
     Fuse rotate_half RoPE subgraphs into opset-23 RotaryEmbedding nodes.
@@ -113,6 +141,7 @@ def fuse_rope(model: onnx.ModelProto) -> Tuple[onnx.ModelProto, int]:
     n_fused = sum(1 for n in new_model.graph.node if n.op_type == "RotaryEmbedding")
     if n_fused:
         update_opset(new_model, domain="", version=23)
+        _halve_cache_input_vis(new_model)
         logger.debug(f"fuse_rope: fused {n_fused} RotaryEmbedding node(s)")
     return new_model, n_fused
 

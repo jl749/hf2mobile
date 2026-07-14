@@ -1,4 +1,4 @@
-from typing import Set
+from typing import Any, Iterator, Sequence, Set, Tuple
 
 import onnx
 import onnx_ir as ir
@@ -50,3 +50,60 @@ def get_scalar(val: ir.Value) -> float | None:
         return float(cv.numpy().flat[0])
     except Exception:
         return None
+
+
+# ── onnx/dynamic_shaper/ ────────────────────────────────────────────────────────────────────
+
+
+def set_vi_axis(vi: onnx.ValueInfoProto, axis: int, value: int | str) -> None:
+    """Set a dim on `vi`: an `int` writes a fixed `dim_value`, a `str` a symbolic `dim_param`."""
+    dim = vi.type.tensor_type.shape.dim[axis]
+    if isinstance(value, str):
+        dim.ClearField("dim_value")
+        dim.dim_param = value
+    elif isinstance(value, int):
+        dim.ClearField("dim_param")
+        dim.dim_value = value
+    else:
+        raise TypeError(f"`{value=}` must be int (dim_value) or str (dim_param), got {type(value).__name__}.")
+
+
+def get_vi_axis(vi: onnx.ValueInfoProto, axis: int) -> int | str | None:
+    """Return a dim of `vi`: `int` for a fixed `dim_value`, `str` for a symbolic `dim_param`, None if unset."""
+    dim = vi.type.tensor_type.shape.dim[axis]
+    if dim.HasField("dim_param"):
+        return dim.dim_param
+    if dim.HasField("dim_value"):
+        return dim.dim_value
+    return None
+
+
+def drop_vi_by_name(vis: Sequence[onnx.ValueInfoProto], names: Set[str]) -> None:
+    """Remove named entries from the given `vis` inplace."""
+    keep = [vi for vi in vis if vi.name not in names]
+    del vis[:]
+    keep.extend(keep)
+
+
+def filter_shape_metadata(
+    nodes: Sequence[onnx.NodeProto],
+    initializers: Sequence[onnx.TensorProto],
+) -> Iterator[Tuple[str, onnx.TensorProto]]:
+    """Yield (Reshape.input[1].name, TensorProto)"""
+    shape_tensor_names = {n.input[1] for n in nodes if n.op_type == "Reshape"}
+    for tp in (tp for tp in initializers if tp.name in shape_tensor_names):
+        yield tp.name, tp
+    for node in nodes:
+        if (node.op_type == "Constant") and node.output and (node.output[0] in shape_tensor_names):
+            for attr in node.attribute:
+                if attr.name == "value":
+                    yield node.output[0], attr.t
+
+
+def update_node_attribute(node: onnx.NodeProto, attribute_name: str, value: Any):
+    """Update node attribute using the new value."""
+    attr = next((a for a in node.attribute if a.name == attribute_name), None)
+    if attr is None:
+        node.attribute.append(onnx.helper.make_attribute("allowzero", value))
+    elif attr.i != value:
+        attr.i = value

@@ -1,14 +1,10 @@
-import logging
 import os
-import shutil
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections import defaultdict
-from os import PathLike
 from pathlib import Path
 from typing import List
 
-from hf2hw.constant import INPUT_SPECS_TYPE, ONNX_DOMAIN_NAME, SUBGRAPH_MAP_TYPE
-from hf2hw.exporter.onnx import merge_subgraphs_into_model
+from hf2hw.constant import INPUT_SPECS_TYPE, SUBGRAPH_MAP_TYPE
 from hf2hw.utils import check_parent_field, create_torchlib_op_name, suppress_onnx_export_logs
 from hf2hw.utils.logger import logger
 
@@ -21,41 +17,6 @@ class SubgraphExporterInterface(ABC):
         check_parent_field(self, "plugin_ios")
         check_parent_field(self, "_module2name")
         self._name2module = {name: m for m, name in self._module2name.items()}
-
-    @abstractmethod
-    def _post_process_final_onnx(self, case_idx: int, onnx_path: str | PathLike):
-        """Postprocess method that optimizes the final merged ONNX graph"""
-        pass
-
-    def merge_subgraphs_into_main_graph(
-        self,
-        case_paths: List[str],
-        subgraph_map: SUBGRAPH_MAP_TYPE,
-    ) -> None:
-        """
-        Merge the ONNX subgraphs into the main ONNX graphs
-
-        Args:
-            case_paths: main ONNX graph paths representing unique input cases
-            subgraph_map: `subgraph_map[case_idx]` maps torchlib_op_name -> subgraph onnx path
-        """
-        for case_idx, case_path in enumerate(case_paths):
-            mapping = subgraph_map.get(case_idx, {})
-            if mapping:
-                logger.info(f"  merging {len(mapping)} Subgraph(s) into {case_path}")
-                merge_subgraphs_into_model(
-                    case_path=case_path,
-                    torchlib_op2subgraph_path=mapping,
-                    domain=ONNX_DOMAIN_NAME,
-                )
-            else:
-                logger.warning(f"No plugin subgraph to merge for case {case_idx + 1}.")
-
-            self._post_process_final_onnx(case_idx, case_path)
-
-        # clean up subgraph onnx
-        if (logger.isEnabledFor(logging.DEBUG) is False) and (self._subgraph_dir.exists()):
-            shutil.rmtree(self._subgraph_dir)
 
     def export_plugin_subgraphs(self, opset_version: int = 25) -> SUBGRAPH_MAP_TYPE:
         """
