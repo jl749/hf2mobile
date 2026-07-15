@@ -1,52 +1,8 @@
-"""Dynamic-shape post-processing for the exported two-case CausalLM ONNX graphs.
-
-After ``torch.onnx.export`` every dimension is frozen from the traced example.
-``CausalLMONNXShaper`` rewrites the input/output shapes to symbolic dims and
-re-runs ``onnx.shape_inference`` so the sequence length propagates through the
-main graph.
-
-The frozen sequence axes inside the attention FunctionProtos are located
-**structurally** via ``AttentionIdentifier``: the Q/K/V head-split Reshapes and the
-output-merge Reshape are found by backtracing from the ``Attention`` node, and their
-seq axis is axis 1 by construction (the head split runs before the Transpose, in
-``(B, S, ...)`` layout). No trace sentinel or prefill→generation registry is needed —
-each case graph is rewritten independently.
-
-How the seq axis is rewritten depends on ``allowzero``:
-
-  allowzero=0 (default)
-    Set the seq axis to ``0`` ("copy the input dim at that axis") and reset the node's
-    ``allowzero=0`` so the copy is honored. The head-count axis stays ``-1`` (inferred),
-    so a single shape constant can stay shared across Q/K/V (different head counts).
-
-  allowzero=1
-    Some runtimes reject the ``0``-copy. Instead make the seq axis the inferred ``-1``
-    and bake the head-count / hidden axis explicitly (derived from the graph by
-    ``AttentionIdentifier``). Because Q/K/V share one constant but need different head
-    counts, each Reshape gets its **own** private shape constant (un-shared):
-        query4dReshape -> [1, -1, num_heads,    head_dim]
-        key4dReshape   -> [1, -1, kv_num_heads, head_dim]
-        value4dReshape -> [1, -1, kv_num_heads, head_dim]
-        out3dReshape   -> [1, -1, num_heads * head_dim]
-
-Symbolic dims set explicitly (shape inference cannot cross FunctionProto boundaries):
-
-  prefill (case1)
-    inputs:   input_ids[1, L], position_ids[1, L]
-    dropped:  attention_mask  (no consumers)
-
-  generation (case2)
-    inputs:   past_keys_*[1, H, L_prev, E], past_values_*[1, H, L_prev, E]
-    dropped:  attention_mask
-    outputs:  past_keys_*_out[1, H, L_prev+1, E], past_values_*_out[1, H, L_prev+1, E]
-              ("L_prev+1" is a literal dim_param label — ONNX dim_param is a free
-               string, not arithmetic — documenting the past+current relation)
-"""
-
 import logging
 import shutil
 from abc import ABC, abstractmethod
 from os import PathLike
+from pathlib import Path
 from typing import List, Literal
 
 import numpy as np
@@ -64,7 +20,7 @@ class CausalLMONNXShaper(ABC):
     def __init__(self, hf_config: transformers.PreTrainedConfig) -> None:
         self.hf_config = hf_config
 
-    # ================ subgraph merge  ================ #
+    # ================ subgraph merge ================ #
     @abstractmethod
     def _post_process_final_onnx(self, case_idx: int, onnx_path: str | PathLike):
         """Postprocess method that optimizes the final merged ONNX graph"""
@@ -100,11 +56,10 @@ class CausalLMONNXShaper(ABC):
         if (logger.isEnabledFor(logging.DEBUG) is False) and (self._subgraph_dir.exists()):
             shutil.rmtree(self._subgraph_dir)
 
-    # ================ dynamic shaping  ================ #
+    # ================ dynamic shaping ================ #
     def make_dynamic_onnx(
         self,
         onnx_path: str | PathLike,
-        mode: Literal["prefill", "generation"],
         *,
         allowzero: int = 0,
         seq_sym: str = "L",
@@ -133,29 +88,17 @@ class CausalLMONNXShaper(ABC):
         for vi in model.graph.output:
             if vi.name in ("logits",):
                 set_vi_axis(vi, 1, seq_sym)
-        # TODO: CausalLMExporter._post_process_final_onnx
-        #   will make prefill graph to output KV cache in future. make KV output dynamic too.
 
         # NOTE: IO KV ValueInfoProto update (make KeyL, ValueL dynamic)
-        if mode == "generation":
-            for vi in model.graph.input:
-                if vi.name.startswith(("past_keys_", "past_values_")):
-                    set_vi_axis(vi, 2, prev_sym)
-            for vi in model.graph.output:
-                if vi.name.startswith(("past_keys_", "past_values_")) and vi.name.endswith("_out"):
-                    set_vi_axis(vi, 2, curr_sym)
+        for vi in model.graph.input:
+            if vi.name.startswith(("past_keys_", "past_values_")):
+                set_vi_axis(vi, 2, prev_sym)
+        for vi in model.graph.output:
+            if vi.name.startswith(("past_keys_", "past_values_")) and vi.name.endswith("_out"):
+                set_vi_axis(vi, 2, curr_sym)
 
-        for func in model.functions:
-            if not AttentionIdentifier.is_attention_func(func):
-                continue
-            attention = AttentionIdentifier(func, hf_config=self.hf_config)
-            head_dim, n_heads, n_kv_heads = attention.head_dim, attention.num_heads, attention.kv_num_heads
-            reshape2shape = {
-                attention.query4dReshape.name: (attention.query4dReshape, [1, -1, n_heads, head_dim]),
-                attention.key4dReshape.name: (attention.key4dReshape, [1, -1, n_kv_heads, head_dim]),
-                attention.value4dReshape.name: (attention.value4dReshape, [1, -1, n_kv_heads, head_dim]),
-                attention.o3dReshape.name: (attention.o3dReshape, [1, -1, n_heads * head_dim]),
-            }
+        for attn_func in (f for f in model.functions if AttentionIdentifier.is_attention_func(f)):
+            attention = AttentionIdentifier(attn_func, hf_config=self.hf_config)
 
             if allowzero == 0:
                 # NOTE: seq axis (axis 1) -> 0-copy; the shape constant may be shared across
@@ -187,19 +130,26 @@ class CausalLMONNXShaper(ABC):
                     )
                     reshape_node.input[1] = out_name
 
-                new_nodes = new_consts + list(func.node)
-                del func.node[:]
-                func.node.extend(new_nodes)
+                new_nodes = new_consts + list(attn_func.node)
+                del attn_func.node[:]
+                attn_func.node.extend(new_nodes)
 
         # NOTE: set Reshape(allowzero = allowzero)
-        for func in model.functions:
-            for node in (n for n in func.node if n.op_type == "Reshape"):
+        for attn_func in (f for f in model.functions if AttentionIdentifier.is_attention_func(f)):
+            for node in (n for n in attn_func.node if n.op_type == "Reshape"):
                 update_node_attribute(node, attribute_name="allowzero", value=allowzero)
 
-        # NOTE: shapes inference from scratch
         del model.graph.value_info[:]
-        onnx.save(model, str(onnx_path))
-        model = onnx.shape_inference.infer_shapes_path(onnx_path, check_type=True, strict_mode=False)
+        data_path = Path(f"{onnx_path}.data")
+        data_path.unlink(missing_ok=True)
+        onnx.save(
+            model,
+            onnx_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=data_path.name,
+            size_threshold=1024,
+        )
 
 
 __all__ = ["CausalLMONNXShaper"]

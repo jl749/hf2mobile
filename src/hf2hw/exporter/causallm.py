@@ -1,10 +1,14 @@
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime
 from os import PathLike
+from pathlib import Path
 from typing import List, Sequence
 
 import onnx
+import onnx.inliner  # NOTE: `import onnx` alone does not expose `onnx.inliner`
+import onnxoptimizer
 import torch
 import transformers
 
@@ -17,6 +21,7 @@ from hf2hw.tracing import (
     register_dynamic_cache_pytree,
 )
 from hf2hw.utils.logger import logger
+from hf2hw.utils.onnx_helper import set_node_attributes
 
 from .onnx.dynamic_shaper import CausalLMONNXShaper
 from .onnx.fusion import fuse_rms_norm
@@ -106,16 +111,66 @@ class CausalLMExporter(
 
         if self.target == "ORT":
             if case_idx == 0:
-                self.make_dynamic_onnx(onnx_path, mode="prefill", allow_zero=0)
+                if logger.isEnabledFor(logging.DEBUG):
+                    self.make_dynamic_onnx(onnx_path, allowzero=1)
+                    model = onnx.load(onnx_path, load_external_data=True)
+                    model, _n = fuse_rms_norm(model)
+                    onnx.save(
+                        model,
+                        f"debug__{onnx_path}",
+                        save_as_external_data=True,
+                        all_tensors_to_one_file=True,
+                        location=f"debug__{onnx_path}.data",
+                        size_threshold=1024,
+                    )
+                    os.remove(f"debug__{onnx_path}.data")
+                os.remove(onnx_path)
+                os.remove(str(onnx_path) + ".data")
             elif case_idx == 1:
-                self.make_dynamic_onnx(onnx_path, mode="generation", allow_zero=0)
+                self.make_dynamic_onnx(onnx_path, allowzero=1)
+                logger.info(f"  {LOG_PREFIX} applied dynamic shaping on `{onnx_path=}`")
                 model = onnx.load(onnx_path, load_external_data=True)
                 model, _n = fuse_rms_norm(model)
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
+
+                # TODO: (optional) since GQA fusion will replace Attention
+                set_node_attributes(model, "Attention", "is_causal", 1)
+                logger.info(f"  {LOG_PREFIX} force Attention node attribute to `is_causal=1`")
+
                 # TODO: GroupQueryAttention, SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
-                onnx.save(model, onnx_path)
-                logger.info(f"  {LOG_PREFIX} dynamic shapes written: {onnx_path}")
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    onnx.save(
+                        model,
+                        f"debug__{onnx_path}",
+                        save_as_external_data=True,
+                        all_tensors_to_one_file=True,
+                        location=f"debug__{onnx_path}.data",
+                        size_threshold=1024,
+                    )
+                    os.remove(f"debug__{onnx_path}.data")
+                model = onnx.inliner.inline_local_functions(model)
+                model = onnxoptimizer.optimize(
+                    model,
+                    passes=[
+                        "extract_constant_to_initializer",
+                        "eliminate_deadend",
+                        "eliminate_unused_initializer",
+                    ],
+                )
+                data_path = Path(f"{str(onnx_path)}.data")
+                data_path.unlink(missing_ok=True)
+                onnx.save(
+                    model,
+                    onnx_path,
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    location=str(data_path),
+                    size_threshold=1024,
+                )
+                onnx.shape_inference.infer_shapes_path(onnx_path, check_type=True, strict_mode=False)
+                logger.info(f"  {LOG_PREFIX} flattened model local function and saved under `{onnx_path=}`")
         elif self.target == "QNN":
             return NotImplemented
             # model = onnx.load(onnx_path, load_external_data=True)
@@ -189,7 +244,6 @@ class CausalLMExporter(
 
             logger.info("Stage 5/5: merging Subgraphs into the main graphs and postprocessing")
             self.merge_subgraphs_into_main_graph(case_paths, subgraph_paths)
-            # TODO: onnx.inliner.inline_local_functions(model)
         except Exception as e:
             raise RuntimeError("CausalLMExporter.export(...) failed.") from e
         finally:

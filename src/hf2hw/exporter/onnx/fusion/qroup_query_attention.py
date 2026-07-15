@@ -108,7 +108,7 @@ class AttentionIdentifier:
     def is_attention_func(cls, func: onnx.FunctionProto) -> bool:
         return sum(1 for n in func.node if n.op_type == "Attention") == 1
 
-    # ── path walkers ──────────────────────────────────────────────────────────
+    # ================ fwd bwd inspector ================ #
     def _walk_bwd(self, edge: str) -> Dict[str, onnx.NodeProto]:
         """
         Using `slef.bwd_dict` backtrace Attention block nodes on Q, K or V branch.
@@ -181,7 +181,7 @@ class AttentionIdentifier:
             edge = node.output[0]  # NOTE: always follow output[0]
         return children
 
-    # ── shape references ──────────────────────────────────────────────────────
+    # ================ shape references ================ #
     @property
     def query4dShape(self) -> List[int]:
         return [1, -1, self.num_heads, self.head_dim]
@@ -198,7 +198,7 @@ class AttentionIdentifier:
     def out3dShape(self) -> List[int]:
         return [1, -1, self.num_heads * self.head_dim]
 
-    # ── node references ──────────────────────────────────────────────────────
+    # ================ node references ================ #
     @property
     def queryMM(self) -> onnx.NodeProto:
         return self._q["matmul"]
@@ -256,10 +256,10 @@ class AttentionIdentifier:
         return self._o["reshape"]
 
     @property
-    def oMM(self) -> onnx.NodeProto:
+    def outMM(self) -> onnx.NodeProto:
         return self._o["matmul"]
 
-    # ── derived attention hyper-params (graph-derived; no HF config needed) ───
+    # ================ derived attention hyper-params ================ #
     def _get_shape_tp_from_reshape(self, reshape_node: onnx.NodeProto) -> onnx.TensorProto | None:
         assert (
             reshape_node.op_type == "Reshape"
@@ -392,7 +392,7 @@ def _rewrite_attention_function(func: onnx.FunctionProto, ident: AttentionIdenti
             **gqa_attrs,
         )
     )
-    o_mm = ident.oMM
+    o_mm = ident.outMM
     o_mm.input[0] = "gqa_out"  # GQA output is already (B, S, H*E): o_proj consumes it directly
     compute.append(o_mm)
 

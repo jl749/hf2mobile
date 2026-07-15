@@ -3,7 +3,7 @@ from typing import Any, Dict, Iterator, List, Sequence, Set, Tuple
 import onnx
 import onnx_ir as ir
 
-# ── onnx/merge.py ───────────────────────────────────────────────────────────────────
+# ===================== onnx/ ===================== #
 
 
 def ensure_opset_imports(model: onnx.ModelProto, new_imports) -> None:
@@ -38,7 +38,7 @@ def drop_attributes(node: onnx.NodeProto, names_to_drop: Set[str]) -> None:
     node.attribute.extend(keep)
 
 
-# ── onnx/fusion/ ────────────────────────────────────────────────────────────────────
+# ===================== onnx/fusion ===================== #
 
 
 def get_scalar(val: ir.Value) -> float | None:
@@ -64,7 +64,7 @@ def get_bwd_dict(nodes: Sequence[onnx.NodeProto]) -> Dict[str, onnx.NodeProto]:
     return {out: n for n in nodes for out in n.output}
 
 
-# ── onnx/dynamic_shaper/ ────────────────────────────────────────────────────────────────────
+# ===================== onnx/dynamic_shaper ===================== #
 
 
 def set_vi_axis(vi: onnx.ValueInfoProto, axis: int, value: int | str) -> None:
@@ -104,3 +104,26 @@ def update_node_attribute(node: onnx.NodeProto, attribute_name: str, value: Any)
         node.attribute.append(onnx.helper.make_attribute("allowzero", value))
     elif attr.i != value:
         attr.i = value
+
+
+# ===================== GENERAL ===================== #
+def set_node_attributes(model: onnx.ModelProto, op_type: str, attribute: str, val: Any) -> None:
+    """
+    Set `attribute=val` on every `op_type` node in the model (main graph + FunctionProto bodies).
+    Overwrites the attribute if present, appends it otherwise (type is inferred from `val`).
+    """
+
+    def _apply(nodes: Sequence[onnx.NodeProto]) -> None:
+        for node in nodes:
+            if node.op_type != op_type:
+                continue
+            new_attr = onnx.helper.make_attribute(attribute, val)
+            existing = next((a for a in node.attribute if a.name == attribute), None)
+            if existing is None:
+                node.attribute.append(new_attr)
+            else:
+                existing.CopyFrom(new_attr)
+
+    _apply(model.graph.node)
+    for func in model.functions:
+        _apply(func.node)
