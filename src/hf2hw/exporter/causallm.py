@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import List, Sequence
 
 import onnx
-import onnx.inliner  # NOTE: `import onnx` alone does not expose `onnx.inliner`
+import onnx.external_data_helper  # NOTE: `import onnx` alone does not expose these submodules
+import onnx.inliner
 import onnxoptimizer
 import torch
 import transformers
@@ -136,16 +137,21 @@ class CausalLMExporter(
                 # TODO: GroupQueryAttention, SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
 
                 if logger.isEnabledFor(logging.DEBUG):
+                    debug_path = f"debug__{onnx_path}"
+                    data_path = f"{debug_path}.data"
+                    if os.path.exists(data_path):
+                        os.remove(data_path)
                     onnx.save(
                         model,
-                        f"debug__{onnx_path}",
+                        debug_path,
                         save_as_external_data=True,
                         all_tensors_to_one_file=True,
-                        location=f"debug__{onnx_path}.data",
+                        location=data_path,
                         size_threshold=1024,
                     )
-                    os.remove(f"debug__{onnx_path}.data")
-                    # TODO: known bug when debug enabled case2.onnx is somehow referring to debug__case2.onnx.data
+                    onnx.external_data_helper.load_external_data_for_model(
+                        model, base_dir=os.path.dirname(os.path.abspath(debug_path))
+                    )
                 model = onnx.inliner.inline_local_functions(model)
                 model = onnxoptimizer.optimize(
                     model,
