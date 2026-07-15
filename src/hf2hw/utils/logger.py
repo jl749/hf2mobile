@@ -55,10 +55,10 @@ class _ColorFormatter(logging.Formatter):
             return super().format(record)
         original_levelname = record.levelname
         color = _LEVEL_COLOR.get(record.levelno, "")
-        # Pad first, then wrap in color codes so width stays uniform.
+        # pad first, then wrap in color codes so width stays uniform.
         record.levelname = f"{color}{original_levelname:<8}{_RESET}"
         try:
-            # Replace the format string for this call to avoid double-padding.
+            # replace the format string for this call to avoid double-padding.
             return logging.Formatter("[hf2hw] %(levelname)s | %(message)s").format(record)
         finally:
             record.levelname = original_levelname

@@ -130,28 +130,28 @@ class CausalLMExporter(
                 self.make_dynamic_onnx(onnx_path, allowzero=1)
                 logger.info(f"  {LOG_PREFIX} applied dynamic shaping on `{onnx_path=}`")
                 model = onnx.load(onnx_path, load_external_data=True)
-                model, _n = fuse_rms_norm(model)
+                model, _n = fuse_rms_norm(model)  # NOTE: fuse main graph RMSNorms (subgraphs are already fused)
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
 
                 # TODO: GroupQueryAttention, SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
 
                 if logger.isEnabledFor(logging.DEBUG):
-                    debug_path = f"debug__{onnx_path}"
-                    data_path = f"{debug_path}.data"
-                    if os.path.exists(data_path):
-                        os.remove(data_path)
+                    debug_path = Path(f"debug__{onnx_path}")
+                    data_path = debug_path.with_suffix(".onnx.data")
                     onnx.save(
                         model,
-                        debug_path,
+                        str(debug_path),
                         save_as_external_data=True,
                         all_tensors_to_one_file=True,
-                        location=data_path,
+                        location=str(data_path),
                         size_threshold=1024,
                     )
                     onnx.external_data_helper.load_external_data_for_model(
-                        model, base_dir=os.path.dirname(os.path.abspath(debug_path))
+                        model=model,
+                        base_dir=str(debug_path.resolve().parent),
                     )
+                    data_path.unlink(missing_ok=True)
                 model = onnx.inliner.inline_local_functions(model)
                 model = onnxoptimizer.optimize(
                     model,
