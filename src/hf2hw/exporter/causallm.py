@@ -189,6 +189,7 @@ class CausalLMExporter(
 
             logger.info("Stage 5/5: merging Subgraphs into the main graphs and postprocessing")
             self.merge_subgraphs_into_main_graph(case_paths, subgraph_paths)
+            # TODO: onnx.inliner.inline_local_functions(model)
         except Exception as e:
             raise RuntimeError("CausalLMExporter.export(...) failed.") from e
         finally:

@@ -1,4 +1,4 @@
-from typing import Any, Iterator, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Sequence, Set, Tuple
 
 import onnx
 import onnx_ir as ir
@@ -52,6 +52,18 @@ def get_scalar(val: ir.Value) -> float | None:
         return None
 
 
+def get_fwd_dict(nodes: Sequence[onnx.NodeProto]) -> Dict[str, List[onnx.NodeProto]]:
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for node in nodes:
+        for edge_name in node.input:
+            consumers.setdefault(edge_name, []).append(node)
+    return consumers
+
+
+def get_bwd_dict(nodes: Sequence[onnx.NodeProto]) -> Dict[str, onnx.NodeProto]:
+    return {out: n for n in nodes for out in n.output}
+
+
 # ── onnx/dynamic_shaper/ ────────────────────────────────────────────────────────────────────
 
 
@@ -79,25 +91,10 @@ def get_vi_axis(vi: onnx.ValueInfoProto, axis: int) -> int | str | None:
 
 
 def drop_vi_by_name(vis: Sequence[onnx.ValueInfoProto], names: Set[str]) -> None:
-    """Remove named entries from the given `vis` inplace."""
+    """Remove named entries from the given `vis` inplace (NOTE: assumes they have no consumers)."""
     keep = [vi for vi in vis if vi.name not in names]
     del vis[:]
-    keep.extend(keep)
-
-
-def filter_shape_metadata(
-    nodes: Sequence[onnx.NodeProto],
-    initializers: Sequence[onnx.TensorProto],
-) -> Iterator[Tuple[str, onnx.TensorProto]]:
-    """Yield (Reshape.input[1].name, TensorProto)"""
-    shape_tensor_names = {n.input[1] for n in nodes if n.op_type == "Reshape"}
-    for tp in (tp for tp in initializers if tp.name in shape_tensor_names):
-        yield tp.name, tp
-    for node in nodes:
-        if (node.op_type == "Constant") and node.output and (node.output[0] in shape_tensor_names):
-            for attr in node.attribute:
-                if attr.name == "value":
-                    yield node.output[0], attr.t
+    vis.extend(keep)
 
 
 def update_node_attribute(node: onnx.NodeProto, attribute_name: str, value: Any):
