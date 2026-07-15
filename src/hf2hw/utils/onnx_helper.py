@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterator, List, Sequence, Set, Tuple
+from typing import Any, Dict, List, Sequence, Set
 
 import onnx
 import onnx_ir as ir
@@ -101,29 +101,9 @@ def update_node_attribute(node: onnx.NodeProto, attribute_name: str, value: Any)
     """Update node attribute using the new value."""
     attr = next((a for a in node.attribute if a.name == attribute_name), None)
     if attr is None:
-        node.attribute.append(onnx.helper.make_attribute("allowzero", value))
+        node.attribute.append(onnx.helper.make_attribute(attribute_name, value))
     elif attr.i != value:
         attr.i = value
 
 
 # ===================== GENERAL ===================== #
-def set_node_attributes(model: onnx.ModelProto, op_type: str, attribute: str, val: Any) -> None:
-    """
-    Set `attribute=val` on every `op_type` node in the model (main graph + FunctionProto bodies).
-    Overwrites the attribute if present, appends it otherwise (type is inferred from `val`).
-    """
-
-    def _apply(nodes: Sequence[onnx.NodeProto]) -> None:
-        for node in nodes:
-            if node.op_type != op_type:
-                continue
-            new_attr = onnx.helper.make_attribute(attribute, val)
-            existing = next((a for a in node.attribute if a.name == attribute), None)
-            if existing is None:
-                node.attribute.append(new_attr)
-            else:
-                existing.CopyFrom(new_attr)
-
-    _apply(model.graph.node)
-    for func in model.functions:
-        _apply(func.node)

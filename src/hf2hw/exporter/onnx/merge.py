@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List
 
 import onnx
@@ -37,7 +38,7 @@ def _onnx_to_function(
         opset_imports=list(m.opset_import),
     )
     logger.debug(
-        f"onnx_to_function: {submodule_onnx_path} → fn {function_name!r} "
+        f"onnx_to_function: {os.path.relpath(submodule_onnx_path)} → fn {function_name!r} "
         f"({len(const_nodes)} const(s) + {len(submodule_nodes)} node(s), "
         f"{len(func.input)} in / {len(func.output)} out)"
     )

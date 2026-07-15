@@ -21,7 +21,6 @@ from hf2hw.tracing import (
     register_dynamic_cache_pytree,
 )
 from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import set_node_attributes
 
 from .onnx.dynamic_shaper import CausalLMONNXShaper
 from .onnx.fusion import fuse_rms_norm
@@ -134,10 +133,6 @@ class CausalLMExporter(
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
 
-                # TODO: (optional) since GQA fusion will replace Attention
-                set_node_attributes(model, "Attention", "is_causal", 1)
-                logger.info(f"  {LOG_PREFIX} force Attention node attribute to `is_causal=1`")
-
                 # TODO: GroupQueryAttention, SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -150,6 +145,7 @@ class CausalLMExporter(
                         size_threshold=1024,
                     )
                     os.remove(f"debug__{onnx_path}.data")
+                    # TODO: known bug when debug enabled case2.onnx is somehow referring to debug__case2.onnx.data
                 model = onnx.inliner.inline_local_functions(model)
                 model = onnxoptimizer.optimize(
                     model,

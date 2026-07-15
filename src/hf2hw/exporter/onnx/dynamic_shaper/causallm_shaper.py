@@ -3,7 +3,7 @@ import shutil
 from abc import ABC, abstractmethod
 from os import PathLike
 from pathlib import Path
-from typing import List, Literal
+from typing import List
 
 import numpy as np
 import onnx
@@ -134,10 +134,13 @@ class CausalLMONNXShaper(ABC):
                 del attn_func.node[:]
                 attn_func.node.extend(new_nodes)
 
-        # NOTE: set Reshape(allowzero = allowzero)
         for attn_func in (f for f in model.functions if AttentionIdentifier.is_attention_func(f)):
+            # NOTE: set Reshape(allowzero = allowzero)
             for node in (n for n in attn_func.node if n.op_type == "Reshape"):
                 update_node_attribute(node, attribute_name="allowzero", value=allowzero)
+            # NOTE: set Attention(is_causal = 1)
+            for node in (n for n in attn_func.node if n.op_type == "Attention"):
+                update_node_attribute(node, attribute_name="is_causal", value=1)
 
         del model.graph.value_info[:]
         data_path = Path(f"{onnx_path}.data")
