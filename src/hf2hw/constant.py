@@ -24,3 +24,8 @@ SUBGRAPH_MAP_TYPE = Dict[int, Dict[str, str]]
 
 # causallm_shaper.py
 _CASE_SUFFIX_RE = re.compile(r"____case\d+$")
+
+# group_query_attention.py
+_NORM_OPS = ("RMSNormalization", "SimplifiedLayerNormalization", "LayerNormalization")
+_SEQLENS_K_NAME = "seqlens_k"
+_TOTAL_SEQLEN_NAME = "total_sequence_length"

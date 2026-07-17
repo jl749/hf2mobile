@@ -17,6 +17,7 @@ from hf2hw.tracing import (
     sig2fwdspecs,
 )
 from hf2hw.utils.logger import logger
+from hf2hw.utils.onnx_helper import save_onnx
 
 _ONNX_OUTPUT_NAME = "attn_output"
 
@@ -103,7 +104,8 @@ def export(
     _m = onnx.load(str(onnx_path), load_external_data=True)
     _m, _n_rms = fuse_rms_norm(_m)
     _m, _n_rope = fuse_rope(_m)
-    onnx.save(_m, str(onnx_path))
+    # TODO: fuse_attention (eager mode)
+    save_onnx(_m, onnx_path)
     if _n_rms:
         logger.debug(f"  fused {_n_rms} RMSNorm(s) in {onnx_path.name}")
     if _n_rope:

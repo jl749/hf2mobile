@@ -1,0 +1,12 @@
+from hf2hw.main import export
+
+
+def main():
+    # model_id = "JackFram/llama-68m"
+    # model_id = "Qwen/Qwen3-0.6B"
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    export(model_id, "ORT")
+
+
+if __name__ == "__main__":
+    main()

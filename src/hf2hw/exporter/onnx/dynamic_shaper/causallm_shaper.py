@@ -13,10 +13,12 @@ from hf2hw.constant import ONNX_DOMAIN_NAME, SUBGRAPH_MAP_TYPE
 from hf2hw.exporter.onnx.fusion import AttentionIdentifier
 from hf2hw.exporter.onnx.merge import merge_subgraphs_into_model
 from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import drop_vi_by_name, set_vi_axis, update_node_attribute
+from hf2hw.utils.onnx_helper import drop_vi_by_name, save_onnx, set_vi_axis, update_node_attribute
+
+from ._base import _ONNXShaper
 
 
-class CausalLMONNXShaper(ABC):
+class CausalLMONNXShaper(_ONNXShaper):
     def __init__(self, hf_config: transformers.PreTrainedConfig) -> None:
         self.hf_config = hf_config
 
@@ -143,16 +145,7 @@ class CausalLMONNXShaper(ABC):
                 update_node_attribute(node, attribute_name="is_causal", value=1)
 
         del model.graph.value_info[:]
-        data_path = Path(f"{onnx_path}.data")
-        data_path.unlink(missing_ok=True)
-        onnx.save(
-            model,
-            onnx_path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location=data_path.name,
-            size_threshold=1024,
-        )
+        save_onnx(model, onnx_path)
 
 
 __all__ = ["CausalLMONNXShaper"]

@@ -53,8 +53,9 @@ def _adapt_module_for_case(module: torch.nn.Module, input_specs: INPUT_SPECS_TYP
     # NOTE: onnx RotaryEmbedding op does half rotation itself
     #   torch impl takes full head_dim where onnx takes head_dim//2
     #   downcast fp32 tables to the model activation dtype (compute in fp32, store in e.g. bf16)
-    cos_table = cos_table[:, : hf_config.head_dim // 2].to(model_dtype)
-    sin_table = sin_table[:, : hf_config.head_dim // 2].to(model_dtype)
+    head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+    cos_table = cos_table[:, : head_dim // 2].to(model_dtype)
+    sin_table = sin_table[:, : head_dim // 2].to(model_dtype)
 
     def _traceable_forward(self_inner, position_ids: torch.Tensor):
         """ONNX takes `*args` (position_ids) as inputs and `cos_table`, `sin_table` as outputs"""

@@ -72,6 +72,11 @@ class HookRegisterInterface(ABC):
         _ts = TensorSpec.from_tensor(output)
         obsvd_outputs: OUTPUT_SPECS_TYPE = (_ts,) if isinstance(_ts, TensorSpec) else _ts
 
+        # NOTE: Attention returns `(attn_out, attn_weight)` we don't trace `attn_weight`
+        #   None is added instead during register.py::_plugin_forward
+        if "Attention" in _cls_name:
+            obsvd_outputs = obsvd_outputs[:1]
+
         self.plugin_ios[f"{_cls_name}::{_module_name}"].obsvd_output_specs.append(obsvd_outputs)
 
     def _attach_hooks(self):

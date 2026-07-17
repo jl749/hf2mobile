@@ -7,13 +7,10 @@ from pathlib import Path
 from typing import List, Sequence
 
 import onnx
-import onnx.external_data_helper  # NOTE: `import onnx` alone does not expose these submodules
-import onnx.inliner
-import onnxoptimizer
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, SUPPORTED_TARGETS, TRACE_L
+from hf2hw.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, SUPPORTED_TARGETS
 from hf2hw.tracing import (
     HookRegisterInterface,
     PluginRegisterInterface,
@@ -22,9 +19,10 @@ from hf2hw.tracing import (
     register_dynamic_cache_pytree,
 )
 from hf2hw.utils.logger import logger
+from hf2hw.utils.onnx_helper import optimize_onnx, save_onnx
 
 from .onnx.dynamic_shaper import CausalLMONNXShaper
-from .onnx.fusion import fuse_rms_norm
+from .onnx.fusion import fuse_group_query_attention, fuse_rms_norm
 from .submodules import SubgraphExporterInterface
 
 
@@ -58,7 +56,7 @@ class CausalLMExporter(
     @HookRegisterInterface.register_plugin_io_hooks()
     def trace_plugin_ios(self) -> None:
         """Model inference logic for tracing"""
-        trace_input_ids = torch.LongTensor([[57] * TRACE_L])
+        trace_input_ids = torch.LongTensor([[57] * 11])
         self.model.generate(input_ids=trace_input_ids, max_new_tokens=3)
 
     @contextmanager
@@ -115,17 +113,10 @@ class CausalLMExporter(
                     self.make_dynamic_onnx(onnx_path, allowzero=1)
                     model = onnx.load(onnx_path, load_external_data=True)
                     model, _n = fuse_rms_norm(model)
-                    onnx.save(
-                        model,
-                        f"debug__{onnx_path}",
-                        save_as_external_data=True,
-                        all_tensors_to_one_file=True,
-                        location=f"debug__{onnx_path}.data",
-                        size_threshold=1024,
-                    )
-                    os.remove(f"debug__{onnx_path}.data")
-                os.remove(onnx_path)
-                os.remove(str(onnx_path) + ".data")
+                    save_onnx(model, f"debug__{onnx_path}")
+                    Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)
+                Path(onnx_path).unlink(missing_ok=True)
+                Path(onnx_path).with_suffix(".onnx.data").unlink(missing_ok=True)
             elif case_idx == 1:
                 self.make_dynamic_onnx(onnx_path, allowzero=1)
                 logger.info(f"  {LOG_PREFIX} applied dynamic shaping on `{onnx_path=}`")
@@ -134,44 +125,17 @@ class CausalLMExporter(
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
 
-                # TODO: GroupQueryAttention, SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
-
                 if logger.isEnabledFor(logging.DEBUG):
-                    debug_path = Path(f"debug__{onnx_path}")
-                    data_path = debug_path.with_suffix(".onnx.data")
-                    onnx.save(
-                        model,
-                        str(debug_path),
-                        save_as_external_data=True,
-                        all_tensors_to_one_file=True,
-                        location=str(data_path),
-                        size_threshold=1024,
-                    )
-                    onnx.external_data_helper.load_external_data_for_model(
-                        model=model,
-                        base_dir=str(debug_path.resolve().parent),
-                    )
-                    data_path.unlink(missing_ok=True)
-                model = onnx.inliner.inline_local_functions(model)
-                model = onnxoptimizer.optimize(
-                    model,
-                    passes=[
-                        "extract_constant_to_initializer",
-                        "eliminate_deadend",
-                        "eliminate_unused_initializer",
-                    ],
-                )
-                data_path = Path(f"{str(onnx_path)}.data")
-                data_path.unlink(missing_ok=True)
-                onnx.save(
-                    model,
-                    onnx_path,
-                    save_as_external_data=True,
-                    all_tensors_to_one_file=True,
-                    location=str(data_path),
-                    size_threshold=1024,
-                )
-                onnx.shape_inference.infer_shapes_path(onnx_path, check_type=True, strict_mode=False)
+                    save_onnx(model, f"debug__{onnx_path}")
+                    Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)
+
+                model = optimize_onnx(model)
+                model, _n = fuse_group_query_attention(model, self.hf_config)
+                if _n:
+                    logger.info(f"  {LOG_PREFIX} fused {_n} main-graph GroupQueryAttention(s) in {onnx_path}")
+                # TODO: SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
+
+                save_onnx(model, onnx_path)
                 logger.info(f"  {LOG_PREFIX} flattened model local function and saved under `{onnx_path=}`")
         elif self.target == "QNN":
             return NotImplemented

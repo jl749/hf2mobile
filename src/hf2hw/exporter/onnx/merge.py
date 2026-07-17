@@ -4,8 +4,8 @@ from typing import Dict, List
 import onnx
 
 from hf2hw.constant import ONNX_DOMAIN_NAME
-from hf2hw.utils import drop_attributes, update_opset
 from hf2hw.utils.logger import logger
+from hf2hw.utils.onnx_helper import drop_attributes, save_onnx, update_opset
 
 _PLACEHOLDER_ATTR = "torchlib_op_name"
 
@@ -117,7 +117,7 @@ def merge_subgraphs_into_model(
         drop_attributes(node, names_to_drop={_PLACEHOLDER_ATTR})  # TODO: is this step required?
         rewritten += 1
 
-    onnx.save(model, output_path)
+    save_onnx(model, output_path)
     logger.info(
         f"merge_subgraphs_into_model: {case_path} → {output_path} "
         f"({rewritten} node(s) rewritten, {len(appended_fn_names)} function(s) appended)"

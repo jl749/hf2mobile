@@ -1,7 +1,12 @@
+import tempfile
+from os import PathLike
+from pathlib import Path
 from typing import Any, Dict, List, Sequence, Set
 
 import onnx
+import onnx.external_data_helper  # NOTE: `import onnx` alone does not expose this submodule
 import onnx_ir as ir
+from onnx_ir.passes.common import InlinePass, LiftConstantsToInitializersPass, RemoveUnusedNodesPass
 
 # ===================== onnx/ ===================== #
 
@@ -107,3 +112,39 @@ def update_node_attribute(node: onnx.NodeProto, attribute_name: str, value: Any)
 
 
 # ===================== GENERAL ===================== #
+def save_onnx(model: onnx.ModelProto, save_path: str | PathLike):
+    data_path = Path(f"{save_path}.data")
+    data_path.unlink(missing_ok=True)
+    onnx.save(
+        model,
+        save_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_path.name,
+        size_threshold=1024,
+    )
+    onnx.external_data_helper.load_external_data_for_model(model, str(data_path.resolve().parent))
+
+
+def optimize_onnx(model: onnx.ModelProto):
+    """
+    pure-Python onnx_ir passes
+    onnx.inliner/onnxoptimizer round-trip the full model through GB-scale protobuf C++ (de)serialization
+    which could be the source of silent nondeterministic weight corruption
+
+    - inline local functions + drop unused ones
+    - Constant to initializers
+    - clean dead nodes + drop unused initializers
+    """
+    model_ir = ir.from_proto(model)
+    InlinePass()(model_ir)
+    LiftConstantsToInitializersPass()(model_ir)
+    RemoveUnusedNodesPass()(model_ir)
+    model = ir.to_proto(model_ir)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir = Path(temp_dir)
+        temp_onnx_path = temp_dir.joinpath("delete_me.onnx")
+        save_onnx(model, str(temp_onnx_path))
+        onnx.shape_inference.infer_shapes_path(str(temp_onnx_path), check_type=True, strict_mode=False)
+        model = onnx.load(str(temp_onnx_path))
+    return model
