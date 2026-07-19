@@ -38,7 +38,8 @@ Replaced with (custom domain):
   )
 """
 
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Dict, Tuple
 
 import numpy as np
 import onnx
@@ -49,261 +50,7 @@ from onnxscript.rewriter import pattern
 
 from hf2hw.constant import _NORM_OPS, _SEQLENS_K_NAME, _TOTAL_SEQLEN_NAME
 from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import get_bwd_dict, get_fwd_dict, update_opset
-
-
-# ════════════════════════════ fusion helper ════════════════════════════ #
-# TODO: use onnx_ir instead of using bwd_dict, fwd_dict
-class AttentionIdentifier:
-    """Structural identification of a traced Attention FunctionProto.
-
-    e.g. (Qwen3 generation case)
-      {args_0} ─ MatMul ─ Reshape(4d) ─ RMSNorm ─ Transpose ─ RotaryEmbedding ─────┐
-      {args_0} ─ MatMul ─ Reshape(4d) ─ RMSNorm ─ Transpose ─ RotaryEmbedding ── Concat ── {prev_K}
-      {args_0} ─ MatMul ─ Reshape(4d) ─ Transpose ────────────────────────────── Concat ── {prev_V}
-                                                                                   |
-                                                                             Attention(Q,K,V)
-                                                                 Transpose ─ Reshape(3d) ─ MatMul -> {OUT}
-    """
-
-    _PASSTHROUGH_OPS = ("Cast", "Identity", "Add", "Mul")
-
-    def __init__(self, func: onnx.FunctionProto, hf_config: transformers.PreTrainedConfig):
-        self.hf_config = hf_config
-
-        self.func = func
-        self.fwd_dict: Dict[str, List[onnx.NodeProto]] = get_fwd_dict(func.node)
-        self.bwd_dict: Dict[str, onnx.NodeProto] = get_bwd_dict(func.node)
-        self.edge2const: Dict[str, onnx.TensorProto] = {
-            n.output[0]: attr.t
-            for n in func.node
-            if n.op_type == "Constant" and n.output
-            for attr in n.attribute
-            if attr.name == "value"
-        }
-
-        _attns = [n for n in func.node if n.op_type == "Attention"]
-        if len(_attns) != 1:
-            raise ValueError(f"`{func.name}` holds {len(_attns)} Attention node(s); expected exactly 1.")
-        self.attention: onnx.NodeProto = _attns[0]
-
-        # NOTE: the following _walk_bwd and _walk_fwd calls are assuming certain graph topologies in advacne
-        # [bwd]
-        #   Q, K, V MatMul weights are not merged
-        #   RotaryEmbedding must have been fused in advance
-        #   (OPTIONAL) RMSNormalization, SimplifiedLayerNormalization, LayerNormalization must have been fused in advance
-        # [fwd]
-        #   {O -> Trnaspose -> Reshape} must be a pathological tree
-        self._q = self._walk_bwd(self.attention.input[0])
-        self._k = self._walk_bwd(self.attention.input[1])
-        self._v = self._walk_bwd(self.attention.input[2])
-        self._o = self._walk_fwd(self.attention.output[0])
-        for tag, path in (("Q", self._q), ("K", self._k), ("V", self._v)):
-            if "matmul" not in path or "reshape" not in path:
-                raise ValueError(f"`{func.name}` {tag} path is missing its projection MatMul/Reshape.")
-        if "matmul" not in self._o or "reshape" not in self._o:
-            raise ValueError(f"`{func.name}` output path is missing its o_proj MatMul/Reshape.")
-
-    @classmethod
-    def is_attention_func(cls, func: onnx.FunctionProto) -> bool:
-        return sum(1 for n in func.node if n.op_type == "Attention") == 1
-
-    # ================ fwd bwd inspector ================ #
-    def _walk_bwd(self, edge: str) -> Dict[str, onnx.NodeProto]:
-        """
-        Using `slef.bwd_dict` backtrace Attention block nodes on Q, K or V branch.
-        Return dictionary containing references to ...
-            `matmul` (Q, K or V)
-            `concat` (past_KV + cur_KV (IF EXIST))
-            `rope`   (assumes RotaryEmbedding has already been fused)
-            `norm`   (assums RMSNormalization, SimplifiedLayerNormalization, LayerNormalization are fused already (IF EXIST))
-            `transpose`, `reshape` (3d -> 4d head split)
-        NodeProtos
-        """
-        parents: Dict[str, onnx.NodeProto] = {}
-        while True:
-            node = self.bwd_dict.get(edge)
-            if node is None:
-                break  # NOTE: graph input reached (end of the loop)
-
-            if node.op_type in ("MatMul", "Gemm"):
-                parents["matmul"] = node
-                break  # NOTE: MM reached (end of the loop)
-            elif node.op_type == "Concat":
-                parents["concat"] = node
-                edge = next((_ for _ in node.input if _ in self.bwd_dict), None)
-                if edge is None:
-                    break  # NOTE: concat reached but does not have parent node
-            elif node.op_type == "RotaryEmbedding":
-                parents["rope"] = node
-                edge = node.input[0]
-            elif node.op_type in _NORM_OPS:
-                parents["norm"] = node
-                edge = node.input[0]
-            elif node.op_type == "Reshape":
-                parents.setdefault("reshape", node)
-                edge = node.input[0]
-            elif node.op_type == "Transpose":
-                parents["transpose"] = node
-                edge = node.input[0]
-            elif node.op_type in self._PASSTHROUGH_OPS:
-                edge = next((_ for _ in node.input if _ in self.bwd_dict), node.input[0])
-            else:
-                break  # NOTE: no more case to cover exit the loop
-        return parents
-
-    def _walk_fwd(self, edge: str) -> Dict[str, onnx.NodeProto]:
-        """
-        Using `slef.fwd_dict` forwardtrace Attention block nodes from sftmx((QK.T)/sqrt(d))V.output[0]
-        Return dictionary containing references to ...
-            `matmul` (O)
-            `transpose`, `reshape` (4d -> 3d head merge)
-        NodeProtos
-        """
-        children: Dict[str, onnx.NodeProto] = {}
-        while True:
-            nexts = self.fwd_dict.get(edge, [])
-            if len(nexts) != 1:
-                break  # NOTE: graph output reached (end of the loop)
-            assert (
-                len(nexts) == 1
-            ), f"`{edge}` directs to multiple NodeProtos `{[n.name for n in nexts]}`. Please pass an edge name that does not branch out (pathological)."
-            node = nexts[0]
-            if node.op_type in ("MatMul", "Gemm"):
-                children["matmul"] = node
-                break
-            elif node.op_type == "Reshape":
-                children["reshape"] = node
-            elif node.op_type == "Transpose":
-                children["transpose"] = node
-            elif node.op_type not in _PASSTHROUGH_OPS:
-                break
-            edge = node.output[0]  # NOTE: always follow output[0]
-        return children
-
-    # ================ shape references ================ #
-    @property
-    def query4dShape(self) -> List[int]:
-        return [1, -1, self.num_heads, self.head_dim]
-
-    @property
-    def key4dShape(self) -> List[int]:
-        return [1, -1, self.kv_num_heads, self.head_dim]
-
-    @property
-    def value4dShape(self) -> List[int]:
-        return [1, -1, self.kv_num_heads, self.head_dim]
-
-    @property
-    def out3dShape(self) -> List[int]:
-        return [1, -1, self.num_heads * self.head_dim]
-
-    # ================ node references ================ #
-    @property
-    def queryMM(self) -> onnx.NodeProto:
-        return self._q["matmul"]
-
-    @property
-    def keyMM(self) -> onnx.NodeProto:
-        return self._k["matmul"]
-
-    @property
-    def valueMM(self) -> onnx.NodeProto:
-        return self._v["matmul"]
-
-    @property
-    def query4dReshape(self) -> onnx.NodeProto:
-        return self._q["reshape"]
-
-    @property
-    def key4dReshape(self) -> onnx.NodeProto:
-        return self._k["reshape"]
-
-    @property
-    def value4dReshape(self) -> onnx.NodeProto:
-        return self._v["reshape"]
-
-    @property
-    def queryNorm(self) -> Optional[onnx.NodeProto]:
-        return self._q.get("norm")
-
-    @property
-    def keyNorm(self) -> Optional[onnx.NodeProto]:
-        return self._k.get("norm")
-
-    @property
-    def valueNorm(self) -> Optional[onnx.NodeProto]:
-        return self._v.get("norm")
-
-    @property
-    def queryRope(self) -> Optional[onnx.NodeProto]:
-        return self._q.get("rope")
-
-    @property
-    def keyRope(self) -> Optional[onnx.NodeProto]:
-        return self._k.get("rope")
-
-    @property
-    def keyConcat(self) -> Optional[onnx.NodeProto]:
-        return self._k.get("concat")
-
-    @property
-    def valueConcat(self) -> Optional[onnx.NodeProto]:
-        return self._v.get("concat")
-
-    @property
-    def out3dReshape(self) -> onnx.NodeProto:
-        return self._o["reshape"]
-
-    @property
-    def outMM(self) -> onnx.NodeProto:
-        return self._o["matmul"]
-
-    # ================ derived attention hyper-params ================ #
-    def _get_shape_tp_from_reshape(self, reshape_node: onnx.NodeProto) -> onnx.TensorProto | None:
-        assert (
-            reshape_node.op_type == "Reshape"
-        ), f"`{reshape_node.op_type}` is not an allowed op_type for `_get_shape_tp_from_reshape`"
-        return self.edge2const.get(reshape_node.input[1], None)
-
-    @property
-    def head_dim(self) -> int:
-        """Last element of the Q head-split Reshape, e.g. [1, L, H, head_dim] -> head_dim"""
-        shape_tp = self._get_shape_tp_from_reshape(self.query4dReshape)
-        head_dim = int(onnx.numpy_helper.to_array(shape_tp).ravel()[-1])
-        if self.hf_config is not None:
-            config_head_dim = getattr(
-                self.hf_config, "head_dim", self.hf_config.hidden_size // self.hf_config.num_attention_heads
-            )
-            head_dim = head_dim if head_dim <= 0 else config_head_dim
-            assert head_dim == config_head_dim
-        return head_dim
-
-    @property
-    def num_heads(self) -> int:
-        num_heads = self._mm_out_features(self.queryMM) // self.head_dim
-        if self.hf_config is not None:
-            assert num_heads == self.hf_config.num_attention_heads
-        return num_heads
-
-    @property
-    def kv_num_heads(self) -> int:
-        num_heads = self._mm_out_features(self.keyMM) // self.head_dim
-        if self.hf_config is not None:
-            assert num_heads == self.hf_config.num_key_value_heads
-        return num_heads
-
-    def _mm_out_features(self, mm: onnx.NodeProto) -> int:
-        """Out-features of a projection MatMul/Gemm: weight is `[in, out]` (`[out, in]` if transB)."""
-        trans_b = next((a.i for a in mm.attribute if a.name == "transB"), 0) if mm.op_type == "Gemm" else 0
-        for edge_name in mm.input:
-            tp = self.edge2const.get(edge_name, None)
-            if tp is not None and len(tp.dims) == 2:
-                return int(tp.dims[0] if trans_b else tp.dims[1])
-        raise ValueError(f"`{self.func.name}` {mm.name!r} has non 2D Constant weight input.")
-
-
-# ════════════════════════════ GQA fusion ════════════════════════════ #
+from hf2hw.utils.onnx_helper import update_opset
 
 
 def _ir_const_tensor(val: ir.Value) -> ir.TensorProtocol | None:
@@ -318,100 +65,211 @@ def _ir_const_tensor(val: ir.Value) -> ir.TensorProtocol | None:
     return None
 
 
-def _find_rope_caches(graph: ir.Graph) -> Tuple[ir.Value, ir.Value] | None:
-    """The full cos/sin tables shared by every `RotaryEmbedding`'s `Gather(table, position_ids)` input."""
-    cos_table_candidates, sin_table_candidates = set(), set()
-    for node in graph:
-        if node.op_type != "RotaryEmbedding":
-            continue
-        for cache_idx, table_candidates in ((1, cos_table_candidates), (2, sin_table_candidates)):
-            gather: ir.Node = node.inputs[cache_idx].producer()  # NOTE: `Gather -> RotaryEmbedding[1,2]`
-            if gather is None or gather.op_type != "Gather" or _ir_const_tensor(gather.inputs[0]) is None:
-                return None
-            table_candidates.add(gather.inputs[0])
-    if len(cos_table_candidates) != 1 or len(sin_table_candidates) != 1:
+def _rope_cache_table(cache: ir.Value) -> ir.TensorProtocol | None:
+    """The constant full table behind a RotaryEmbedding cos/sin edge: `Gather(table, position_ids)` input.
+
+    Resolved per attention block — models with several RoPE frequencies (e.g. Gemma3's
+    global/local tables) have a different `Gather` feeding each layer type.
+    """
+    gather: ir.Node = cache.producer()  # NOTE: `Gather -> RotaryEmbedding[1,2]`
+    if gather is None or gather.op_type != "Gather":
         return None
-    return cos_table_candidates.pop(), sin_table_candidates.pop()
+    return _ir_const_tensor(gather.inputs[0])
 
 
-def _gqa_rule(hf_config: transformers.PretrainedConfig, shared: Dict[str, ir.Value]) -> pattern.RewriteRule:
-    """Attention block -> GroupQueryAttention rewrite rule (over `shared` graph-level values)."""
+def _layer_index(past_key: ir.Value) -> int | None:
+    """Layer index of a matched attention block, read off its `past_keys_{i}` graph input name."""
+    match = re.fullmatch(r"past_keys_(\d+)", past_key.name or "")
+    return int(match.group(1)) if match else None
+
+
+def _gqa_rule(
+    hf_config: transformers.PretrainedConfig,
+    shared: Dict[str, ir.Value],
+    head_dim: int,
+    norm_after_transpose: bool = False,
+    with_mask: bool = False,
+) -> pattern.RewriteRule:
+    """Attention block -> GroupQueryAttention rewrite rule (over `shared` graph-level values).
+
+    `norm_after_transpose` selects where the (optional) per-head QK norm sits in the traced graph:
+      * False (Qwen3/Llama): `Reshape(4d) -> [RMSNorm] -> Transpose -> RotaryEmbedding`
+      * True  (Gemma3):      `Reshape(4d) -> Transpose -> RMSNorm -> RotaryEmbedding`
+    In the True variant the replacement re-emits the norm on the *pre-transpose* `(N, L, H, E')`
+    tensor — RMSNorm on `axis=-1` commutes with the `(0, 2, 1, 3)` transpose — then flattens to 3-D.
+
+    `with_mask` matches the 4-input `Attention(Q, K, V, attn_mask)` written by the shaper for
+    sliding-window layers; GQA carries the window via `local_window_size`, so the matched mask
+    chain goes dead and is removed by DCE.
+    """
     num_heads, num_kv_heads = hf_config.num_attention_heads, hf_config.num_key_value_heads
+    # sliding-window layers (e.g. Gemma3/Mistral): GQA expresses the window natively via
+    #   `local_window_size` — verified to match the HF semantics exactly (each query attends
+    #   the last `sliding_window` keys INCLUDING itself; no off-by-one)
+    sliding_window = getattr(hf_config, "sliding_window", None)
+    layer_types = getattr(hf_config, "layer_types", None)
 
-    def pat(
-        op: pattern.OpsetPatternBuilder,
-        q_in: pattern.Var,
-        k_in: pattern.Var,
-        v_in: pattern.Var,
-        v_shape: pattern.Var,
-        o_shape: pattern.Var,
-        cos: pattern.Var,
-        sin: pattern.Var,
-        past_key: pattern.Var,
-        past_value: pattern.Var,
-    ):
-        # {Q} -> Transpose -> RotaryEmbedding -> {Q}
-        q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
-        q_rope = op.RotaryEmbedding(q_t, cos, sin)
-        # {K} -> Trnaspose -> RotaryEmbedding -> Concat -> {new_K}
-        k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
-        k_rope = op.RotaryEmbedding(k_t, cos, sin)
-        k_cat = op.Concat(past_key, k_rope, _outputs=["k_cat"])
-        # {V} -> Reshape(3d->4d) -> Transpose -> Concat -> {new_V}
-        v_4d = op.Reshape(v_in, v_shape)
-        v_t = op.Transpose(v_4d, perm=[0, 2, 1, 3])
-        v_cat = op.Concat(past_value, v_t, _outputs=["v_cat"])
-        # {Q},{K},{V} -> Attention -> Transpose -> Reshape(4d->3d) -> {out3d}
-        attn = op.Attention(q_rope, k_cat, v_cat, _outputs=["attn_out"])
-        attn_t = op.Transpose(attn, perm=[0, 2, 1, 3])
-        out3d = op.Reshape(attn_t, o_shape)
-        return out3d, k_cat, v_cat
+    def _window(past_key: ir.Value) -> int | None:
+        if not sliding_window:
+            return None
+        i = _layer_index(past_key)
+        if layer_types is not None:
+            return sliding_window if layer_types[i] == "sliding_attention" else None
+        return sliding_window  # no per-layer split: every layer slides (e.g. Mistral v0.1)
 
-    def repl(
-        op: pattern.RewriterContext,
-        q_in: ir.Value,
-        k_in: ir.Value,
-        v_in: ir.Value,
-        past_key: ir.Value,
-        past_value: ir.Value,
-        attn_out: ir.Value,
-        **_,
-    ):
-        def _to_3d(val: ir.Value, flat_shape: ir.Value) -> ir.Value:
-            """Make tensor into 3d if not already in 3d shape (insert Reshape(NHLE`->NLE)"""
-            prod: ir.Node = val.producer()
-            if prod.op_type in _NORM_OPS:
-                # flatten the per-head norm (QK norm) output back to 3d
-                return op.Reshape(val, flat_shape)
-            return prod.inputs[0]  # no norm. undo the 4-D head split, the projection output is 3-D
-
+    def _gqa_attrs(past_key: ir.Value, attn_out: ir.Value) -> Dict:
         attrs = {
             "num_heads": num_heads,
             "kv_num_heads": num_kv_heads,
             "do_rotary": 1,
             "rotary_interleaved": 0,
         }
-
+        window = _window(past_key)
+        if window is not None:
+            attrs["local_window_size"] = window
         # inspect sqrt(d) from the Attention node's attribute
         scale: ir.Attr = attn_out.producer().attributes.get("scale", None)
         if scale is not None:
             attrs["scale"] = scale.as_float()
+        return attrs
 
-        # collapse pattern into a GroupQueryAttention node (com.microsoft)
+    def _gqa_node(op, q3d, k3d, v3d, past_key, past_value, cos, sin, attn_out):
+        """Collapse the matched pattern into a GroupQueryAttention node (com.microsoft)."""
         return op.GroupQueryAttention(
-            _to_3d(q_in, shared["q_3d_shape"]),
-            _to_3d(k_in, shared["kv_3d_shape"]),
-            v_in,
+            q3d,
+            k3d,
+            v3d,
             past_key,
             past_value,
             shared[_SEQLENS_K_NAME],
             shared[_TOTAL_SEQLEN_NAME],
-            shared["cos_cache"],
-            shared["sin_cache"],
+            cos.producer().inputs[0],  # this block's full cos table (`Gather.input[0]`)
+            sin.producer().inputs[0],
             _domain="com.microsoft",
             _outputs=3,
-            **attrs,
+            **_gqa_attrs(past_key, attn_out),
         )
+
+    def _tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask=None):
+        """Shared pattern tail: KV concat -> Attention[+mask] -> Transpose -> Reshape(4d->3d).
+
+        `attn_mask` is bound for sliding-window layers (the shaper injects an in-graph window
+        mask); the GQA replacement expresses the window via `local_window_size` instead, so
+        the matched mask chain simply goes dead and is removed by DCE.
+        """
+        k_cat = op.Concat(past_key, k_rope, _outputs=["k_cat"])
+        # {V} -> Reshape(3d->4d) -> Transpose -> Concat -> {new_V}
+        v_4d = op.Reshape(v_in, v_shape)
+        v_t = op.Transpose(v_4d, perm=[0, 2, 1, 3])
+        v_cat = op.Concat(past_value, v_t, _outputs=["v_cat"])
+        # {Q},{K},{V} -> Attention -> Transpose -> Reshape(4d->3d) -> {out3d}
+        attn_inputs = (q_rope, k_cat, v_cat) if attn_mask is None else (q_rope, k_cat, v_cat, attn_mask)
+        attn = op.Attention(*attn_inputs, _outputs=["attn_out"])
+        attn_t = op.Transpose(attn, perm=[0, 2, 1, 3])
+        out3d = op.Reshape(attn_t, o_shape)
+        return out3d, k_cat, v_cat
+
+    if not norm_after_transpose:
+
+        def _pat_base(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value, attn_mask=None):
+            # {Q} -> Transpose -> RotaryEmbedding -> {Q}
+            q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
+            q_rope = op.RotaryEmbedding(q_t, cos, sin)
+            # {K} -> Trnaspose -> RotaryEmbedding -> Concat -> {new_K}
+            k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
+            k_rope = op.RotaryEmbedding(k_t, cos, sin)
+            return _tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
+
+        if with_mask:
+
+            def pat(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value, attn_mask):
+                return _pat_base(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value, attn_mask)
+
+        else:
+
+            def pat(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value):
+                return _pat_base(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value)
+
+        def repl(
+            op: pattern.RewriterContext,
+            q_in: ir.Value,
+            k_in: ir.Value,
+            v_in: ir.Value,
+            cos: ir.Value,
+            sin: ir.Value,
+            past_key: ir.Value,
+            past_value: ir.Value,
+            attn_out: ir.Value,
+            **_,
+        ):
+            def _to_3d(val: ir.Value, flat_shape: ir.Value) -> ir.Value:
+                """Make tensor into 3d if not already in 3d shape (insert Reshape(NHLE`->NLE)"""
+                prod: ir.Node = val.producer()
+                if prod.op_type in _NORM_OPS:
+                    # flatten the per-head norm (QK norm) output back to 3d
+                    return op.Reshape(val, flat_shape)
+                return prod.inputs[0]  # no norm. undo the 4-D head split, the projection output is 3-D
+
+            q3d = _to_3d(q_in, shared["q_3d_shape"])
+            k3d = _to_3d(k_in, shared["kv_3d_shape"])
+            return _gqa_node(op, q3d, k3d, v_in, past_key, past_value, cos, sin, attn_out)
+
+    else:
+
+        def _pat_base(
+            op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value, attn_mask=None
+        ):
+            # {Q} -> Transpose -> RMSNorm -> RotaryEmbedding -> {Q}
+            q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
+            q_normed = op.RMSNormalization(q_t, q_scale, _outputs=["q_normed"])
+            q_rope = op.RotaryEmbedding(q_normed, cos, sin)
+            # {K} -> Transpose -> RMSNorm -> RotaryEmbedding -> Concat -> {new_K}
+            k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
+            k_normed = op.RMSNormalization(k_t, k_scale, _outputs=["k_normed"])
+            k_rope = op.RotaryEmbedding(k_normed, cos, sin)
+            return _tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
+
+        if with_mask:
+
+            def pat(
+                op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value, attn_mask
+            ):
+                return _pat_base(
+                    op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value, attn_mask
+                )
+
+        else:
+
+            def pat(op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value):
+                return _pat_base(
+                    op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value
+                )
+
+        def repl(
+            op: pattern.RewriterContext,
+            q_in: ir.Value,
+            k_in: ir.Value,
+            v_in: ir.Value,
+            q_scale: ir.Value,
+            k_scale: ir.Value,
+            q_normed: ir.Value,
+            k_normed: ir.Value,
+            cos: ir.Value,
+            sin: ir.Value,
+            past_key: ir.Value,
+            past_value: ir.Value,
+            attn_out: ir.Value,
+            **_,
+        ):
+            def _norm_to_3d(val_4d: ir.Value, scale: ir.Value, normed: ir.Value, flat_shape: ir.Value) -> ir.Value:
+                """Re-emit the per-head norm on the pre-transpose (N, L, H, E`) tensor, flatten to 3d."""
+                norm_attrs = {name: attr.value for name, attr in normed.producer().attributes.items()}
+                out_4d = op.RMSNormalization(val_4d, scale, **norm_attrs)
+                return op.Reshape(out_4d, flat_shape)
+
+            q3d = _norm_to_3d(q_in, q_scale, q_normed, shared["q_3d_shape"])
+            k3d = _norm_to_3d(k_in, k_scale, k_normed, shared["kv_3d_shape"])
+            return _gqa_node(op, q3d, k3d, v_in, past_key, past_value, cos, sin, attn_out)
 
     def cond(
         context: "MatchContext",
@@ -422,17 +280,21 @@ def _gqa_rule(hf_config: transformers.PretrainedConfig, shared: Dict[str, ir.Val
         sin: ir.Value,
         k_cat: ir.Value,
         v_cat: ir.Value,
+        past_key: ir.Value,
         **_,
     ) -> bool:
         # KV cache appends along the L axis of (N, H, L, E`)
         for cat in (k_cat, v_cat):
             if cat.producer().attributes["axis"].as_int() not in (2, -2):
                 return False
-        # ir.Value (cos_cache, sin_cache) must satisfy `Gather.input[0] == shared["cos/sin_cache"]`
-        for cache, table in ((cos, shared["cos_cache"]), (sin, shared["sin_cache"])):
-            gather: ir.Node = cache.producer()
-            if gather is None or gather.op_type != "Gather" or gather.inputs[0] is not table:
+        # cos/sin must backtrace to constant full tables of width head_dim//2
+        for cache in (cos, sin):
+            table = _rope_cache_table(cache)
+            if table is None or table.shape[-1] != head_dim // 2:
                 return False
+        # a sliding-window model needs the layer index (past_keys_{i}) to pick this block's window
+        if sliding_window and layer_types is not None and _layer_index(past_key) is None:
+            return False
         return True
 
     return pattern.RewriteRule(pat, repl, cond, name="GroupQueryAttention")
@@ -465,19 +327,6 @@ def fuse_group_query_attention(
     model_ir = ir.from_proto(model)
     graph_ir: ir.Graph = model_ir.graph
 
-    caches: Tuple[ir.Value, ir.Value] | None = _find_rope_caches(graph_ir)
-    if caches is None:
-        logger.warning("fuse_group_query_attention: cannot locate RotaryEmbedding cache tables (cos, sin).")
-        return model, 0
-    cos_cache, sin_cache = caches
-    _table_width = _ir_const_tensor(cos_cache).shape[-1]
-    if _table_width != head_dim // 2:
-        logger.warning(
-            f"fuse_group_query_attention: cos table width `{_table_width} != head_dim//2` "
-            f"(hf_config.head_dim={head_dim // 2})."
-        )
-        return model, 0
-
     def _shape_initializer(name: str, embed_dim: int) -> ir.Value:
         arr = np.array([1, -1, embed_dim], np.int64)
         value = ir.Value(
@@ -487,8 +336,6 @@ def fuse_group_query_attention(
         return value
 
     shared: Dict[str, ir.Value] = {
-        "cos_cache": cos_cache,  # the existing full-table constants are consumed directly
-        "sin_cache": sin_cache,
         "q_3d_shape": _shape_initializer("gqa_q_3d_shape", hf_config.num_attention_heads * head_dim),
         "kv_3d_shape": _shape_initializer("gqa_kv_3d_shape", hf_config.num_key_value_heads * head_dim),
         _SEQLENS_K_NAME: ir.Value(name=_SEQLENS_K_NAME, type=ir.TensorType(ir.DataType.INT32), shape=ir.Shape([1])),
@@ -498,7 +345,12 @@ def fuse_group_query_attention(
     }
     graph_ir.inputs.extend([shared[_SEQLENS_K_NAME], shared[_TOTAL_SEQLEN_NAME]])  # NOTE: add new model inputs
 
-    n_fused = pattern.RewriteRuleSet([_gqa_rule(hf_config, shared)]).apply_to_model(model_ir)
+    rules = [
+        _gqa_rule(hf_config, shared, head_dim, norm_after_transpose=norm_pos, with_mask=mask)
+        for norm_pos in (False, True)
+        for mask in (False, True)
+    ]
+    n_fused = pattern.RewriteRuleSet(rules).apply_to_model(model_ir)
     if not n_fused:
         logger.warning("fuse_group_query_attention: 0 attention pattern matched.")
         return model, 0
@@ -515,4 +367,4 @@ def fuse_group_query_attention(
     return new_model, n_fused
 
 
-__all__ = ["AttentionIdentifier", "fuse_group_query_attention"]
+__all__ = ["fuse_group_query_attention"]

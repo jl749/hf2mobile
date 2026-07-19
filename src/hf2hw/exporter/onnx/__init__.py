@@ -1,1 +1,1 @@
-from .merge import *
+from .fusion import AttentionIdentifier

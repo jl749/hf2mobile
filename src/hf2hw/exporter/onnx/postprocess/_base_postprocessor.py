@@ -1,51 +1,18 @@
+import logging
 import os
+import shutil
+from abc import ABC, abstractmethod
+from os import PathLike
 from typing import Dict, List
 
 import onnx
 
-from hf2hw.constant import ONNX_DOMAIN_NAME
+from hf2hw.constant import ONNX_DOMAIN_NAME, ONNX_TORCHLIB_ATTRIBUTE_NAME, SUBGRAPH_MAP_TYPE
 from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import drop_attributes, save_onnx, update_opset
-
-_PLACEHOLDER_ATTR = "torchlib_op_name"
+from hf2hw.utils.onnx_helper import drop_attributes, onnx_to_function, save_onnx, update_opset
 
 
-def _onnx_to_function(
-    submodule_onnx_path: str,
-    function_name: str,
-    domain: str = ONNX_DOMAIN_NAME,
-) -> onnx.FunctionProto:
-    """
-    Load a standalone submodule ONNX and convert its graph to a FunctionProto.
-
-    FunctionProto does not accept graph-level initializers.
-    Hence, initializers are inlined as `Constant` nodes prepended to the function body.
-    """
-    m = onnx.load(submodule_onnx_path, load_external_data=True)
-
-    const_nodes = [
-        onnx.helper.make_node("Constant", inputs=[], outputs=[init.name], value=init, name=f"const_{init.name}")
-        for init in m.graph.initializer
-    ]
-    submodule_nodes = list(m.graph.node)
-
-    func = onnx.helper.make_function(
-        domain=domain,
-        fname=function_name,
-        inputs=[i.name for i in m.graph.input],
-        outputs=[o.name for o in m.graph.output],
-        nodes=const_nodes + submodule_nodes,
-        opset_imports=list(m.opset_import),
-    )
-    logger.debug(
-        f"onnx_to_function: {os.path.relpath(submodule_onnx_path)} → fn {function_name!r} "
-        f"({len(const_nodes)} const(s) + {len(submodule_nodes)} node(s), "
-        f"{len(func.input)} in / {len(func.output)} out)"
-    )
-    return func
-
-
-def merge_subgraphs_into_model(
+def _merge_subgraphs_into_model(
     case_path: str,
     torchlib_op2subgraph_path: Dict[str, str],
     domain: str = ONNX_DOMAIN_NAME,
@@ -74,7 +41,7 @@ def merge_subgraphs_into_model(
     for node in model.graph.node:
         if node.domain != domain:
             continue
-        _attr = next((a for a in node.attribute if a.name == _PLACEHOLDER_ATTR), None)
+        _attr = next((a for a in node.attribute if a.name == ONNX_TORCHLIB_ATTRIBUTE_NAME), None)
         if _attr is None:
             continue
 
@@ -91,7 +58,12 @@ def merge_subgraphs_into_model(
 
         # build and register the function
         if (domain, torchlib_op_name) not in seen_fn_names:
-            func: onnx.FunctionProto = _onnx_to_function(subgraph_path, function_name=torchlib_op_name, domain=domain)
+            func: onnx.FunctionProto = onnx_to_function(subgraph_path, function_name=torchlib_op_name, domain=domain)
+            logger.debug(
+                f"onnx_to_function: {os.path.relpath(subgraph_path)} → fn {torchlib_op_name!r} "
+                f"{len(func.node)} node(s), "
+                f"{len(func.input)} in / {len(func.output)} out)"
+            )
             for op in func.opset_import:
                 update_opset(model, op.domain, op.version)
             model.functions.append(func)
@@ -114,7 +86,7 @@ def merge_subgraphs_into_model(
         # rewrite placeholder into a function call (domain stays the same).
         node.op_type = torchlib_op_name
         # drop placeholder-only attributes so the node is a clean function call.
-        drop_attributes(node, names_to_drop={_PLACEHOLDER_ATTR})  # TODO: is this step required?
+        drop_attributes(node, names_to_drop={ONNX_TORCHLIB_ATTRIBUTE_NAME})  # TODO: is this step required?
         rewritten += 1
 
     save_onnx(model, output_path)
@@ -125,4 +97,60 @@ def merge_subgraphs_into_model(
     return output_path
 
 
-__all__ = ["merge_subgraphs_into_model"]
+class _ONNXPostprocessor(ABC):
+    # ================ subgraph merge ================ #
+    def merge_subgraphs_into_main_graph(
+        self,
+        case_paths: List[str],
+        subgraph_map: SUBGRAPH_MAP_TYPE,
+    ) -> None:
+        """
+        Merge the ONNX subgraphs into the main ONNX graphs
+
+        Args:
+            case_paths: main ONNX graph paths representing unique input cases
+            subgraph_map: `subgraph_map[case_idx]` maps torchlib_op_name -> subgraph onnx path
+        """
+        for case_idx, case_path in enumerate(case_paths):
+            mapping = subgraph_map.get(case_idx, {})
+            if mapping:
+                logger.info(f"  merging {len(mapping)} Subgraph(s) into {case_path}")
+                _merge_subgraphs_into_model(
+                    case_path=case_path,
+                    torchlib_op2subgraph_path=mapping,
+                    domain=ONNX_DOMAIN_NAME,
+                )
+            else:
+                logger.warning(f"No plugin subgraph to merge for case {case_idx + 1}.")
+
+            self._post_process_final_onnx(case_idx, case_path)
+
+        # clean up subgraph onnx
+        if (logger.isEnabledFor(logging.DEBUG) is False) and (self._subgraph_dir.exists()):
+            shutil.rmtree(self._subgraph_dir)
+
+    @abstractmethod
+    def _post_process_final_onnx(self, case_idx: int, onnx_path: str | PathLike):
+        """Postprocess method that optimizes the final merged ONNX graph"""
+        pass
+
+    @abstractmethod
+    def make_dynamic_onnx(
+        self,
+        onnx_path: str | PathLike,
+        *,
+        allowzero: int = 0,
+        seq_sym: str = "L",
+        prev_sym: str = "L_prev",
+        curr_sym: str = "L_prev+1",
+    ) -> None:
+        """
+        Rewrite the CausalLM ONNX graph so that it can take dynamic seq_len.
+
+        `allowzero=0` writes the seq axis as a `0`-copy (default).
+        `allowzero=1` makes the seq axis the inferred `-1` and bakes the head-count / hidden axis explicitly.
+        """
+        pass
+
+
+__all__ = ["_ONNXPostprocessor"]

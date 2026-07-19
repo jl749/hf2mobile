@@ -3,7 +3,12 @@ from typing import Literal
 import transformers
 
 from .constant import SUPPORTED_TARGETS
-from .exporter import LlamaForCausalLMExporter, Qwen2ForCausalLMExporter, Qwen3ForCausalLMExporter
+from .exporter import (
+    Gemma3ForCausalLMExporter,
+    LlamaForCausalLMExporter,
+    Qwen2ForCausalLMExporter,
+    Qwen3ForCausalLMExporter,
+)
 
 
 def export(model_id: str, target: Literal["ORT", "QNN"]):
@@ -23,20 +28,13 @@ def export(model_id: str, target: Literal["ORT", "QNN"]):
     architecture = model.config.architectures[0]
 
     if architecture == "LlamaForCausalLM":
-        exporter = LlamaForCausalLMExporter(
-            model=model,
-            plugin_suffix=("Attention", "RotaryEmbedding"),
-        )
+        exporter = LlamaForCausalLMExporter(model=model)
     elif architecture == "Qwen3ForCausalLM":
-        exporter = Qwen3ForCausalLMExporter(
-            model=model,
-            plugin_suffix=("Attention", "RotaryEmbedding"),
-        )
+        exporter = Qwen3ForCausalLMExporter(model=model)
     elif architecture == "Qwen2ForCausalLM":
-        exporter = Qwen2ForCausalLMExporter(
-            model=model,
-            plugin_suffix=("Attention", "RotaryEmbedding"),
-        )
+        exporter = Qwen2ForCausalLMExporter(model=model)
+    elif architecture == "Gemma3ForCausalLM":
+        exporter = Gemma3ForCausalLMExporter(model=model)
     else:
         raise ValueError(f"{model_id=} is not a supported architecture `{architecture}`.")
 

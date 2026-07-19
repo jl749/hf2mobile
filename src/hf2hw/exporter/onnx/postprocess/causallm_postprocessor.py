@@ -1,62 +1,19 @@
-import logging
-import shutil
-from abc import ABC, abstractmethod
 from os import PathLike
-from pathlib import Path
 from typing import List
 
 import numpy as np
 import onnx
 import transformers
 
-from hf2hw.constant import ONNX_DOMAIN_NAME, SUBGRAPH_MAP_TYPE
-from hf2hw.exporter.onnx.fusion import AttentionIdentifier
-from hf2hw.exporter.onnx.merge import merge_subgraphs_into_model
-from hf2hw.utils.logger import logger
+from hf2hw.exporter.onnx import AttentionIdentifier
 from hf2hw.utils.onnx_helper import drop_vi_by_name, save_onnx, set_vi_axis, update_node_attribute
 
-from ._base import _ONNXShaper
+from ._base_postprocessor import _ONNXPostprocessor
 
 
-class CausalLMONNXShaper(_ONNXShaper):
+class CausalLMONNXPostprocessor(_ONNXPostprocessor):
     def __init__(self, hf_config: transformers.PreTrainedConfig) -> None:
         self.hf_config = hf_config
-
-    # ================ subgraph merge ================ #
-    @abstractmethod
-    def _post_process_final_onnx(self, case_idx: int, onnx_path: str | PathLike):
-        """Postprocess method that optimizes the final merged ONNX graph"""
-        pass
-
-    def merge_subgraphs_into_main_graph(
-        self,
-        case_paths: List[str],
-        subgraph_map: SUBGRAPH_MAP_TYPE,
-    ) -> None:
-        """
-        Merge the ONNX subgraphs into the main ONNX graphs
-
-        Args:
-            case_paths: main ONNX graph paths representing unique input cases
-            subgraph_map: `subgraph_map[case_idx]` maps torchlib_op_name -> subgraph onnx path
-        """
-        for case_idx, case_path in enumerate(case_paths):
-            mapping = subgraph_map.get(case_idx, {})
-            if mapping:
-                logger.info(f"  merging {len(mapping)} Subgraph(s) into {case_path}")
-                merge_subgraphs_into_model(
-                    case_path=case_path,
-                    torchlib_op2subgraph_path=mapping,
-                    domain=ONNX_DOMAIN_NAME,
-                )
-            else:
-                logger.warning(f"No plugin subgraph to merge for case {case_idx + 1}.")
-
-            self._post_process_final_onnx(case_idx, case_path)
-
-        # clean up subgraph onnx
-        if (logger.isEnabledFor(logging.DEBUG) is False) and (self._subgraph_dir.exists()):
-            shutil.rmtree(self._subgraph_dir)
 
     # ================ dynamic shaping ================ #
     def make_dynamic_onnx(
@@ -80,7 +37,7 @@ class CausalLMONNXShaper(_ONNXShaper):
         model: onnx.ModelProto = onnx.load(onnx_path, load_external_data=True)
         assert not any(
             n.op_type == "Reshape" for n in model.graph.node
-        ), "Main graph holds Reshape node(s); CausalLMONNXShaper assumes every Reshape lives inside a FuncProto."
+        ), "Main graph holds Reshape node(s); CausalLMONNXPostprocessor assumes every Reshape lives inside a FuncProto."
         drop_vi_by_name(model.graph.input, {"attention_mask"})  # TODO: attention_bias? ALiBi?
 
         # NOTE: IO ValueInfoProto update (make QueryL dynamic)
@@ -102,6 +59,7 @@ class CausalLMONNXShaper(_ONNXShaper):
         for attn_func in (f for f in model.functions if AttentionIdentifier.is_attention_func(f)):
             attention = AttentionIdentifier(attn_func, hf_config=self.hf_config)
 
+            # ===== Reshape(split_head, merge_head) update ===== #
             if allowzero == 0:
                 # NOTE: seq axis (axis 1) -> 0-copy; the shape constant may be shared across
                 #   Q/K/V — the rewrite is identical for all of them, so setting it repeatedly is fine
@@ -136,11 +94,10 @@ class CausalLMONNXShaper(_ONNXShaper):
                 del attn_func.node[:]
                 attn_func.node.extend(new_nodes)
 
-        for attn_func in (f for f in model.functions if AttentionIdentifier.is_attention_func(f)):
-            # NOTE: set Reshape(allowzero = allowzero)
+            # ===== set Reshape(allowzero = allowzero) ===== #
             for node in (n for n in attn_func.node if n.op_type == "Reshape"):
                 update_node_attribute(node, attribute_name="allowzero", value=allowzero)
-            # NOTE: set Attention(is_causal = 1)
+            # ===== set Attention(is_causal = 1) ===== #
             for node in (n for n in attn_func.node if n.op_type == "Attention"):
                 update_node_attribute(node, attribute_name="is_causal", value=1)
 
@@ -148,4 +105,4 @@ class CausalLMONNXShaper(_ONNXShaper):
         save_onnx(model, onnx_path)
 
 
-__all__ = ["CausalLMONNXShaper"]
+__all__ = ["CausalLMONNXPostprocessor"]

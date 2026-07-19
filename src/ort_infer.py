@@ -97,6 +97,10 @@ def _upcast_model_to_fp32(model: onnx.ModelProto) -> onnx.ModelProto:
     for tp in model.graph.initializer:
         _conv(tp)
     for node in model.graph.node:
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i == TensorProto.BFLOAT16:
+                    attr.i = TensorProto.FLOAT  # keep explicit dtype casts consistent with the upcast
         for attr in node.attribute:
             if attr.type == AttributeProto.TENSOR:
                 _conv(attr.t)

@@ -120,10 +120,65 @@ def _fp32_rule() -> pattern.RewriteRule:
     return pattern.RewriteRule(pat, repl, cond)
 
 
+def _gemma_cast_rule(cast_back_to: int) -> pattern.RewriteRule:
+    """
+    Rule for Gemma-style norms:
+    `(1 + weight)` scale is applied in fp32 BEFORE the cast back to original activation dtype
+    unlike normal RMSNorm (e.g. torch.nn.functional.rms_norm).
+
+    Cast(x, f32) → ...RMSNorm... → Mul(x_f32) → Mul(scale_f32) → Cast(back)
+    """
+
+    def pat(
+        op: pattern.OpsetPatternBuilder,
+        x: pattern.Var,
+        scale: pattern.Var,
+        pow_exp: pattern.Var,
+        axes: pattern.Var,
+        epsilon: pattern.Var,
+    ):
+        x_f32 = op.Cast(x, to=onnx.TensorProto.FLOAT)
+        sq = op.Pow(x_f32, pow_exp)
+        mean_sq = op.ReduceMean(sq, axes)
+        added = op.Add(mean_sq, epsilon)
+        rms = op.Sqrt(added)
+        rsqrt = op.Reciprocal(rms)
+        normed = op.Mul(x_f32, rsqrt)
+        scaled = op.Mul(normed, scale)
+        return op.Cast(scaled, to=cast_back_to)
+
+    def repl(
+        op: pattern.RewriterContext,
+        x: ir.Value,
+        scale: ir.Value,
+        pow_exp: ir.Value,
+        axes: ir.Value,
+        epsilon: ir.Value,
+    ):
+        eps = get_scalar(epsilon) or 1e-6
+        scale_cast = op.Cast(scale, to=cast_back_to)
+        return op.RMSNormalization(x, scale_cast, epsilon=eps, stash_type=onnx.TensorProto.FLOAT, axis=-1)
+
+    def cond(
+        context: "MatchContext",
+        x: ir.Value,
+        scale: ir.Value,
+        pow_exp: ir.Value,
+        axes: ir.Value,
+        epsilon: ir.Value,
+    ):
+        p = get_scalar(pow_exp)
+        return p is not None and abs(p - 2.0) < 1e-6
+
+    return pattern.RewriteRule(pat, repl, cond)
+
+
 _RMS_RULE_SET = pattern.RewriteRuleSet(
     [
         _cast_rule(onnx.TensorProto.FLOAT16),
         _cast_rule(onnx.TensorProto.BFLOAT16),
+        _gemma_cast_rule(onnx.TensorProto.FLOAT16),
+        _gemma_cast_rule(onnx.TensorProto.BFLOAT16),
         _fp32_rule(),
     ]
 )

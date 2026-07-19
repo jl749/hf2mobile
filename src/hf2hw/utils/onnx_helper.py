@@ -6,9 +6,42 @@ from typing import Any, Dict, List, Sequence, Set
 import onnx
 import onnx.external_data_helper  # NOTE: `import onnx` alone does not expose this submodule
 import onnx_ir as ir
+import onnxscript.optimizer
 from onnx_ir.passes.common import InlinePass, LiftConstantsToInitializersPass, RemoveUnusedNodesPass
 
+from hf2hw.constant import ONNX_DOMAIN_NAME
+
 # ===================== onnx/ ===================== #
+
+
+def onnx_to_function(
+    submodule_onnx_path: str,
+    function_name: str,
+    domain: str = ONNX_DOMAIN_NAME,
+) -> onnx.FunctionProto:
+    """
+    Load a standalone submodule ONNX and convert its graph to a FunctionProto.
+
+    FunctionProto does not accept graph-level initializers.
+    Hence, initializers are inlined as `Constant` nodes prepended to the function body.
+    """
+    m = onnx.load(submodule_onnx_path, load_external_data=True)
+
+    const_nodes = [
+        onnx.helper.make_node("Constant", inputs=[], outputs=[init.name], value=init, name=f"const_{init.name}")
+        for init in m.graph.initializer
+    ]
+    submodule_nodes = list(m.graph.node)
+
+    func = onnx.helper.make_function(
+        domain=domain,
+        fname=function_name,
+        inputs=[i.name for i in m.graph.input],
+        outputs=[o.name for o in m.graph.output],
+        nodes=const_nodes + submodule_nodes,
+        opset_imports=list(m.opset_import),
+    )
+    return func
 
 
 def ensure_opset_imports(model: onnx.ModelProto, new_imports) -> None:
@@ -69,7 +102,7 @@ def get_bwd_dict(nodes: Sequence[onnx.NodeProto]) -> Dict[str, onnx.NodeProto]:
     return {out: n for n in nodes for out in n.output}
 
 
-# ===================== onnx/dynamic_shaper ===================== #
+# ===================== onnx/postprocess ===================== #
 
 
 def set_vi_axis(vi: onnx.ValueInfoProto, axis: int, value: int | str) -> None:
@@ -133,11 +166,13 @@ def optimize_onnx(model: onnx.ModelProto):
     which could be the source of silent nondeterministic weight corruption
 
     - inline local functions + drop unused ones
+    - fold constant subexpressions (e.g. the `Cast(fp32 scale -> bf16)` left by the Gemma RMSNorm fusion)
     - Constant to initializers
     - clean dead nodes + drop unused initializers
     """
     model_ir = ir.from_proto(model)
     InlinePass()(model_ir)
+    onnxscript.optimizer.fold_constants(model_ir)
     LiftConstantsToInitializersPass()(model_ir)
     RemoveUnusedNodesPass()(model_ir)
     model = ir.to_proto(model_ir)

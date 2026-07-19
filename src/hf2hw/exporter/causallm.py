@@ -11,6 +11,7 @@ import torch
 import transformers
 
 from hf2hw.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, SUPPORTED_TARGETS
+from hf2hw.exporter.onnx.postprocess.sliding_window import attach_sliding_window_mask_onnx
 from hf2hw.tracing import (
     HookRegisterInterface,
     PluginRegisterInterface,
@@ -21,8 +22,8 @@ from hf2hw.tracing import (
 from hf2hw.utils.logger import logger
 from hf2hw.utils.onnx_helper import optimize_onnx, save_onnx
 
-from .onnx.dynamic_shaper import CausalLMONNXShaper
 from .onnx.fusion import fuse_group_query_attention, fuse_rms_norm
+from .onnx.postprocess import CausalLMONNXPostprocessor
 from .submodules import SubgraphExporterInterface
 
 
@@ -31,7 +32,7 @@ class CausalLMExporter(
     PluginRegisterInterface,
     HookRegisterInterface,
     SubgraphExporterInterface,
-    CausalLMONNXShaper,
+    CausalLMONNXPostprocessor,
 ):
     def __init__(
         self,
@@ -48,7 +49,7 @@ class CausalLMExporter(
         PluginRegisterInterface.__init__(self)
         HookRegisterInterface.__init__(self)
         SubgraphExporterInterface.__init__(self)
-        CausalLMONNXShaper.__init__(self, model.config)
+        CausalLMONNXPostprocessor.__init__(self, model.config)
 
         register_dynamic_cache_pytree()
 
@@ -56,8 +57,14 @@ class CausalLMExporter(
     @HookRegisterInterface.register_plugin_io_hooks()
     def trace_plugin_ios(self) -> None:
         """Model inference logic for tracing"""
-        trace_input_ids = torch.LongTensor([[57] * 11])
-        self.model.generate(input_ids=trace_input_ids, max_new_tokens=3)
+        _TRACE_L = 11
+        _MAX_GENERATION_STEPS = 3
+        assert self.model.config.sliding_window is None or self.model.config.sliding_window >= _TRACE_L, (
+            f"{self.model.config.sliding_window=} < {_TRACE_L=}: the window would truncate within the "
+            "trace length and mask suppression during export would change traced behavior."
+        )
+        trace_input_ids = torch.LongTensor([[57] * _TRACE_L])
+        self.model.generate(input_ids=trace_input_ids, max_new_tokens=_MAX_GENERATION_STEPS)
 
     @contextmanager
     def adapt_model_for_case(self, input_dict: INPUT_KWARGS_TYPE):
@@ -112,6 +119,7 @@ class CausalLMExporter(
                 if logger.isEnabledFor(logging.DEBUG):
                     self.make_dynamic_onnx(onnx_path, allowzero=1)
                     model = onnx.load(onnx_path, load_external_data=True)
+                    attach_sliding_window_mask_onnx(model, self._name2module)
                     model, _n = fuse_rms_norm(model)
                     save_onnx(model, f"debug__{onnx_path}")
                     Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)
@@ -121,6 +129,7 @@ class CausalLMExporter(
                 self.make_dynamic_onnx(onnx_path, allowzero=1)
                 logger.info(f"  {LOG_PREFIX} applied dynamic shaping on `{onnx_path=}`")
                 model = onnx.load(onnx_path, load_external_data=True)
+                attach_sliding_window_mask_onnx(model, self._name2module)
                 model, _n = fuse_rms_norm(model)  # NOTE: fuse main graph RMSNorms (subgraphs are already fused)
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
