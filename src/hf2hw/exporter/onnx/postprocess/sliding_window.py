@@ -53,40 +53,58 @@ def _get_sliding_window_mask_funcproto(func_name: str, sliding_window: int, opse
     )
 
 
-def _inject_sliding_window_mask(model: onnx.ModelProto, attn_func: onnx.FunctionProto, sliding_window: int) -> None:
-    """Route a `SlidingWindowMask_{window}` FuncProto call into this attention FuncProto's `Attention`.
-
-    Adds the (shared) mask FuncProto to `model.functions` once, then inserts a call
-    `SlidingWindowMask(hidden_states, past_key) -> mask` right before the `Attention` node and
-    appends `mask` as its 4th input. Both functions get flattened together by the later inliner.
-    """
-    attn_identifier = AttentionIdentifier(attn_func, hf_config=None)  # rebuilt post-reshape-rewrite (stale-ref safe)
-    func_name = f"SlidingWindowMask_{sliding_window}"
-    if not any(f.name == func_name and f.domain == ONNX_DOMAIN_NAME for f in model.functions):
-        opset_version = next(oi.version for oi in model.opset_import if oi.domain in ("", "ai.onnx"))
-        model.functions.append(_get_sliding_window_mask_funcproto(func_name, sliding_window, opset_version))
-
-    inner_func_node = onnx.helper.make_node(
-        func_name,
-        [attn_identifier.queryMM.input[0], attn_identifier.keyConcat.input[0]],
-        ["swa_mask"],
-        domain=ONNX_DOMAIN_NAME,
-        name="node_SlidingWindowMask",
-    )
-    attn_idx = next(i for i, n in enumerate(attn_func.node) if n.op_type == "Attention")
-    attn_func.node[attn_idx].input.append("swa_mask")  # Attention(Q, K, V, attn_mask)
-    nodes = list(attn_func.node)
-    nodes.insert(attn_idx, inner_func_node)
-    del attn_func.node[:]
-    attn_func.node.extend(nodes)
+# NOTE: SlidingWindowMask require Lq and Lkv which can be obtained from "input_ids" and "past_keys_0"
+_Q_LEN_SRC, _KV_LEN_SRC = "input_ids", "past_keys_0"
 
 
 def attach_sliding_window_mask_onnx(model: onnx.ModelProto, name2module: Dict[str, torch.nn.Module]):
+    funcname2winsize: Dict[str, int] = {}
     for attn_func in (f for f in model.functions if AttentionIdentifier.is_attention_func(f)):
         _m = name2module[attn_func.name.split("____")[1].replace("__", ".")]
         if getattr(_m, "layer_type", "") == "sliding_attention":
-            _inject_sliding_window_mask(model, attn_func, _m.sliding_window)
-            logger.debug(f"  injected sliding-window mask (window={_m.sliding_window}) into `{attn_func.name}`")
+            funcname2winsize[attn_func.name] = _m.sliding_window
+    if not funcname2winsize:
+        return
+
+    opset_version = next(oi.version for oi in model.opset_import if oi.domain in ("", "ai.onnx"))
+    gen_mask_edge = lambda winsize: f"swa_mask_{winsize}"  # noqa: E731
+
+    # one shared mask computation per distinct winsize, prepended to the main graph
+    mask_func_nodes: List[onnx.NodeProto] = []
+    for winsize in sorted(set(funcname2winsize.values())):
+        func_name = f"SlidingWindowMask_{winsize}"
+        if not any(f.name == func_name and f.domain == ONNX_DOMAIN_NAME for f in model.functions):
+            model.functions.append(_get_sliding_window_mask_funcproto(func_name, winsize, opset_version))
+        mask_func_nodes.append(
+            onnx.helper.make_node(
+                func_name,
+                [_Q_LEN_SRC, _KV_LEN_SRC],
+                [gen_mask_edge(winsize)],
+                domain=ONNX_DOMAIN_NAME,
+                name=f"node_{func_name}",
+            )
+        )
+
+    # add the shared mask as an extra `Attention` input inside each sliding attention FuncProto
+    for attn_func in model.functions:
+        winsize = funcname2winsize.get(attn_func.name)
+        if winsize is None:
+            continue
+        attn_func.input.append(gen_mask_edge(winsize))  # NOTE: extend the FuncProto signature
+        attn_node = next(n for n in attn_func.node if n.op_type == "Attention")
+        attn_node.input.append(gen_mask_edge(winsize))  # NOTE: extend Attention(Q, K, V, attn_mask)
+        logger.debug(f"  routed {gen_mask_edge(winsize)} into `{attn_func.name}`")
+
+    # pass the shared mask at each sliding attention call site in the main graph
+    for node in model.graph.node:
+        winsize = funcname2winsize.get(node.op_type, None) if node.domain == ONNX_DOMAIN_NAME else None
+        if winsize is not None:
+            node.input.append(gen_mask_edge(winsize))
+
+    # mask calls only depend on graph inputs -> valid at the front of the main graph
+    main_nodes = mask_func_nodes + list(model.graph.node)
+    del model.graph.node[:]
+    model.graph.node.extend(main_nodes)
 
 
 __all__ = ["attach_sliding_window_mask_onnx"]
