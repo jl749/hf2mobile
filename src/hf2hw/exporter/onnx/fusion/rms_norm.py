@@ -156,8 +156,12 @@ def _gemma_cast_rule(cast_back_to: int) -> pattern.RewriteRule:
         epsilon: ir.Value,
     ):
         eps = get_scalar(epsilon) or 1e-6
-        scale_cast = op.Cast(scale, to=cast_back_to)
-        return op.RMSNormalization(x, scale_cast, epsilon=eps, stash_type=onnx.TensorProto.FLOAT, axis=-1)
+        # keep the `(1 + weight)` scale in fp32 (HF applies it BEFORE the cast-back). opset-23
+        #   RMSNormalization ties X and scale to the same dtype (shape inference fails otherwise),
+        #   so upcast X to fp32 too and cast the fp32 result back to the activation dtype.
+        x_f32 = op.Cast(x, to=onnx.TensorProto.FLOAT)
+        y_f32 = op.RMSNormalization(x_f32, scale, epsilon=eps, stash_type=onnx.TensorProto.FLOAT, axis=-1)
+        return op.Cast(y_f32, to=cast_back_to)
 
     def cond(
         context: "MatchContext",

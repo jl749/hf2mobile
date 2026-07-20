@@ -166,7 +166,6 @@ def optimize_onnx(model: onnx.ModelProto):
     which could be the source of silent nondeterministic weight corruption
 
     - inline local functions + drop unused ones
-    - fold constant subexpressions (e.g. the `Cast(fp32 scale -> bf16)` left by the Gemma RMSNorm fusion)
     - Constant to initializers
     - clean dead nodes + drop unused initializers
     """

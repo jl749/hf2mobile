@@ -126,20 +126,28 @@ class CausalLMExporter(
                 Path(onnx_path).unlink(missing_ok=True)
                 Path(onnx_path).with_suffix(".onnx.data").unlink(missing_ok=True)
             elif case_idx == 1:
+                # ===== POSTPROCESS: dynamic IO + Reshape ===== #
                 self.make_dynamic_onnx(onnx_path, allowzero=1)
                 logger.info(f"  {LOG_PREFIX} applied dynamic shaping on `{onnx_path=}`")
+
+                # ===== FUSION: fuse the main graph RMSNorms ===== #
                 model = onnx.load(onnx_path, load_external_data=True)
-                attach_sliding_window_mask_onnx(model, self._name2module)
-                model, _n = fuse_rms_norm(model)  # NOTE: fuse main graph RMSNorms (subgraphs are already fused)
+                model, _n = fuse_rms_norm(model)  # fuse main graph RMSNorms (subgraphs are already fused)
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
 
+                # ===== POSTPROCESS: attach sliding window ===== #
+                attach_sliding_window_mask_onnx(model, self._name2module)
+
+                # ========================== save debug_case2.onnx ============================ #
+                # ===== flat FuncProtos, fold Constants, drop floating nodes(s)/tensor(s) ===== #
                 if logger.isEnabledFor(logging.DEBUG):
                     save_onnx(model, f"debug__{onnx_path}")
                     Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)
-
                 model = optimize_onnx(model)
-                model, _n = fuse_group_query_attention(model, self.hf_config)
+
+                # ===== FUSION: fuse the main graph GroupQueryAttentions ===== #
+                model, _n = fuse_group_query_attention(model, self.hf_config)  # must be called after optimize_onnx
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph GroupQueryAttention(s) in {onnx_path}")
                 # TODO: SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing

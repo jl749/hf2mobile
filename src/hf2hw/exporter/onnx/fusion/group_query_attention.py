@@ -66,10 +66,11 @@ def _ir_const_tensor(val: ir.Value) -> ir.TensorProtocol | None:
 
 
 def _rope_cache_table(cache: ir.Value) -> ir.TensorProtocol | None:
-    """The constant full table behind a RotaryEmbedding cos/sin edge: `Gather(table, position_ids)` input.
+    """
+    Cache table behind a RotaryEmbedding cos/sin edge: `Gather(table, position_ids)` input.
 
-    Resolved per attention block — models with several RoPE frequencies (e.g. Gemma3's
-    global/local tables) have a different `Gather` feeding each layer type.
+    Resolved per attention block — models with several RoPE frequencies
+    (e.g. Gemma3's global/local tables) have a different `Gather` feeding each layer type.
     """
     gather: ir.Node = cache.producer()  # NOTE: `Gather -> RotaryEmbedding[1,2]`
     if gather is None or gather.op_type != "Gather":
@@ -87,28 +88,21 @@ def _gqa_rule(
     hf_config: transformers.PretrainedConfig,
     shared: Dict[str, ir.Value],
     head_dim: int,
-    norm_after_transpose: bool = False,
+    qknorm_after_transpose: bool = False,
     with_mask: bool = False,
 ) -> pattern.RewriteRule:
-    """Attention block -> GroupQueryAttention rewrite rule (over `shared` graph-level values).
+    """
+    Attention block -> GroupQueryAttention rewrite rule (over `shared` graph-level values).
 
-    `norm_after_transpose` selects where the (optional) per-head QK norm sits in the traced graph:
-      * False (Qwen3/Llama): `Reshape(4d) -> [RMSNorm] -> Transpose -> RotaryEmbedding`
-      * True  (Gemma3):      `Reshape(4d) -> Transpose -> RMSNorm -> RotaryEmbedding`
-    In the True variant the replacement re-emits the norm on the *pre-transpose* `(N, L, H, E')`
-    tensor — RMSNorm on `axis=-1` commutes with the `(0, 2, 1, 3)` transpose — then flattens to 3-D.
-
-    `with_mask` matches the 4-input `Attention(Q, K, V, attn_mask)` written by the shaper for
-    sliding-window layers; GQA carries the window via `local_window_size`, so the matched mask
-    chain goes dead and is removed by DCE.
+    `qknorm_after_transpose` selects where the (optional) per-head QK norm sits in the traced graph:
+      * False (Qwen3):  `Reshape(4d) -> [RMSNorm] -> Transpose -> RotaryEmbedding`
+      * True  (Gemma3): `Reshape(4d) -> Transpose -> [RMSNorm] -> RotaryEmbedding`
     """
     num_heads, num_kv_heads = hf_config.num_attention_heads, hf_config.num_key_value_heads
-    # sliding-window layers (e.g. Gemma3/Mistral): GQA expresses the window natively via
-    #   `local_window_size` — verified to match the HF semantics exactly (each query attends
-    #   the last `sliding_window` keys INCLUDING itself; no off-by-one)
     sliding_window = getattr(hf_config, "sliding_window", None)
     layer_types = getattr(hf_config, "layer_types", None)
 
+    # ================================== HELPER ================================== #
     def _window(past_key: ir.Value) -> int | None:
         if not sliding_window:
             return None
@@ -118,6 +112,7 @@ def _gqa_rule(
         return sliding_window  # no per-layer split: every layer slides (e.g. Mistral v0.1)
 
     def _gqa_attrs(past_key: ir.Value, attn_out: ir.Value) -> Dict:
+        # NOTE: build GroupQueryAttention attribute
         attrs = {
             "num_heads": num_heads,
             "kv_num_heads": num_kv_heads,
@@ -127,13 +122,24 @@ def _gqa_rule(
         window = _window(past_key)
         if window is not None:
             attrs["local_window_size"] = window
-        # inspect sqrt(d) from the Attention node's attribute
+
+        # NOTE: inspect sqrt(d) from the Attention node's attribute
         scale: ir.Attr = attn_out.producer().attributes.get("scale", None)
         if scale is not None:
             attrs["scale"] = scale.as_float()
         return attrs
 
-    def _gqa_node(op, q3d, k3d, v3d, past_key, past_value, cos, sin, attn_out):
+    def _repl_gqa(
+        op: pattern.RewriterContext,
+        q3d: pattern.Var,
+        k3d: pattern.Var,
+        v3d: pattern.Var,
+        past_key: pattern.Var,
+        past_value: pattern.Var,
+        cos: pattern.Var,
+        sin: pattern.Var,
+        attn_out: pattern.Var,
+    ):
         """Collapse the matched pattern into a GroupQueryAttention node (com.microsoft)."""
         return op.GroupQueryAttention(
             q3d,
@@ -143,20 +149,24 @@ def _gqa_rule(
             past_value,
             shared[_SEQLENS_K_NAME],
             shared[_TOTAL_SEQLEN_NAME],
-            cos.producer().inputs[0],  # this block's full cos table (`Gather.input[0]`)
-            sin.producer().inputs[0],
+            cos.producer().inputs[0],  # cos table (`Gather.input[0]`)
+            sin.producer().inputs[0],  # sin table (`Gather.input[0]`)
             _domain="com.microsoft",
             _outputs=3,
             **_gqa_attrs(past_key, attn_out),
         )
 
-    def _tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask=None):
-        """Shared pattern tail: KV concat -> Attention[+mask] -> Transpose -> Reshape(4d->3d).
-
-        `attn_mask` is bound for sliding-window layers (the shaper injects an in-graph window
-        mask); the GQA replacement expresses the window via `local_window_size` instead, so
-        the matched mask chain simply goes dead and is removed by DCE.
-        """
+    def _pat_tail(
+        op: pattern.OpsetPatternBuilder,
+        q_rope: pattern.Var,
+        k_rope: pattern.Var,
+        v_in: pattern.Var,
+        v_shape: pattern.Var,
+        o_shape: pattern.Var,
+        past_key: pattern.Var,
+        past_value: pattern.Var,
+        attn_mask: pattern.Var | None = None,
+    ):
         k_cat = op.Concat(past_key, k_rope, _outputs=["k_cat"])
         # {V} -> Reshape(3d->4d) -> Transpose -> Concat -> {new_V}
         v_4d = op.Reshape(v_in, v_shape)
@@ -169,25 +179,178 @@ def _gqa_rule(
         out3d = op.Reshape(attn_t, o_shape)
         return out3d, k_cat, v_cat
 
-    if not norm_after_transpose:
+    # ================================== HELPER ================================== #
 
-        def _pat_base(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value, attn_mask=None):
-            # {Q} -> Transpose -> RotaryEmbedding -> {Q}
+    if qknorm_after_transpose:
+
+        def _pat_base(
+            op: pattern.OpsetPatternBuilder,
+            q_in: pattern.Var,
+            k_in: pattern.Var,
+            v_in: pattern.Var,
+            v_shape: pattern.Var,
+            o_shape: pattern.Var,
+            q_norm_scale: pattern.Var,
+            k_norm_scale: pattern.Var,
+            cos: pattern.Var,
+            sin: pattern.Var,
+            past_key: pattern.Var,
+            past_value: pattern.Var,
+            attn_mask: pattern.Var | None = None,
+        ):
+            # {Q} -> Transpose -> Cast(fp32) -> RMSNorm(fp32 scale) -> Cast(act) -> RotaryEmbedding -> {Q}
             q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
-            q_rope = op.RotaryEmbedding(q_t, cos, sin)
-            # {K} -> Trnaspose -> RotaryEmbedding -> Concat -> {new_K}
+            q_f32 = op.Cast(q_t, to=onnx.TensorProto.FLOAT)
+            q_normed_f32 = op.RMSNormalization(q_f32, q_norm_scale, _outputs=["q_normed"])
+            q_normed = op.Cast(q_normed_f32, _outputs=["q_cast"])
+            q_rope = op.RotaryEmbedding(q_normed, cos, sin)
+            # {K} -> Transpose -> Cast(fp32) -> RMSNorm(fp32 scale) -> Cast(act) -> RotaryEmbedding -> Concat -> {new_K}
             k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
-            k_rope = op.RotaryEmbedding(k_t, cos, sin)
-            return _tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
+            k_f32 = op.Cast(k_t, to=onnx.TensorProto.FLOAT)
+            k_normed_f32 = op.RMSNormalization(k_f32, k_norm_scale, _outputs=["k_normed"])
+            k_normed = op.Cast(k_normed_f32, _outputs=["k_cast"])
+            k_rope = op.RotaryEmbedding(k_normed, cos, sin)
+            return _pat_tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
 
         if with_mask:
 
-            def pat(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value, attn_mask):
+            def pat(
+                op: pattern.OpsetPatternBuilder,
+                q_in: pattern.Var,
+                k_in: pattern.Var,
+                v_in: pattern.Var,
+                v_shape: pattern.Var,
+                o_shape: pattern.Var,
+                q_norm_scale: pattern.Var,
+                k_norm_scale: pattern.Var,
+                cos: pattern.Var,
+                sin: pattern.Var,
+                past_key: pattern.Var,
+                past_value: pattern.Var,
+                attn_mask: pattern.Var,
+            ):
+                return _pat_base(
+                    op,
+                    q_in,
+                    k_in,
+                    v_in,
+                    v_shape,
+                    o_shape,
+                    q_norm_scale,
+                    k_norm_scale,
+                    cos,
+                    sin,
+                    past_key,
+                    past_value,
+                    attn_mask,
+                )
+
+        else:
+
+            def pat(
+                op: pattern.OpsetPatternBuilder,
+                q_in: pattern.Var,
+                k_in: pattern.Var,
+                v_in: pattern.Var,
+                q_norm_scale: pattern.Var,
+                k_norm_scale: pattern.Var,
+                cos: pattern.Var,
+                sin: pattern.Var,
+                past_key: pattern.Var,
+                past_value: pattern.Var,
+                v_shape: pattern.Var,
+                o_shape: pattern.Var,
+            ):
+                return _pat_base(
+                    op, q_in, k_in, v_in, v_shape, o_shape, q_norm_scale, k_norm_scale, cos, sin, past_key, past_value
+                )
+
+        def repl(
+            op: pattern.RewriterContext,
+            q_in: ir.Value,
+            k_in: ir.Value,
+            v_in: ir.Value,
+            q_norm_scale: ir.Value,
+            k_norm_scale: ir.Value,
+            q_normed: ir.Value,
+            k_normed: ir.Value,
+            q_cast: ir.Value,
+            cos: ir.Value,
+            sin: ir.Value,
+            past_key: ir.Value,
+            past_value: ir.Value,
+            attn_out: ir.Value,
+            **_,
+        ):
+            # activation dtype = the `to` of the matched cast-back (bf16/fp16)
+            act_dtype = q_cast.producer().attributes["to"].as_int()
+
+            def _norm_to_3d(val_4d: ir.Value, scale: ir.Value, normed: ir.Value, flat_shape: ir.Value) -> ir.Value:
+                """Re-emit the fp32 per-head norm on the pre-transpose (N, L, H, E`) tensor, flatten to 3d."""
+                norm_attrs = {name: attr.value for name, attr in normed.producer().attributes.items()}
+                val_f32 = op.Cast(val_4d, to=onnx.TensorProto.FLOAT)
+                out_f32 = op.RMSNormalization(val_f32, scale, **norm_attrs)
+                out_4d = op.Cast(out_f32, to=act_dtype)
+                return op.Reshape(out_4d, flat_shape)
+
+            q3d = _norm_to_3d(q_in, q_norm_scale, q_normed, shared["q_3d_shape"])
+            k3d = _norm_to_3d(k_in, k_norm_scale, k_normed, shared["kv_3d_shape"])
+            return _repl_gqa(op, q3d, k3d, v_in, past_key, past_value, cos, sin, attn_out)
+
+    else:
+
+        def _pat_base(
+            op: pattern.OpsetPatternBuilder,
+            q_in: pattern.Var,
+            k_in: pattern.Var,
+            v_in: pattern.Var,
+            v_shape: pattern.Var,
+            o_shape: pattern.Var,
+            cos: pattern.Var,
+            sin: pattern.Var,
+            past_key: pattern.Var,
+            past_value: pattern.Var,
+            attn_mask: pattern.Var | None = None,
+        ):
+            # ..(optional)Norm already applied..{Q} -> Transpose -> RotaryEmbedding -> {Q}
+            q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
+            q_rope = op.RotaryEmbedding(q_t, cos, sin)
+            # ..(optional)Norm already applied..{K} -> Transpose -> RotaryEmbedding -> Concat -> {new_K}
+            k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
+            k_rope = op.RotaryEmbedding(k_t, cos, sin)
+            return _pat_tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
+
+        if with_mask:
+
+            def pat(
+                op: pattern.OpsetPatternBuilder,
+                q_in: pattern.Var,
+                k_in: pattern.Var,
+                v_in: pattern.Var,
+                v_shape: pattern.Var,
+                o_shape: pattern.Var,
+                cos: pattern.Var,
+                sin: pattern.Var,
+                past_key: pattern.Var,
+                past_value: pattern.Var,
+                attn_mask: pattern.Var,
+            ):
                 return _pat_base(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value, attn_mask)
 
         else:
 
-            def pat(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value):
+            def pat(
+                op: pattern.OpsetPatternBuilder,
+                q_in: pattern.Var,
+                k_in: pattern.Var,
+                v_in: pattern.Var,
+                v_shape: pattern.Var,
+                o_shape: pattern.Var,
+                cos: pattern.Var,
+                sin: pattern.Var,
+                past_key: pattern.Var,
+                past_value: pattern.Var,
+            ):
                 return _pat_base(op, q_in, k_in, v_in, v_shape, o_shape, cos, sin, past_key, past_value)
 
         def repl(
@@ -208,68 +371,11 @@ def _gqa_rule(
                 if prod.op_type in _NORM_OPS:
                     # flatten the per-head norm (QK norm) output back to 3d
                     return op.Reshape(val, flat_shape)
-                return prod.inputs[0]  # no norm. undo the 4-D head split, the projection output is 3-D
+                return prod.inputs[0]  # no norm. undo the 4d head split, the projection output is 3d
 
             q3d = _to_3d(q_in, shared["q_3d_shape"])
             k3d = _to_3d(k_in, shared["kv_3d_shape"])
-            return _gqa_node(op, q3d, k3d, v_in, past_key, past_value, cos, sin, attn_out)
-
-    else:
-
-        def _pat_base(
-            op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value, attn_mask=None
-        ):
-            # {Q} -> Transpose -> RMSNorm -> RotaryEmbedding -> {Q}
-            q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
-            q_normed = op.RMSNormalization(q_t, q_scale, _outputs=["q_normed"])
-            q_rope = op.RotaryEmbedding(q_normed, cos, sin)
-            # {K} -> Transpose -> RMSNorm -> RotaryEmbedding -> Concat -> {new_K}
-            k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
-            k_normed = op.RMSNormalization(k_t, k_scale, _outputs=["k_normed"])
-            k_rope = op.RotaryEmbedding(k_normed, cos, sin)
-            return _tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
-
-        if with_mask:
-
-            def pat(
-                op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value, attn_mask
-            ):
-                return _pat_base(
-                    op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value, attn_mask
-                )
-
-        else:
-
-            def pat(op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value):
-                return _pat_base(
-                    op, q_in, k_in, v_in, v_shape, o_shape, q_scale, k_scale, cos, sin, past_key, past_value
-                )
-
-        def repl(
-            op: pattern.RewriterContext,
-            q_in: ir.Value,
-            k_in: ir.Value,
-            v_in: ir.Value,
-            q_scale: ir.Value,
-            k_scale: ir.Value,
-            q_normed: ir.Value,
-            k_normed: ir.Value,
-            cos: ir.Value,
-            sin: ir.Value,
-            past_key: ir.Value,
-            past_value: ir.Value,
-            attn_out: ir.Value,
-            **_,
-        ):
-            def _norm_to_3d(val_4d: ir.Value, scale: ir.Value, normed: ir.Value, flat_shape: ir.Value) -> ir.Value:
-                """Re-emit the per-head norm on the pre-transpose (N, L, H, E`) tensor, flatten to 3d."""
-                norm_attrs = {name: attr.value for name, attr in normed.producer().attributes.items()}
-                out_4d = op.RMSNormalization(val_4d, scale, **norm_attrs)
-                return op.Reshape(out_4d, flat_shape)
-
-            q3d = _norm_to_3d(q_in, q_scale, q_normed, shared["q_3d_shape"])
-            k3d = _norm_to_3d(k_in, k_scale, k_normed, shared["kv_3d_shape"])
-            return _gqa_node(op, q3d, k3d, v_in, past_key, past_value, cos, sin, attn_out)
+            return _repl_gqa(op, q3d, k3d, v_in, past_key, past_value, cos, sin, attn_out)
 
     def cond(
         context: "MatchContext",
@@ -307,9 +413,8 @@ def fuse_group_query_attention(
     """
     Rewrite every attention block around `com.microsoft.GroupQueryAttention`.
 
-    `RotaryEmbedding` nodes and cos/sin_cache tables (`Gather`s) are removed.
+    `RotaryEmbedding` nodes and cos/sin_cache tables (`Gather`s) will be fused. (Attribute `do_rotary=1`)
     main graph loses `position_ids` and gains `seqlens_k`(int32, [batch]) and `total_sequence_length`(int32, [1])
-    => GQA applies RoPE internally (`do_rotary=1`) positions implied by `seqlens_k`.
 
     ```
     seqlens_k[b] = kv_len + q_len - 1
@@ -343,12 +448,13 @@ def fuse_group_query_attention(
             name=_TOTAL_SEQLEN_NAME, type=ir.TensorType(ir.DataType.INT32), shape=ir.Shape([1])
         ),
     }
-    graph_ir.inputs.extend([shared[_SEQLENS_K_NAME], shared[_TOTAL_SEQLEN_NAME]])  # NOTE: add new model inputs
+    graph_ir.inputs.extend([shared[_SEQLENS_K_NAME], shared[_TOTAL_SEQLEN_NAME]])  # add new model inputs
 
     rules = [
-        _gqa_rule(hf_config, shared, head_dim, norm_after_transpose=norm_pos, with_mask=mask)
-        for norm_pos in (False, True)
-        for mask in (False, True)
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, with_mask=True),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, with_mask=False),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=False, with_mask=True),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=False, with_mask=False),
     ]
     n_fused = pattern.RewriteRuleSet(rules).apply_to_model(model_ir)
     if not n_fused:

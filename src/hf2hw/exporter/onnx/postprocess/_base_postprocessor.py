@@ -98,7 +98,6 @@ def _merge_subgraphs_into_model(
 
 
 class _ONNXPostprocessor(ABC):
-    # ================ subgraph merge ================ #
     def merge_subgraphs_into_main_graph(
         self,
         case_paths: List[str],

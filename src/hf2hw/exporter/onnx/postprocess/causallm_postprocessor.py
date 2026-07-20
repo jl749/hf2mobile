@@ -15,7 +15,6 @@ class CausalLMONNXPostprocessor(_ONNXPostprocessor):
     def __init__(self, hf_config: transformers.PreTrainedConfig) -> None:
         self.hf_config = hf_config
 
-    # ================ dynamic shaping ================ #
     def make_dynamic_onnx(
         self,
         onnx_path: str | PathLike,
