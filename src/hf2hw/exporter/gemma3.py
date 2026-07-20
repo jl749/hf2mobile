@@ -6,29 +6,34 @@ from .causallm import CausalLMExporter
 
 
 class Gemma3RotaryEmbeddingPinned(torch.nn.Module):
-    """Single-layer_type view over Gemma3's shared dual-frequency rotary module.
+    """
+    Single layer_type view over Gemma3's shared dual-frequency rotary module.
 
-    Gemma3 computes RoPE with one `Gemma3RotaryEmbedding` called once per layer type —
-    `forward(x, position_ids, layer_type)` selects the `{layer_type}_inv_freq` buffer
-    (global `rope_theta` for full layers, `rope_local_base_freq` for sliding layers).
-    The tracing framework keys plugins by module instance and only traces tensor args,
-    so the shared module is split into one pinned child per layer type, each exposing the
-    plain `forward(x, position_ids)` signature every other supported arch has.
+    `Gemma3RotaryEmbedding.forward(x, position_ids, layer_type)`
+    selects different `{layer_type}_inv_freq` base on layer_type(full or sliding).
+    (computed using `rope_theta` for full layers, `rope_local_base_freq` for sliding layers).
+
+    The tracing framework registers plugins by module instance ...
+    For every `layer_type` register N Gemma3RotaryEmbeddingPinned child modules under Gemma3RopeDispatch.
+    Each child module will expose plain `forward(x, position_ids)` signature.
     """
 
     def __init__(self, rotary_emb: torch.nn.Module, layer_type: str):
         super().__init__()
         self.config = rotary_emb.config
         self._layer_type = layer_type
-        self._shared = (rotary_emb,)  # tuple: keeps the shared module out of the module tree
-        #   (a registered `Gemma3RotaryEmbedding` child would also match plugin_suffix)
+
+        # NOTE: keep the shared module out of the module tree by storing it under Tuple
+        #   prevents `Gemma3RotaryEmbedding` torchlib registration
+        self._shared = (rotary_emb,)
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
         return self._shared[0].forward(x, position_ids, self._layer_type)
 
 
 class Gemma3RopeDispatch(torch.nn.Module):
-    """Drop-in `model.rotary_emb` replacement routing each `layer_type` to its pinned child.
+    """
+    Drop-in `model.rotary_emb` replacement routing each `layer_type` to its pinned child.
 
     The class name intentionally avoids the "RotaryEmbedding" plugin suffix: only the
     pinned children (one per unique layer type) are traced and exported as subgraphs.
