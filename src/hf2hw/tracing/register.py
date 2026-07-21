@@ -2,77 +2,32 @@ import contextvars
 import inspect
 from abc import ABC
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import onnx_ir
 import torch
 import transformers
 from torch.onnx._internal.exporter import _core as _onnx_core
-from transformers.cache_utils import DynamicCache
 
-from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, KV_CACHE_PARAM_NAME, ONNX_DOMAIN_NAME
+from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, ONNX_DOMAIN_NAME
+from hf2hw.utils import check_parent_field, create_torchlib_op_name, register_dynamic_cache_pytree, update_input_cache
 from hf2hw.utils.logger import logger
-from hf2hw.utils.py_helper import check_parent_field
 
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, fwdspecs2args, sig2fwdspecs
-from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_input_specs
-
-_CACHE_PYTREE_REGISTERED = False
+from .tensor_metadata import OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_input_specs
 
 # case index threaded by `CausalLMTracer.export_graphs`
 # each module's `plugin_forward` picks the right per-case op.
 # `None` means no export in progress -> `plugin_forward` falls straight through to `orig_cls.forward`.
 export_case: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("export_case", default=None)
 
-
-def register_dynamic_cache_pytree() -> None:
-    """
-    Register DynamicCache as a pytree whose direct children are per-layer (K, V) pairs.
-    tree_flatten(cache) -> leaves [K0, V0, K1, V1, ...]
-    Layer i: (leaves[2*i], leaves[2*i+1])
-    """
-    global _CACHE_PYTREE_REGISTERED
-    if _CACHE_PYTREE_REGISTERED:
-        return
-
-    def _flatten(cache: DynamicCache):
-        return [(layer.keys, layer.values) for layer in cache.layers], len(cache.layers)
-
-    def _unflatten(pairs, num_layers):
-        return DynamicCache(ddp_cache_data=list(pairs))
-
-    try:
-        torch.utils._pytree.register_pytree_node(DynamicCache, _flatten, _unflatten)
-    except ValueError:
-        pass  # already registered (newer transformers registers DynamicCache itself)
-    _CACHE_PYTREE_REGISTERED = True
-
-
-def _update_input_cache(input_dict: dict, layer_idx: int) -> str | None:
-    """
-    Update Attention.forward input KV cache so that it see the relevant cache index only
-    Args:
-        input_dict: .forward inputs with default entries
-            `dict(sig.bound_partial(*args, **kwargs).apply_defaults().arguments())`
-        layer_idx: in order to extract the local cache from `transformers.Cache` object
-            we need to know the exact layer_idx (local cache location)
-    Returns:
-        updated input KV cache param name or None
-    """
-    cache_param_name = None
-    value = input_dict.get(KV_CACHE_PARAM_NAME, None)
-    if isinstance(value, transformers.Cache):
-        flat, _ = torch.utils._pytree.tree_flatten(value)
-        kv_cache_tuple = (flat[2 * layer_idx], flat[2 * layer_idx + 1])
-        input_dict[KV_CACHE_PARAM_NAME] = kv_cache_tuple
-        cache_param_name = KV_CACHE_PARAM_NAME
-    return cache_param_name
+_DEFINED_TORCHLIB_OPS: Set[str] = set()
 
 
 def _make_plugin_forward(
     orig_cls: Any,
     module: torch.nn.Module,
-):
+) -> Callable:
     """
     Plugin forward factory function
     Returned forward function overwrites existing plugin `nn.Module` forward
@@ -108,19 +63,19 @@ def _make_plugin_forward(
 
         bound = sig_wo_self.bind_partial(*args, **kwargs)
         bound.apply_defaults()
-        bound_args = dict(bound.arguments)  # copy bound
+        input_dict = dict(bound.arguments)  # copy bound
 
         if has_kv:
             layer_idx = getattr(self_module, "layer_idx", None)
             assert (
                 layer_idx is not None
             ), f"Attribute `{self_module.__class__.__name__}.layer_idx` does not exist (id={id(self_module)})."
-            cache_param_name = _update_input_cache(bound_args, self_module.layer_idx)
-            assert cache_param_name is not None, "No cache params found under `bound_args`"
+            cache_param_name = update_input_cache(input_dict, self_module.layer_idx)
+            assert cache_param_name is not None, "No cache params found under `input_dict`"
         else:
             cache_param_name = None
 
-        flat = fwdspecs2args(case_fwd_specs, bound_args)
+        flat = fwdspecs2args(case_fwd_specs, input_dict)
         result = op(id(self_module), *flat)
 
         if has_kv:
@@ -140,6 +95,7 @@ def _make_plugin_forward(
 
         if "Attention" in self_module.__class__.__name__:
             # NOTE: attentions return -> (attn_out, attn_weight)
+            #   attach None to onnx output so that it matches the rest of the forward flow
             # TODO: assert using `sig.return_annotation` if it exist
             return result, None
         else:
@@ -223,14 +179,17 @@ class PluginRegisterInterface(ABC):
             num_outputs > 0
         ), f"{_err_msg} we noticed `output_specs` is containing 0 `TensorSpec`. In order to trace the ONNX at least one output `TensorSpec` is required."
 
-        schema = self._create_schema_str(torchlib_op_name, fwd_specs, num_outputs)
-        CUSTOM_LIB.define(schema)
+        if torchlib_op_name not in _DEFINED_TORCHLIB_OPS:
+            schema = self._create_schema_str(torchlib_op_name, fwd_specs, num_outputs)
+            CUSTOM_LIB.define(schema)
 
-        @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{torchlib_op_name}")
-        def _abstract_impl(module_id, *flat_tensors):
-            device = next(t for t in flat_tensors if t is not None).device
-            outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flatten_specs)
-            return outs[0] if num_outputs == 1 else outs
+            @torch.library.register_fake(f"{CUSTOM_LIB_NAME}::{torchlib_op_name}")
+            def _abstract_impl(module_id, *flat_tensors):
+                device = next(t for t in flat_tensors if t is not None).device
+                outs = tuple(torch.empty(ts.shape, dtype=ts.torch_dtype, device=device) for ts in flatten_specs)
+                return outs[0] if num_outputs == 1 else outs
+
+            _DEFINED_TORCHLIB_OPS.add(torchlib_op_name)
 
         def _onnx_translation(module_id, *flat_tensors):
             # TODO: set attributes by reading self._id2module attributes
@@ -279,20 +238,25 @@ class PluginRegisterInterface(ABC):
                 sig = inspect.signature(orig_cls.forward)
                 fwd_specs: List[FwdSpec] = sig2fwdspecs(sig)
 
-                name = self._module2name[orig_m]
-                unique_io_cases = self.plugin_ios[f"{orig_cls.__name__}::{name}"].unique_ios()
+                module_name = self._module2name[orig_m]
+                unique_io_cases = self.plugin_ios[f"{orig_cls.__name__}::{module_name}"].unique_ios()
                 if not unique_io_cases:
                     logger.warning(
-                        f"{orig_cls.__name__}::{name} has no observed IOs; "
+                        f"{orig_cls.__name__}::{module_name} has no observed IOs; "
                         f"_plugin_forward will raise at export time. "
                         f"Did `trace_plugin_ios` run? Is this module reached during generate()?"
                     )
                     continue
 
                 trace_metadata: List[Dict[str, Any]] = []
-                for i, (input_specs, output_specs) in enumerate(unique_io_cases):
+                for case_idx, (input_specs, output_specs) in enumerate(unique_io_cases):
+                    # NOTE: drop x from RotaryEmbedding(x, position_ids)
+                    #   ONNX tracing only requires position_ids as an input edge
+                    if "RotaryEmbedding" in orig_cls.__name__:
+                        input_specs.pop("x")
+
                     case_fwd_specs = apply_input_specs2fwd_specs(fwd_specs, input_specs)
-                    torchlib_op_name = f"{orig_cls.__name__}____{name.replace('.', '__')}____case{i}"
+                    torchlib_op_name = create_torchlib_op_name(orig_cls.__name__, module_name, case_idx + 1)
 
                     # NOTE: in case KV caches are observed under `input_specs` append KV to `output_specs` (ONNX tracing purpose)
                     _kv_specs = get_kv_specs_from_input_specs(input_specs)

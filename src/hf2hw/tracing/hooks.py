@@ -5,16 +5,16 @@ from typing import Dict, List
 
 import torch
 
+from hf2hw.utils import check_parent_field
 from hf2hw.utils.logger import logger
-from hf2hw.utils.py_helper import check_parent_field
 
 from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, ModuleIOSpec, TensorSpec
 
 
 class HookRegisterInterface(ABC):
     def __init__(self):
-        self.model_ios: ModuleIOSpec | None = None
-        self.plugin_ios: Dict[str, ModuleIOSpec] = {}
+        self.model_ios: ModuleIOSpec | None = None  # HF model IO pairs
+        self.plugin_ios: Dict[str, ModuleIOSpec] = {}  # User specified plugin IO paris
         self._hook_handles: List[torch.utils.hooks.RemovableHook] = []
         check_parent_field(self, "_module2name")
         check_parent_field(self, "model")
@@ -71,6 +71,11 @@ class HookRegisterInterface(ABC):
 
         _ts = TensorSpec.from_tensor(output)
         obsvd_outputs: OUTPUT_SPECS_TYPE = (_ts,) if isinstance(_ts, TensorSpec) else _ts
+
+        # NOTE: Attention returns `(attn_out, attn_weight)` we don't trace `attn_weight`
+        #   None is added instead during register.py::_plugin_forward
+        if "Attention" in _cls_name:
+            obsvd_outputs = obsvd_outputs[:1]
 
         self.plugin_ios[f"{_cls_name}::{_module_name}"].obsvd_output_specs.append(obsvd_outputs)
 

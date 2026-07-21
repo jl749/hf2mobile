@@ -4,7 +4,13 @@ from typing import Any, Dict, List, Tuple, Union
 import torch
 import transformers
 
-from hf2hw.constant import _NON_HASHABLE_PARAMS, INPUT_KWARGS, INPUT_SPECS_TYPE, KV_CACHE_PARAM_NAME, OUTPUT_SPECS_TYPE
+from hf2hw.constant import (
+    _NON_HASHABLE_PARAMS,
+    INPUT_KWARGS_TYPE,
+    INPUT_SPECS_TYPE,
+    KV_CACHE_PARAM_NAME,
+    OUTPUT_SPECS_TYPE,
+)
 from hf2hw.utils.logger import logger
 
 _STR_TO_DTYPE = {
@@ -175,6 +181,21 @@ class TensorSpec:
                 )
 
 
+def input_specs2pseudo_inputs(input_specs: INPUT_SPECS_TYPE) -> INPUT_KWARGS_TYPE:
+    """Create fake input tensors: INPUT_SPECS_TYPE -> INPUT_KWARGS_TYPE"""
+
+    def _materialize(s):
+        if not isinstance(s, TensorSpec):
+            return s
+        if s.is_empty:
+            return None
+        if s.is_scalar:
+            return s.scalar
+        return torch.zeros(s.shape, dtype=s.torch_dtype)
+
+    return torch.utils._pytree.tree_map(_materialize, input_specs)
+
+
 @dataclass
 class ModuleIOSpec:
     """
@@ -195,6 +216,7 @@ class ModuleIOSpec:
     def flatten_io_specs(
         specs: INPUT_SPECS_TYPE | OUTPUT_SPECS_TYPE, skip_empty=False
     ) -> Tuple[List[TensorSpec], torch.utils._pytree.TreeSpec]:
+        """Flatten INPUT_SPECS_TYPE/OUTPUT_SPECS_TYPE pytree"""
         if skip_empty:
 
             def is_filterable(v) -> bool:
@@ -242,7 +264,7 @@ class ModuleIOSpec:
 
     @property
     def unique_obsvd_input_specs(self) -> List[INPUT_SPECS_TYPE]:
-        """Some input param names are ignored when considering the uniquness of the module IO (e.g. past_key_values)"""
+        """Some input param names are ignored when considering the uniqueness of the module IO (e.g. past_key_values)"""
         return [{k: v for k, v in s.items() if k not in _NON_HASHABLE_PARAMS} for s in self.obsvd_input_specs]
 
     @property
@@ -277,20 +299,19 @@ class ModuleIOSpec:
     def unique_ios(self) -> Tuple[Tuple[INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE], ...]:
         """
         Return unique (input_specs, output_specs) pairs
-        When considering the uniqness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
-        Output tuple will always return the metadata pairs in observation order
+        When considering the uniqueness param names under `_NON_HASHABLE_PARAMS` are ignored (e.g. past_key_values)
+        Output tuple will always return the IO metadata pairs in observation order
         e.g.
             when `generate` is called on the transformers CausalLM models
             prefill runs first taking index 0 for both `obsvd_input_specs` and `obsvd_output_specs`
-            this means `unique_ios` returned tuple also contains
-            prefill profile at idx 0 and generation profile at idx 1
+            meaning `unique_ios` returned tuple also contains prefill profile at idx 0 and gen profile at idx 1
         """
         unique_io_pairs = []
         _seen = set()
         for _unq_input_specs, input_specs, output_specs in zip(
             self.unique_obsvd_input_specs, self.obsvd_input_specs, self.obsvd_output_specs
         ):
-            # when considering the uniqness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs`
+            # when considering the uniqueness use `self.unique_obsvd_input_specs` instead of `self.obsvd_input_specs`
             _flat_unq_is, _unq_tree = self.flatten_io_specs(specs=_unq_input_specs, skip_empty=True)
             _unq_input_specs: INPUT_SPECS_TYPE = torch.utils._pytree.tree_unflatten(_flat_unq_is, _unq_tree)
 
@@ -314,32 +335,26 @@ class ModuleIOSpec:
         )
         return tuple(unique_io_pairs)
 
-    def pseudo_unique_inputs(self) -> List[INPUT_KWARGS]:
+    def pseudo_unique_inputs(self) -> List[INPUT_KWARGS_TYPE]:
         """
         Create pseudo unique inputs based on `unique_ios` output.
         e.g.
-        {
-            "input_ids": Tensor((1, 1), dtype=int64),
-            "position_ids": Tensor((1, 16), dtype=int64),
-            "past_kv_values": [(Tensor, Tensor), (Tensor, Tensor), ...]
-            "use_cache": True
-        }
-        """
-
-        def _materialize(s):
-            if not isinstance(s, TensorSpec):
-                return s
-            if s.is_empty:
-                return None
-            if s.is_scalar:
-                return s.scalar
-            return torch.zeros(s.shape, dtype=s.torch_dtype)
-
-        # build unique pseudo inputs
-        input_cases: List[INPUT_KWARGS] = [
-            torch.utils._pytree.tree_map(_materialize, input_specs) for input_specs, _ in self.unique_ios()
+        [
+            {
+                "input_ids": Tensor((1, 1), dtype=int64),
+                "position_ids": Tensor((1, 16), dtype=int64),
+                "use_cache": False
+            },
+            {
+                "input_ids": Tensor((1, 1), dtype=int64),
+                "position_ids": Tensor((1, 16), dtype=int64),
+                "past_kv_values": [(Tensor, Tensor), (Tensor, Tensor), ...]
+                "use_cache": True
+            },
+            ...
         ]
-        return input_cases
+        """
+        return [input_specs2pseudo_inputs(specs) for specs, _ in self.unique_ios()]
 
 
 def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[TensorSpec, TensorSpec] | Tuple[()]:
@@ -357,4 +372,4 @@ def get_kv_specs_from_input_specs(input_specs: INPUT_SPECS_TYPE) -> Tuple[Tensor
         return ()
 
 
-__all__ = ["convert_dtype", "TensorSpec", "ModuleIOSpec", "get_kv_specs_from_input_specs"]
+__all__ = ["convert_dtype", "TensorSpec", "input_specs2pseudo_inputs", "ModuleIOSpec", "get_kv_specs_from_input_specs"]

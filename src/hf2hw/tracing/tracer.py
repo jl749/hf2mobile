@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Sequence
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_KWARGS
+from hf2hw.constant import INPUT_KWARGS_TYPE
 from hf2hw.utils.logger import logger
 
 from .tensor_metadata import ModuleIOSpec
@@ -14,6 +14,8 @@ from .tensor_metadata import ModuleIOSpec
 class TracerInterface(ABC):
     def __init__(self, model: transformers.PreTrainedModel, plugin_suffix: Sequence[str]):
         self.plugin_suffix = (plugin_suffix,) if isinstance(plugin_suffix, str) else plugin_suffix
+        # TODO: evaluate plugin_suffix -> Attention, RotaryEmbedding supported for now ...
+        # TODO: plugin_suffix cannot be empty
         self.plugin_ios: Dict[str, ModuleIOSpec] = {}
 
         self.model = model
@@ -41,16 +43,15 @@ class TracerInterface(ABC):
         return suffix2modules
 
     @abstractmethod
-    def trace_plugin_ios(self, model_inputs: Dict[str, Any], **kwargs) -> None:
-        """Inference steps to export"""
+    def trace_plugin_ios(self) -> None:
+        """Model inference logic for tracing"""
         pass
 
     @abstractmethod
-    def _adapt_model_for_case(self, input_dict: INPUT_KWARGS) -> AbstractContextManager:
-        """Return a context manager that adapts `self.model` for the given case.
-
-        Subclasses typically implement this with `@contextmanager`; the context
-        block yields ``(export_kwargs, output_names)`` and restores any model
-        mutations on exit.
+    def adapt_model_for_case(self, input_dict: INPUT_KWARGS_TYPE) -> AbstractContextManager:
+        """
+        Subclasses typically implement this abstractmethod with `@contextmanager`
+            * context block yields `(export_kwargs, output_names)`
+            * restores module back to original on exit
         """
         ...

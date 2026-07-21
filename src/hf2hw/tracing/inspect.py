@@ -33,10 +33,10 @@ def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPE
         - update the "unknown" `FwdSpec` kinds by inspecting the input `TensorSpec`s
         - drop the unused params from `fwd_specs` based on `input_specs` observation
     Args:
-        fwd_specs: list of the `FwdSpec`s collected by inspecting the forward signatures
+        fwd_specs: list of the `FwdSpec`s collected by inspecting the forward signatures (PyTorch inputs)
         input_specs: list of the `TensorSpec`s containing the input activation info
     Returns:
-        new `fwd_specs` now covering the specific `input_specs` case
+        new `fwd_specs` now covering the specific `input_specs` case (ONNX inputs)
     """
     updated_fwd_specs: List[FwdSpec] = []
     for fs in fwd_specs:
@@ -62,7 +62,21 @@ def apply_input_specs2fwd_specs(fwd_specs: List[FwdSpec], input_specs: INPUT_SPE
                     f_spec = FwdSpec(name=fs.name, kind="tuple_tensor", count=len(flat_specs))
             updated_fwd_specs.append(f_spec)
         else:
-            updated_fwd_specs.append(FwdSpec(name=fs.name, kind=fs.kind, count=fs.count))
+            # TODO: transformers==5.12.0 Gemma3 has `position_embedding: torch.Tensor`
+            #   when it actually should be `position_embedding: Tuple[torch.Tensor, torch.Tensor]`
+
+            # fwd_spec(signature) says "tensor"/"optional_tensor" BUT input_specs(observed) is NOT
+            f_spec = FwdSpec(name=fs.name, kind=fs.kind, count=fs.count)
+            if fs.kind in ("tensor", "optional_tensor") and not isinstance(spec, TensorSpec):
+                leaves, _ = torch.utils._pytree.tree_flatten(spec)
+                flat_specs = [ts for ts in leaves if isinstance(ts, TensorSpec) and not ts.is_empty]
+                if len(flat_specs) > 1:
+                    logger.warning(
+                        f"apply_input_specs2fwd_specs: param '{fs.name}' annotated as {fs.kind!r} "
+                        f"but observed as a container of {len(flat_specs)} tensors. Update to kind='tuple_tensor'."
+                    )
+                    f_spec = FwdSpec(name=fs.name, kind="tuple_tensor", count=len(flat_specs))
+            updated_fwd_specs.append(f_spec)
     return updated_fwd_specs
 
 

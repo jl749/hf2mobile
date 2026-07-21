@@ -1,10 +1,12 @@
 """Centralized logger for hf2hw.
 
-Writes INFO+ messages to stderr with a `[hf2hw]` prefix by default.  Level
-names are colorized when stderr is a TTY (DEBUG=gray, INFO=cyan,
-WARNING=yellow, ERROR=red, CRITICAL=bold red); plain text otherwise so logs
-piped to files / CI stay clean.  To change verbosity, configure the `hf2hw`
-logger via the standard `logging` module:
+Writes INFO+ messages to stderr with a `[hf2hw]` prefix by default.
+Level names are colorized when stderr is a TTY
+(DEBUG=gray, INFO=cyan, WARNING=yellow, ERROR=red, CRITICAL=bold red);
+plain text otherwise so logs piped to files / CI stay clean.
+Set `DEBUG=1` in the environment to start at DEBUG level (e.g. `DEBUG=1 python src/main.py`);
+otherwise it defaults to INFO.
+Verbosity can also be changed at runtime via the standard `logging` module:
 
     >> import logging
     >> logging.getLogger("hf2hw").setLevel(logging.DEBUG)   # more chatty
@@ -17,9 +19,15 @@ Internal modules should import and use the shared `logger` instance::
 """
 
 import logging
+import os
 import sys
 
 _LOGGER_NAME = "hf2hw"
+
+
+def _env_debug_enabled() -> bool:
+    return os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
 
 _RESET = "\033[0m"
 _LEVEL_COLOR = {
@@ -47,10 +55,10 @@ class _ColorFormatter(logging.Formatter):
             return super().format(record)
         original_levelname = record.levelname
         color = _LEVEL_COLOR.get(record.levelno, "")
-        # Pad first, then wrap in color codes so width stays uniform.
+        # pad first, then wrap in color codes so width stays uniform.
         record.levelname = f"{color}{original_levelname:<8}{_RESET}"
         try:
-            # Replace the format string for this call to avoid double-padding.
+            # replace the format string for this call to avoid double-padding.
             return logging.Formatter("[hf2hw] %(levelname)s | %(message)s").format(record)
         finally:
             record.levelname = original_levelname
@@ -63,7 +71,7 @@ def _get_logger() -> logging.Logger:
         use_color = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
         handler.setFormatter(_ColorFormatter(use_color=use_color))
         log.addHandler(handler)
-        log.setLevel(logging.INFO)
+        log.setLevel(logging.DEBUG if _env_debug_enabled() else logging.INFO)
         log.propagate = False  # do not double-emit via the root logger
     return log
 
