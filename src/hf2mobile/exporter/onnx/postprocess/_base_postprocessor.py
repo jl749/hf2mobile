@@ -7,9 +7,9 @@ from typing import Dict, List
 
 import onnx
 
-from hf2hw.constant import ONNX_DOMAIN_NAME, ONNX_TORCHLIB_ATTRIBUTE_NAME, SUBGRAPH_MAP_TYPE
-from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import drop_attributes, onnx_to_function, save_onnx, update_opset
+from hf2mobile.constant import ONNX_DOMAIN_NAME, ONNX_TORCHLIB_ATTRIBUTE_NAME, SUBGRAPH_MAP_TYPE
+from hf2mobile.utils.logger import logger
+from hf2mobile.utils.onnx_helper import drop_attributes, onnx_to_function, save_onnx, update_opset
 
 
 def _merge_subgraphs_into_model(

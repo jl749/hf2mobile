@@ -61,7 +61,7 @@ def export(model_id: str, target: Literal["ORT", "QNN"], debug: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="python -m hf2hw.export",
+        prog="python -m hf2mobile.export",
         description="Export a Hugging Face causal LM to a hardware-targeted ONNX model.",
     )
     parser.add_argument(

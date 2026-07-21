@@ -26,8 +26,8 @@ import onnx_ir as ir
 from onnxscript import rewriter
 from onnxscript.rewriter import pattern
 
-from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import get_scalar, update_opset
+from hf2mobile.utils.logger import logger
+from hf2mobile.utils.onnx_helper import get_scalar, update_opset
 
 
 def _cast_rule(cast_back_to: int) -> pattern.RewriteRule:

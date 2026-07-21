@@ -6,7 +6,7 @@ from typing import Any, List
 
 import torch
 
-from hf2hw.utils.logger import logger
+from hf2mobile.utils.logger import logger
 
 from .tensor_metadata import INPUT_SPECS_TYPE, TensorSpec
 

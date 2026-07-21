@@ -4,14 +4,14 @@ from typing import Any, Dict, List, Tuple, Union
 import torch
 import transformers
 
-from hf2hw.constant import (
+from hf2mobile.constant import (
     _NON_HASHABLE_PARAMS,
     INPUT_KWARGS_TYPE,
     INPUT_SPECS_TYPE,
     KV_CACHE_PARAM_NAME,
     OUTPUT_SPECS_TYPE,
 )
-from hf2hw.utils.logger import logger
+from hf2mobile.utils.logger import logger
 
 _STR_TO_DTYPE = {
     # Floats

@@ -9,7 +9,7 @@ import onnx_ir as ir
 import onnxscript.optimizer
 from onnx_ir.passes.common import InlinePass, LiftConstantsToInitializersPass, RemoveUnusedNodesPass
 
-from hf2hw.constant import ONNX_DOMAIN_NAME
+from hf2mobile.constant import ONNX_DOMAIN_NAME
 
 # ===================== onnx/ ===================== #
 

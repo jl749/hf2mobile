@@ -3,7 +3,7 @@ import time
 import torch
 import transformers
 
-from hf2hw.constant import KV_CACHE_PARAM_NAME
+from hf2mobile.constant import KV_CACHE_PARAM_NAME
 
 
 class TokenSpeedStreamer(transformers.generation.streamers.BaseStreamer):

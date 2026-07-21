@@ -4,9 +4,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import List
 
-from hf2hw.constant import INPUT_SPECS_TYPE, SUBGRAPH_MAP_TYPE
-from hf2hw.utils import check_parent_field, create_torchlib_op_name, suppress_onnx_export_logs
-from hf2hw.utils.logger import logger
+from hf2mobile.constant import INPUT_SPECS_TYPE, SUBGRAPH_MAP_TYPE
+from hf2mobile.utils import check_parent_field, create_torchlib_op_name, suppress_onnx_export_logs
+from hf2mobile.utils.logger import logger
 
 from .attention import export as attn_export
 from .rotary_embedding import export as rope_export

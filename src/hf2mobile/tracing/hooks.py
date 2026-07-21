@@ -5,8 +5,8 @@ from typing import Dict, List
 
 import torch
 
-from hf2hw.utils import check_parent_field
-from hf2hw.utils.logger import logger
+from hf2mobile.utils import check_parent_field
+from hf2mobile.utils.logger import logger
 
 from .tensor_metadata import INPUT_SPECS_TYPE, OUTPUT_SPECS_TYPE, ModuleIOSpec, TensorSpec
 

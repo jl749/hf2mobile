@@ -10,17 +10,17 @@ import onnx
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, SUPPORTED_TARGETS
-from hf2hw.exporter.onnx.postprocess.sliding_window import attach_sliding_window_mask_onnx
-from hf2hw.tracing import (
+from hf2mobile.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, SUPPORTED_TARGETS
+from hf2mobile.exporter.onnx.postprocess.sliding_window import attach_sliding_window_mask_onnx
+from hf2mobile.tracing import (
     HookRegisterInterface,
     PluginRegisterInterface,
     TracerInterface,
     export_case,
     register_dynamic_cache_pytree,
 )
-from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import optimize_onnx, save_onnx
+from hf2mobile.utils.logger import logger
+from hf2mobile.utils.onnx_helper import optimize_onnx, save_onnx
 
 from .onnx.fusion import fuse_group_query_attention, fuse_rms_norm
 from .onnx.postprocess import CausalLMONNXPostprocessor

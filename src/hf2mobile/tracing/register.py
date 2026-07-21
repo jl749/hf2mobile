@@ -9,9 +9,14 @@ import torch
 import transformers
 from torch.onnx._internal.exporter import _core as _onnx_core
 
-from hf2hw.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, ONNX_DOMAIN_NAME
-from hf2hw.utils import check_parent_field, create_torchlib_op_name, register_dynamic_cache_pytree, update_input_cache
-from hf2hw.utils.logger import logger
+from hf2mobile.constant import CUSTOM_LIB, CUSTOM_LIB_NAME, ONNX_DOMAIN_NAME
+from hf2mobile.utils import (
+    check_parent_field,
+    create_torchlib_op_name,
+    register_dynamic_cache_pytree,
+    update_input_cache,
+)
+from hf2mobile.utils.logger import logger
 
 from .inspect import FwdSpec, apply_input_specs2fwd_specs, fwdspecs2args, sig2fwdspecs
 from .tensor_metadata import OUTPUT_SPECS_TYPE, TensorSpec, get_kv_specs_from_input_specs

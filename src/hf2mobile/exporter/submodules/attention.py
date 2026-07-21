@@ -7,17 +7,17 @@ import onnx
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_SPECS_TYPE, KV_CACHE_PARAM_NAME
-from hf2hw.exporter.onnx.fusion import fuse_rms_norm, fuse_rope
-from hf2hw.tracing import (
+from hf2mobile.constant import INPUT_SPECS_TYPE, KV_CACHE_PARAM_NAME
+from hf2mobile.exporter.onnx.fusion import fuse_rms_norm, fuse_rope
+from hf2mobile.tracing import (
     apply_input_specs2fwd_specs,
     fwdspecs2args,
     fwdspecs2kwargs,
     input_specs2pseudo_inputs,
     sig2fwdspecs,
 )
-from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import save_onnx
+from hf2mobile.utils.logger import logger
+from hf2mobile.utils.onnx_helper import save_onnx
 
 _ONNX_OUTPUT_NAME = "attn_output"
 

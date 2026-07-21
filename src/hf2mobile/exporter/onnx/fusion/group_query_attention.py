@@ -48,9 +48,9 @@ import transformers
 from onnx_ir.passes.common import RemoveUnusedNodesPass
 from onnxscript.rewriter import pattern
 
-from hf2hw.constant import _NORM_OPS, _SEQLENS_K_NAME, _TOTAL_SEQLEN_NAME
-from hf2hw.utils.logger import logger
-from hf2hw.utils.onnx_helper import update_opset
+from hf2mobile.constant import _NORM_OPS, _SEQLENS_K_NAME, _TOTAL_SEQLEN_NAME
+from hf2mobile.utils.logger import logger
+from hf2mobile.utils.onnx_helper import update_opset
 
 
 def _ir_const_tensor(val: ir.Value) -> ir.TensorProtocol | None:

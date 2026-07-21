@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Sequence
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_KWARGS_TYPE
-from hf2hw.utils.logger import logger
+from hf2mobile.constant import INPUT_KWARGS_TYPE
+from hf2mobile.utils.logger import logger
 
 from .tensor_metadata import ModuleIOSpec
 

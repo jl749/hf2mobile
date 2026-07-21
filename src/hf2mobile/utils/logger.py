@@ -1,6 +1,6 @@
-"""Centralized logger for hf2hw.
+"""Centralized logger for hf2mobile.
 
-Writes INFO+ messages to stderr with a `[hf2hw]` prefix by default.
+Writes INFO+ messages to stderr with a `[hf2mobile]` prefix by default.
 Level names are colorized when stderr is a TTY
 (DEBUG=gray, INFO=cyan, WARNING=yellow, ERROR=red, CRITICAL=bold red);
 plain text otherwise so logs piped to files / CI stay clean.
@@ -9,12 +9,12 @@ otherwise it defaults to INFO.
 Verbosity can also be changed at runtime via the standard `logging` module:
 
     >> import logging
-    >> logging.getLogger("hf2hw").setLevel(logging.DEBUG)   # more chatty
-    >> logging.getLogger("hf2hw").setLevel(logging.WARNING) # quieter
+    >> logging.getLogger("hf2mobile").setLevel(logging.DEBUG)   # more chatty
+    >> logging.getLogger("hf2mobile").setLevel(logging.WARNING) # quieter
 
 Internal modules should import and use the shared `logger` instance::
 
-    >> from hf2hw.utils.logger import logger
+    >> from hf2mobile.utils.logger import logger
     >> logger.info("Registering plugin ops...")
 """
 
@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 
-_LOGGER_NAME = "hf2hw"
+_LOGGER_NAME = "hf2mobile"
 
 
 def _env_debug_enabled() -> bool:
@@ -47,7 +47,7 @@ class _ColorFormatter(logging.Formatter):
     """
 
     def __init__(self, use_color: bool):
-        super().__init__("[hf2hw] %(levelname)-8s | %(message)s")
+        super().__init__("[hf2mobile] %(levelname)-8s | %(message)s")
         self._use_color = use_color
 
     def format(self, record: logging.LogRecord) -> str:
@@ -59,7 +59,7 @@ class _ColorFormatter(logging.Formatter):
         record.levelname = f"{color}{original_levelname:<8}{_RESET}"
         try:
             # replace the format string for this call to avoid double-padding.
-            return logging.Formatter("[hf2hw] %(levelname)s | %(message)s").format(record)
+            return logging.Formatter("[hf2mobile] %(levelname)s | %(message)s").format(record)
         finally:
             record.levelname = original_levelname
 

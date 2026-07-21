@@ -5,8 +5,8 @@ import numpy as np
 import onnx
 import transformers
 
-from hf2hw.exporter.onnx import AttentionIdentifier
-from hf2hw.utils.onnx_helper import drop_vi_by_name, save_onnx, set_vi_axis, update_node_attribute
+from hf2mobile.exporter.onnx import AttentionIdentifier
+from hf2mobile.utils.onnx_helper import drop_vi_by_name, save_onnx, set_vi_axis, update_node_attribute
 
 from ._base_postprocessor import _ONNXPostprocessor
 

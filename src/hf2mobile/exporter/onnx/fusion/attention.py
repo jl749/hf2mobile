@@ -3,8 +3,8 @@ from typing import Dict, List, Optional
 import onnx
 import transformers
 
-from hf2hw.constant import _NORM_OPS
-from hf2hw.utils.onnx_helper import get_bwd_dict, get_fwd_dict
+from hf2mobile.constant import _NORM_OPS
+from hf2mobile.utils.onnx_helper import get_bwd_dict, get_fwd_dict
 
 # TODO: eager mode won't create Attention ONNX use fuser under submodules/attention.py
 # TODO: use onnx_ir instead of using bwd_dict, fwd_dict

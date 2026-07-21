@@ -5,9 +5,9 @@ import numpy as np
 import onnx
 import torch
 
-from hf2hw.constant import ONNX_DOMAIN_NAME, _swa_onnx_template
-from hf2hw.exporter.onnx import AttentionIdentifier
-from hf2hw.utils.logger import logger
+from hf2mobile.constant import ONNX_DOMAIN_NAME, _swa_onnx_template
+from hf2mobile.exporter.onnx import AttentionIdentifier
+from hf2mobile.utils.logger import logger
 
 
 def _get_sliding_window_mask_funcproto(func_name: str, sliding_window: int, opset_version: int) -> onnx.FunctionProto:

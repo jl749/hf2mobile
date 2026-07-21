@@ -6,14 +6,14 @@ from pathlib import Path
 import torch
 import transformers
 
-from hf2hw.constant import INPUT_SPECS_TYPE
-from hf2hw.tracing import (
+from hf2mobile.constant import INPUT_SPECS_TYPE
+from hf2mobile.tracing import (
     apply_input_specs2fwd_specs,
     fwdspecs2args,
     input_specs2pseudo_inputs,
     sig2fwdspecs,
 )
-from hf2hw.utils.logger import logger
+from hf2mobile.utils.logger import logger
 
 _ONNX_OUTPUT_NAMES = ("cos", "sin")
 
