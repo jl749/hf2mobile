@@ -1,34 +1,43 @@
 import argparse
+import logging
+import os
 from typing import Literal
 
 import transformers
 
-from .constant import SUPPORTED_TARGETS
+from .constant import DEBUG_CONFIG, SUPPORTED_TARGETS
 from .exporter import (
     Gemma3ForCausalLMExporter,
     LlamaForCausalLMExporter,
     Qwen2ForCausalLMExporter,
     Qwen3ForCausalLMExporter,
 )
+from .utils.logger import logger
 
 
-def export(model_id: str, target: Literal["ORT", "QNN"], debug=False):
+def export(model_id: str, target: Literal["ORT", "QNN"], debug: bool = False):
     assert (
         target in SUPPORTED_TARGETS
     ), f"Unsupported `{target=}`. Currently supported targets are: `{SUPPORTED_TARGETS}`."
 
     if debug:
-        attribute = {
-            "num_hidden_layers": 2,
-            # sliding_window: 3,
-            # attn_implementation: "eager",  # TODO: support eager
-        }
-    else:
-        attribute = {}
-    model = transformers.AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", **attribute).cpu()
+        logger.setLevel(logging.DEBUG)
+
+    logger.info(f"export: loading `{model_id}` (target={target}, debug={debug})")
+
+    config = transformers.AutoConfig.from_pretrained(model_id)
+    if debug:
+        logger.debug(f"export: forcing tiny model config: {DEBUG_CONFIG}")
+        for key, value in DEBUG_CONFIG.items():
+            setattr(config, key, value)
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_id, config=config, ignore_mismatched_sizes=debug
+    ).cpu()
     model.eval()
 
     architecture = model.config.architectures[0]
+    logger.info(f"export: resolved architecture `{architecture}`")
 
     if architecture == "LlamaForCausalLM":
         exporter = LlamaForCausalLMExporter(model=model)
@@ -41,11 +50,13 @@ def export(model_id: str, target: Literal["ORT", "QNN"], debug=False):
     else:
         raise ValueError(f"{model_id=} is not a supported architecture `{architecture}`.")
 
-    exporter.export(
+    exported_onnx_paths = exporter.export(
         path_template="case{i}.onnx",
         opset_version=25,
         target=target,
     )
+    relative_onnx_paths = [os.path.relpath(p) for p in exported_onnx_paths]
+    logger.info(f"export: done — `{model_id}` → ONNX (target={target}); exported_onnx_paths={relative_onnx_paths}")
 
 
 def main():
@@ -64,10 +75,14 @@ def main():
         choices=SUPPORTED_TARGETS,
         help="Export target (default: %(default)s).",
     )
-    parser.add_argument("--debug", action="store_true", help="Force small export.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Force a tiny random-init model (num_hidden_layers=2) and DEBUG logging for quick debugging.",
+    )
     args = parser.parse_args()
 
-    export(args.repo_id, args.target)
+    export(args.repo_id, args.target, debug=args.debug)
 
 
 if __name__ == "__main__":
