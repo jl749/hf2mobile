@@ -14,10 +14,6 @@
       HF_HOME = "./.hf_cache";
       UV_CACHE_DIR = "./.uv_cache";
       UV_PYTHON_DOWNLOADS = "never";
-      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-        pkgs.stdenv.cc.cc.lib
-        pkgs.zlib
-      ];
     };
   in {
     devShells.${system}.default =
@@ -32,6 +28,7 @@
         env = envVars;
         packages = [];
         shellHook = ''
+        export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [pkgs.stdenv.cc.cc.lib pkgs.zlib]}:$LD_LIBRARY_PATH"
         if [ ! -d ".venv" ]; then
           echo "Creating virtual environment..."
           uv venv --python ${pkgs.python312}/bin/python
