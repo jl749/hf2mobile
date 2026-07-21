@@ -174,8 +174,10 @@ class CausalLMExporter(
         target: str,
         path_template: str = "case{i}.onnx",
         opset_version: int = 25,
-    ) -> None:
+    ) -> List[str]:
         """Export HF model to ONNX (export 2 unique cases - prefill, generation)"""
+        case_paths: List[str] = []
+
         start_dir = os.getcwd()
         try:
             work_dir = datetime.now().strftime(
@@ -204,7 +206,6 @@ class CausalLMExporter(
             self.register_plugins()  # requires `trace_plugin_ios` to be ran first
 
             logger.info(f"Stage 4/5: exporting {len(uniq_input_dicts)} ONNX case(s) — model level")
-            case_paths: List[str] = []
             for i, input_dict in enumerate(uniq_input_dicts):
                 path = path_template.format(i=i + 1)
                 logger.info(f"  case {i + 1}/{num_uniq_cases} → {path}")
@@ -231,6 +232,8 @@ class CausalLMExporter(
             raise RuntimeError("CausalLMExporter.export(...) failed.") from e
         finally:
             os.chdir(start_dir)
+
+        return [str(Path(work_dir).joinpath(p)) for p in case_paths]
 
 
 __all__ = ["CausalLMExporter"]

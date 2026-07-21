@@ -54,8 +54,11 @@ class Gemma3ForCausalLMExporter(CausalLMExporter):
         text_model = model.model
         text_model.rotary_emb = Gemma3RopeDispatch(text_model.rotary_emb, model.config.layer_types).eval()
 
-        # NOTE: sliding mask is attached during postprocessing. keep it causal initially for easier tracing.
-        modeling_gemma3.create_causal_mask = lambda *args, **kwargs: None
+        # NOTE: transformers/integrations/sdpa_attention.py::`use_gqa_in_sdpa()` returns False if `attention_mask != None`.
+        #   This materializes `Expand` onnx nodes(expand KV) on K/V that `AttentionIdentifier` cannot walk past.
+        #   Hence, Null the sliding mask that every attention module traces with `.forward(..., attention_mask=None)`
+        #   forcing `F.scaled_dot_product_attentio(..., enable_gqa=True)` and native onnx Attention node when exported.
+        #   later re-applying the attention mask with `attach_sliding_window_mask_onnx` function.
         modeling_gemma3.create_sliding_window_causal_mask = lambda *args, **kwargs: None
 
         super().__init__(model, plugin_suffix=("Attention", "RotaryEmbedding"))
