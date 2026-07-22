@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hf2mobile"
+version = "0.1.0"
+description = "Export Hugging Face causal LMs to hardware-targeted ONNX models (ORT / QNN)."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "jlee" }]
+license = { text = "Proprietary" }
+keywords = ["onnx", "transformers", "huggingface", "quantization", "onnxruntime", "qnn"]
+
+dependencies = [
+    "torch>=2.6",
+    "transformers>=5.0",
+    "numpy>=2.0",
+    "onnx>=1.18",
+    "onnx-ir>=0.2",
+    "onnxscript>=0.7",
+    "onnxruntime>=1.22",
+    "onnxoptimizer>=0.4",
+]
+
+[project.scripts]
+hf2mobile-export = "hf2mobile.export:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/hf-quantizer"
+
+# ---------------------------------------------------------------------------
+# Build (src layout). Ship the ONNX template graphs alongside the package.
+# ---------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["src/hf2mobile"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/hf2mobile", "README.md", "pyproject.toml"]
+
+# ---------------------------------------------------------------------------
+# uv: resolve torch from the CPU wheel index for reproducible CPU installs.
+# Drop this section (and use the default index) if you want CUDA wheels.
+# ---------------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[dependency-groups]
+dev = ["pytest>=8", "build>=1.2", "pre-commit>=3.7"]
