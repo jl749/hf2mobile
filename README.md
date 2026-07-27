@@ -224,4 +224,4 @@ Targeting `u16` activations for QNN instead of `u8`, to preserve accuracy on HTP
 
 - [ ] **On-device Android execution.** Cross-compile the runtime so an exported model runs end-to-end on Android.
 - [ ] **Benchmark harness.** Report TTFT (time-to-first-token), TPS (tokens/second), and peak memory across targets.
-- [ ] **Regression testing (pytest).** Extend the per-architecture suite under `tests/` so it also asserts the Rust `ORTInferencer` (`hf2mobile._ort`) matches the Python `onnxruntime` reference (`ort_infer.py`) — same logits/greedy tokens — so export or runtime changes can't silently drift.
+- [ ] **Regression testing (pytest).** Extend the per-architecture suite under `tests/`.
