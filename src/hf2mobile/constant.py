@@ -5,6 +5,15 @@ from typing import Any, Dict, Tuple
 import onnx
 import torch
 
+# postprocess.py
+CAUSALLM_EXPORTED_GRAPH = "case2.onnx"
+CAUSALLM_INFERENCE_GRAPH = "inference.onnx"
+LOGITS_NAME = "logits"
+SAMPLE_LOGITS_OP = "SampleLogits"
+SAMPLE_LOGITS_ATTRS = ("topk", "topp", "temperature")
+SAMPLED_TOKEN_NAME = "sampled_token"
+EOS_TOKENS_CONST_NAME = "hf2mobile_EOS_tokens"
+
 # export.py
 DEBUG_CONFIG = {
     "num_hidden_layers": 2,
@@ -28,7 +37,7 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 # tracing/register.py
 CUSTOM_LIB_NAME = "hf_module2plugin"
 CUSTOM_LIB = torch.library.Library(CUSTOM_LIB_NAME, "DEF")
-ONNX_DOMAIN_NAME = "com.jerry"
+ONNX_DOMAIN_NAME = "com.hf2mobile"
 ONNX_TORCHLIB_ATTRIBUTE_NAME = "torchlib_op_name"  # placeholder node attr carrying the registered op name
 
 # tracing/tensor_metadata.py
