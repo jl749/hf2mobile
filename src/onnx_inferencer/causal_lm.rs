@@ -22,46 +22,47 @@
 //! This is what makes token-at-a-time control cheap. The alternative — re-prefilling the
 //! prompt on every call — is quadratic in the length of the reply.
 //!
-//! # Sampling
+//! # Where the token comes from
 //!
-//! How a token is picked from the logits lives in [`crate::sampling`]; this file only
-//! decides *when* to pick one. The default is greedy, which is deterministic and so the
-//! right baseline for checking that an export still produces what the original model did.
+//! Nothing here reads logits. The graph this file runs (`inference.onnx`, from `python -m
+//! hf2mobile.postprocess`) ends in a `com.hf2mobile:SampleLogits` node and returns the token
+//! it picked as a `[1, 1]` int32. The sampling policy was baked into that node's attributes
+//! at export time, so it is not a per-call argument here and a row of logits never leaves
+//! ONNX Runtime — which is the point: at a 262k vocabulary that row is 1 MB per token, and
+//! copying it out only to reduce it to one integer was the most expensive thing a decode
+//! step did that was not arithmetic.
+//!
+//! Where a turn *stops* comes out of the graph too: the ids in `hf2mobile_EOS_tokens`, read
+//! by [`crate::onnx_file`]. So opening a model takes a graph and a tokenizer, and nothing
+//! else has to be remembered by the caller.
 //!
 //! # Timing
 //!
 //! TTFT and tokens/sec are measured here rather than in Python, around the
-//! `Session::run` call and nothing else. Tokenizing, sampling, and streaming to stdout are
-//! all excluded, so the numbers describe the model rather than the harness. ONNX Runtime
-//! has no per-run latency accessor — its profiler reports per-*operator* spans to a
-//! chrome trace (see `DEBUG=1`) — so an `Instant` around the call is the measurement.
+//! `Session::run` call and nothing else. Tokenizing and streaming to stdout are excluded, so
+//! the numbers describe the model rather than the harness. ONNX Runtime has no per-run
+//! latency accessor — its profiler reports per-*operator* spans to a chrome trace (see
+//! `DEBUG=1`) — so an `Instant` around the call is the measurement.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ort::session::{Session, SessionInputValue};
-use ort::tensor::TensorElementType;
-use ort::value::{DynValue, TensorRef};
+use ort::value::TensorRef;
 use tokenizers::Tokenizer;
 
 use crate::kv_cache::KvCache;
-use crate::sampling::{self, Sampling};
+use crate::onnx_file;
 use crate::session;
 
-/// Token strings that mark end-of-turn across the model families this repo exports.
-///
-/// `tokenizer.json` records a vocabulary, not a chat protocol — it has no "this is the
-/// EOS" field — so the id has to be recovered by name. Any model whose terminator is not
-/// on this list needs `eos_tokens` passed explicitly, which is why that argument exists.
-const KNOWN_EOS_TOKENS: [&str; 6] = [
-    "<|im_end|>",    // Qwen2 / Qwen3 chat
-    "<|endoftext|>", // Qwen base, GPT-2 lineage
-    "<|eot_id|>",    // Llama 3 chat
-    "</s>",          // Llama 2, Mistral
-    "<end_of_turn>", // Gemma chat
-    "<|end|>",       // Phi-3
-];
+/// The graph output `SampleLogits` writes its token into (`SAMPLED_TOKEN_NAME` in
+/// `constant.py`).
+const SAMPLED_TOKEN: &str = "sampled_token";
+
+/// The `Constant` node `python -m hf2mobile.postprocess` parks the stop ids in
+/// (`EOS_TOKENS_CONST_NAME` in `constant.py`).
+const EOS_TOKENS_CONST: &str = "hf2mobile_EOS_tokens";
 
 /// What one `generate` call produced.
 pub struct Step {
@@ -193,12 +194,23 @@ pub struct CausalLm {
     cache: KvCache,
     /// The non-cache inputs this particular graph declares, in its own order.
     step_inputs: Vec<StepInput>,
+    /// End-of-sequence ids `generate` stops on, as the graph itself declares them — see
+    /// [`open`](Self::open).
+    eos_tokens: Vec<i64>,
     /// The turn in progress, if any. `None` means the next `generate` starts a fresh one.
     turn: Option<Turn>,
 }
 
 impl CausalLm {
     /// Load a generation graph and its tokenizer.
+    ///
+    /// The stop ids are read out of the graph rather than passed in. They cannot be guessed
+    /// from `tokenizer.json` — that records a vocabulary, not a chat protocol, so it has no
+    /// "this is the EOS" field, and a guess that misses turns into generation that never
+    /// stops. What does know is the export, and `python -m hf2mobile.postprocess` writes the
+    /// answer into the graph as `hf2mobile_EOS_tokens`. An empty list there is a real answer
+    /// (this model names no stop token, so only the caller's budget ends a turn); a *missing*
+    /// node means the graph never went through postprocess, and is refused.
     pub fn open(onnx_path: &str, tokenizer_path: &str, intra_threads: Option<usize>) -> Result<Self> {
         let session =
             session::open(onnx_path, intra_threads).with_context(|| format!("opening ONNX model `{onnx_path}`"))?;
@@ -220,11 +232,28 @@ impl CausalLm {
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("loading tokenizer `{tokenizer_path}`"))?;
 
+        // Read after the graph has been checked over, so a graph that is wrong in a more
+        // fundamental way (bf16, no KV cache) still says so first.
+        let eos_tokens = onnx_file::int_constant(onnx_path, EOS_TOKENS_CONST)?.with_context(|| {
+            format!(
+                "`{onnx_path}` carries no `{EOS_TOKENS_CONST}` node, so nothing in it says where a \
+                 turn ends. This runtime decodes the postprocessed graph — build it with:\n\
+                 \n    python -m hf2mobile.postprocess <export dir>\n"
+            )
+        })?;
+        if eos_tokens.is_empty() {
+            eprintln!(
+                "[hf2mobile] WARNING: `{EOS_TOKENS_CONST}` is empty, so this graph names no \
+                 end-of-sequence token. Generation will run until the caller's budget is spent."
+            );
+        }
+
         Ok(Self {
             session,
             tokenizer,
             cache,
             step_inputs,
+            eos_tokens,
             turn: None,
         })
     }
@@ -265,14 +294,9 @@ impl CausalLm {
         &mut self.session
     }
 
-    /// End-of-turn ids recovered from the tokenizer's vocabulary, used when the caller
-    /// does not name any. See [`KNOWN_EOS_TOKENS`] for why this is a lookup by name.
-    pub fn default_eos_tokens(&self) -> Vec<i64> {
-        KNOWN_EOS_TOKENS
-            .iter()
-            .filter_map(|token| self.tokenizer.token_to_id(token))
-            .map(i64::from)
-            .collect()
+    /// End-of-sequence ids `generate` stops on, as the graph declared them.
+    pub fn eos_tokens(&self) -> &[i64] {
+        &self.eos_tokens
     }
 
     /// Continue the current turn, or open one if there is none.
@@ -284,14 +308,7 @@ impl CausalLm {
     /// Returns [`Step::text`] as `Some` exactly once — on the call where an end-of-sequence
     /// token arrives. After that the turn is closed and further calls warn and do nothing
     /// until [`reset`](Self::reset).
-    pub fn generate(
-        &mut self,
-        prompt: &str,
-        num_generation: usize,
-        eos_tokens: &[i64],
-        stream_output: bool,
-        sampling: Sampling,
-    ) -> Result<Step> {
+    pub fn generate(&mut self, prompt: &str, num_generation: usize, stream_output: bool) -> Result<Step> {
         // Destructure `self` into its fields up front. The decode loop borrows the
         // tokenizer (for streaming) at the same time as it mutably borrows the session,
         // which the compiler only allows once it can see the two are separate fields.
@@ -300,6 +317,7 @@ impl CausalLm {
             tokenizer,
             cache,
             step_inputs,
+            eos_tokens,
             turn,
         } = self;
 
@@ -324,7 +342,7 @@ impl CausalLm {
                 anyhow::bail!("prompt is empty: it tokenized to no tokens at all");
             }
             cache.reset()?;
-            let (pending, ttft) = forward(session, cache, step_inputs, &prompt_ids, 0, sampling)?;
+            let (pending, ttft) = forward(session, cache, step_inputs, &prompt_ids, 0)?;
             *turn = Some(Turn::new(prompt_ids.len(), pending, ttft));
         }
         let turn = turn.as_mut().expect("a turn was just opened");
@@ -355,7 +373,7 @@ impl CausalLm {
                 }
             }
 
-            let (next, elapsed) = forward(session, cache, step_inputs, &[turn.pending], turn.kv_len, sampling)?;
+            let (next, elapsed) = forward(session, cache, step_inputs, &[turn.pending], turn.kv_len)?;
             turn.pending = next;
             turn.kv_len += 1;
             // Accumulating per-run durations, rather than timing the loop, keeps the
@@ -382,8 +400,8 @@ impl CausalLm {
 /// Run `tokens` through the graph; return the next token id and how long ORT took.
 ///
 /// The returned [`Duration`] covers `Session::run` alone — not building the input
-/// tensors, not the argmax — because that is the number a change to the model or the
-/// provider actually moves.
+/// tensors — because that is the number a change to the model or the provider actually
+/// moves. Picking the token is inside that window now: it is a node in the graph.
 ///
 /// `kv_len` is how many tokens the KV cache already holds, which is also the absolute
 /// position of `tokens[0]`. Every length the graph asks for is derived from it, so there
@@ -398,7 +416,6 @@ fn forward(
     step_inputs: &[StepInput],
     tokens: &[i64],
     kv_len: i64,
-    sampling: Sampling,
 ) -> Result<(i64, Duration)> {
     let len = tokens.len() as i64;
     let total = kv_len + len; // sequence length once this pass is done
@@ -430,47 +447,24 @@ fn forward(
     let elapsed = started.elapsed();
 
     cache.take_update(&mut outputs)?;
-    let logits = outputs.get("logits").context("graph has no `logits` output")?;
-    Ok((pick_next(logits, sampling)?, elapsed))
-}
 
-/// Pick the next token from a `[1, seq, vocab]` logits tensor.
-///
-/// Only the final row predicts the next token — during prefill the earlier rows predict
-/// tokens we already have — so we slice off the tail and ignore the rest. That matters:
-/// on a 1k-token prompt with a 150k vocab, the rows we skip are hundreds of megabytes.
-///
-/// Greedy decoding reads ORT's buffer in place. Sampling has to rescale the scores, so it
-/// copies the one row it needs into `f32` first — which also folds away the f16/bf16 case
-/// before [`sampling`] ever sees it.
-fn pick_next(logits: &DynValue, cfg: Sampling) -> Result<i64> {
-    let (_, dtype) = session::tensor_type(logits.dtype()).context("`logits` is not a tensor")?;
+    // One int32, whatever the prompt length and whatever the vocabulary size — the
+    // `SampleLogits` node at the end of the graph already did the reducing. `try_extract_tensor`
+    // borrows ORT's buffer rather than copying it, which at four bytes is beside the point;
+    // what matters is that the row those four bytes came from stayed inside ONNX Runtime.
+    let sampled = outputs.get(SAMPLED_TOKEN).with_context(|| {
+        format!(
+            "graph has no `{SAMPLED_TOKEN}` output. This runtime decodes the postprocessed graph, \
+             which ends in a `SampleLogits` node — build it with:\n\
+             \n    python -m hf2mobile.postprocess <export dir>\n"
+        )
+    })?;
+    let (_, data) = sampled
+        .try_extract_tensor::<i32>()
+        .with_context(|| format!("`{SAMPLED_TOKEN}` is not an int32 tensor"))?;
+    let token = *data
+        .first()
+        .with_context(|| format!("`{SAMPLED_TOKEN}` came back empty; it should hold one id"))?;
 
-    // `try_extract_tensor` borrows ORT's buffer directly — no copy, at any vocab size.
-    // One arm per float type the model might be running in.
-    macro_rules! pick {
-        ($t:ty, $to_f32:expr) => {{
-            let (shape, data) = logits.try_extract_tensor::<$t>()?;
-            let vocab = *shape.last().context("`logits` has no vocab dimension")? as usize;
-            let last_row = data
-                .len()
-                .checked_sub(vocab)
-                .map(|start| &data[start..])
-                .context("`logits` is smaller than one vocab row")?;
-
-            let id = if cfg.is_greedy() {
-                sampling::argmax(last_row)
-            } else {
-                sampling::sample(last_row.iter().copied().map($to_f32).collect(), cfg)
-            };
-            Ok(id as i64)
-        }};
-    }
-
-    match dtype {
-        TensorElementType::Float32 => pick!(f32, |v| v),
-        TensorElementType::Float16 => pick!(half::f16, f32::from),
-        TensorElementType::Bfloat16 => pick!(half::bf16, f32::from),
-        other => anyhow::bail!("unsupported `logits` element type {other:?}"),
-    }
+    Ok((i64::from(token), elapsed))
 }

@@ -3,25 +3,32 @@
 //! ```python
 //! from hf2mobile.inference import CausalLMInferencer
 //!
-//! lm = CausalLMInferencer("case2.onnx", "tokenizer.json")
+//! lm = CausalLMInferencer("inference.onnx", "tokenizer.json")
 //! print(lm.generate("Where is the capital of France?", num_generation=64))
 //! print(lm.ttft_s, lm.tps)
 //! ```
+//!
+//! The graph it runs is the postprocessed one (`python -m hf2mobile.postprocess`): it returns
+//! the token it sampled, not a row of logits, and it carries the ids that end a turn. So the
+//! two paths above are the whole configuration — the sampling policy and the stop tokens were
+//! decided at export time and travel with the model.
 //!
 //! # Layout
 //!
 //! Only this file and [`numpy`] touch Python
 //! the runtime underneath is plain Rust and can be tested or reused without an interpreter.
 //!
-//! | module          | Python? | job |
-//! |-----------------|---------|-----|
-//! | `lib` (here)    | yes     | the `#[pyclass]` wrapper — argument checking and nothing else |
-//! | [`numpy`]       | yes     | numpy array <-> ORT tensor, for the raw `run` escape hatch |
-//! | [`session`]     | no      | open a graph, read what it declares, `DEBUG=1` dumps |
-//! | [`precision`]   | no      | reject a dtype this machine cannot execute |
-//! | [`kv_cache`]    | no      | carry key/value tensors between decode steps, without copying |
-//! | [`sampling`]    | no      | turn a row of logits into a token |
-//! | [`causal_lm`]   | no      | tokenize, prefill, decode, time |
+//! | module           | Python? | job |
+//! |------------------|---------|-----|
+//! | `lib` (here)     | yes     | the `#[pyclass]` wrapper — argument checking and nothing else |
+//! | [`numpy`]        | yes     | numpy array <-> ORT tensor, for the raw `run` escape hatch |
+//! | [`session`]      | no      | open a graph, register the custom op, `DEBUG=1` dumps |
+//! | [`precision`]    | no      | reject a dtype this machine cannot execute |
+//! | [`kv_cache`]     | no      | carry key/value tensors between decode steps, without copying |
+//! | [`onnx_file`]    | no      | read the stop-token ids out of the `.onnx` protobuf |
+//! | [`sample_logits`]| no      | the `SampleLogits` kernel, shared with `src/onnx_plugins` |
+//! | [`sampling`]     | no      | turn a row of logits into a token, inside that kernel |
+//! | [`causal_lm`]    | no      | tokenize, prefill, decode, time |
 //!
 //! Errors are `anyhow`, which pyo3 turns into a Python `RuntimeError` carrying the whole context chain
 //!  — so a failure deep in the cache surfaces in Python as "opening ONNX model `x.onnx`: ...".
@@ -35,9 +42,19 @@ use pyo3::types::PyDict;
 mod causal_lm;
 mod kv_cache;
 mod numpy;
+mod onnx_file;
 mod precision;
 mod sampling;
 mod session;
+
+// The `SampleLogits` kernel, compiled straight out of the plugin crate rather than
+// reimplemented: `src/onnx_plugins` builds the same file into the `.so` a mobile runtime
+// loads, so the token this runtime picks and the token that runtime picks come from one
+// definition. (The sharing goes both ways — the plugin crate reads [`sampling`] out of this
+// directory in the same manner. Neither crate depends on the other; `cargo` is only being
+// told where a file lives.)
+#[path = "../onnx_plugins/sample_logits.rs"]
+mod sample_logits;
 
 /// ONNX Runtime inference over an exported causal-LM graph
 ///
@@ -59,7 +76,12 @@ pub struct CausalLMInferencer {
 
 #[pymethods]
 impl CausalLMInferencer {
-    /// Load a generation graph (one with KV IO) with HF `tokenizer.json`.
+    /// Load a postprocessed generation graph (one with KV IO) with HF `tokenizer.json`.
+    ///
+    /// `onnx_path` is `inference.onnx` — the graph `python -m hf2mobile.postprocess` writes.
+    /// It ends in a `SampleLogits` node, so it hands back a token rather than logits, and it
+    /// carries the ids that stop a turn; both are read from the graph, so there is nothing
+    /// here to pass them as.
     ///
     /// Raises if the graph's dtype is not supported (e.g. bfloat16).
     /// The runtime never rewrites a model(bf16->f32); that is the exporter's job.
@@ -81,12 +103,9 @@ impl CausalLMInferencer {
         })
     }
 
-    /// Continue the current turn, or start one from `prompt`, and return
-    /// `(text, (ttft_s, tps))`.
+    /// Continue the current turn, or start one from `prompt`, and return `(text, (ttft_s, tps))`.
     ///
-    /// `text` is `None` until an end-of-sequence token arrives, and the finished output
-    /// exactly once on the call where it does. So this composes into a poll loop:
-    ///
+    /// `text` is `None` until an end-of-sequence token arrives
     /// ```python
     /// while True:
     ///     text, (ttft, tps) = lm.generate(prompt, num_generation=1)
@@ -94,64 +113,31 @@ impl CausalLMInferencer {
     ///         break
     /// ```
     ///
-    /// The KV cache, the token history and the timings all live across those calls, so the
-    /// prompt is prefilled once and `ttft_s` keeps reporting that first pass. **`prompt` is
-    /// read only when a turn starts**; later calls continue from the cache and ignore it.
+    /// KV cache, token history and the timings all live across the single generation calls
+    /// - prompt is prefilled once and `ttft_s` keeps reporting that first pass
+    /// - **`prompt` is read only when a turn starts**; (prefill input string)
     ///
-    /// Once a turn ends, its cache is released and further calls warn and do nothing —
-    /// call `reset()` to start another.
+    /// Once a turn ends, its caches are released and further calls warn and do nothing — call `reset()` to start over.
     ///
-    /// - `num_generation` — how many tokens to produce *in this call*.
-    /// - `eos_tokens` — stop on any of these ids. Omitted, the terminators found in the
-    ///   tokenizer's vocabulary are used; pass a list to override that. Pass `[]` and the
-    ///   turn never ends on its own.
-    /// - `stream_output` — print the text to stdout as it is produced. What is printed can
-    ///   lag the return value: a token that is only half a UTF-8 character is held back
-    ///   until it completes, rather than printed broken, so stdout always holds a prefix of
-    ///   the final text and never mojibake.
-    /// - `temperature` — `0` (the default) means greedy: always the highest-scoring
-    ///   token, and so reproducible. Above zero enables sampling, where `top_k` and
-    ///   `top_p` narrow the field first. See [`sampling`] for the order they apply in.
+    /// - `num_generation` — how many new tokens to produce *in this call*.
+    /// - `stream_output` — print the text to stdout as it is produced.
     ///
-    /// `ttft_s` and `tps` are updated from this call; `token_ids` and `prefill_len` read
-    /// the turn's own state, so they reflect it as of the last call either way.
-    #[pyo3(signature = (
-        prompt,
-        num_generation = 64,
-        eos_tokens = None,
-        stream_output = false,
-        temperature = 0.0,
-        top_k = 0,
-        top_p = 1.0,
-    ))]
-    #[allow(clippy::too_many_arguments)]
+    /// There is no `temperature`/`top_k`/`top_p` here: the graph's `SampleLogits` node holds
+    /// the policy, baked in by `python -m hf2mobile.postprocess --temp/--top_k/--top_p`. That
+    /// is what a mobile runtime gets, so it is what this one runs.
+    #[pyo3(signature = (prompt, num_generation = 64, stream_output = false))]
     fn generate(
         &mut self,
         py: Python<'_>,
         prompt: &str,
         num_generation: i32,
-        eos_tokens: Option<Vec<i32>>,
         stream_output: bool,
-        temperature: f32,
-        top_k: i32,
-        top_p: f32,
     ) -> Result<(Option<String>, (f64, f64))> {
-        // The graph speaks int64 token ids; i32 is the friendlier width at the Python
-        // boundary (no vocabulary comes close to 2^31) so widen once, here.
-        let eos: Vec<i64> = match eos_tokens {
-            Some(ids) => ids.into_iter().map(i64::from).collect(),
-            None => self.inner.default_eos_tokens(),
-        };
         let budget = num_generation.max(0) as usize;
-        let cfg = sampling::Sampling {
-            temperature,
-            top_k: top_k.max(0) as usize,
-            top_p,
-        };
 
         // Decoding is compute plus, when streaming, writes to stdout — no Python objects
         // are touched, so the GIL can go.
-        let step = py.allow_threads(|| self.inner.generate(prompt, budget, &eos, stream_output, cfg))?;
+        let step = py.allow_threads(|| self.inner.generate(prompt, budget, stream_output))?;
 
         self.ttft_s = step.ttft_s;
         self.tps = step.tps;
@@ -198,12 +184,11 @@ impl CausalLMInferencer {
         self.inner.prefill_len()
     }
 
-    /// Token ids the tokenizer identifies as end-of-turn, i.e. what `generate` stops on
-    /// when `eos_tokens` is omitted. Empty means the tokenizer uses a terminator this
-    /// runtime does not recognise, and `eos_tokens` should be passed explicitly.
+    /// End-of-sequence ids `generate` stops on, as read from the graph's
+    /// `hf2mobile_EOS_tokens` node.
     #[getter]
     fn eos_tokens(&self) -> Vec<i64> {
-        self.inner.default_eos_tokens()
+        self.inner.eos_tokens().to_vec()
     }
 
     /// The graph's input names, in declaration order.
@@ -241,6 +226,13 @@ impl CausalLMInferencer {
     /// The escape hatch, for inspecting a graph a pass at a time. It does *not* share
     /// `generate`'s KV cache — every call stands alone, and every array is copied across
     /// the boundary. `generate` is the path that keeps tensors on the ORT side.
+    ///
+    /// Clippy reports a `useless_conversion` against this signature. It is `#[pymethods]`'
+    /// own expansion, not anything written here: this is the one method that already returns
+    /// `PyResult`, so the error conversion the macro wraps it in goes `PyErr` to `PyErr`.
+    /// Returning anyhow's `Result` instead would silence it, but then the `?`s below would
+    /// surface numpy's `ValueError` as a `RuntimeError`, so the warning is the better trade.
+    /// An `#[allow]` here or on the `impl` does not reach the generated code.
     fn run<'py>(&mut self, py: Python<'py>, inputs: &Bound<'py, PyDict>) -> PyResult<Bound<'py, PyDict>> {
         let mut ort_inputs: Vec<(String, ort::value::DynValue)> = Vec::with_capacity(inputs.len());
         for (key, value) in inputs.iter() {

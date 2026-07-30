@@ -43,6 +43,7 @@ from .constant import (
     GENERATION_CONFIG_FILE,
     LOGITS_NAME,
     ONNX_DOMAIN_NAME,
+    SAMPLE_LOGITS_ATTRS,
     SAMPLE_LOGITS_OP,
     SAMPLED_TOKEN_NAME,
     TOKENIZER_CONFIG_FILE,
@@ -176,6 +177,7 @@ def attach_sample_logits(
     )
 
     # ===== `SampleLogits` (graph tail) ===== #
+    attributes = {name: sampling[name] for name in SAMPLE_LOGITS_ATTRS}
     graph.node.append(
         onnx.helper.make_node(
             SAMPLE_LOGITS_OP,
@@ -183,9 +185,7 @@ def attach_sample_logits(
             outputs=[SAMPLED_TOKEN_NAME],
             name=f"node_{SAMPLE_LOGITS_OP}",
             domain=ONNX_DOMAIN_NAME,
-            top_k=int(sampling["top_k"]),
-            top_p=float(sampling["top_p"]),
-            temperature=float(sampling["temperature"]),
+            **attributes,
         )
     )
     graph.output.append(onnx.helper.make_tensor_value_info(SAMPLED_TOKEN_NAME, onnx.TensorProto.INT32, [1, 1]))

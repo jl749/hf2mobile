@@ -8,12 +8,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use ort::execution_providers::CPUExecutionProvider;
+use ort::operator::OperatorDomain;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::tensor::TensorElementType;
 use ort::value::ValueType;
 
 use crate::precision::REEXPORT_ADVICE;
+use crate::sample_logits::{SampleLogits, DOMAIN};
 
 /// Load `path` and get it ready to run.
 ///
@@ -25,6 +27,12 @@ use crate::precision::REEXPORT_ADVICE;
 /// trace to the current directory — see [`debug_artifacts`].
 pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
     let mut builder = Session::builder()?
+        // `inference.onnx` ends in a `com.hf2mobile:SampleLogits` node, which ORT cannot
+        // resolve a kernel for unless we hand it one. Registered in-process from the same
+        // source the `libhf2mobile_plugins.so` build uses, rather than by dlopening that
+        // `.so`: the graph then runs with nothing to configure and no second artifact to
+        // keep in step. (A runtime that is not this one — an Android app — loads the `.so`.)
+        .with_operators(OperatorDomain::new(DOMAIN)?.add(SampleLogits::<f32>::new())?)?
         // Level3 turns on every graph rewrite ORT has, including layout changes that
         // are specific to the current CPU. Costs a moment at load, pays it back on the
         // first token.
@@ -76,17 +84,20 @@ pub struct DebugArtifacts {
 }
 
 pub fn debug_artifacts(model_path: &str) -> Option<DebugArtifacts> {
-    if std::env::var("DEBUG").as_deref() != Ok("1") {
-        return None;
+    match std::env::var("DEBUG").as_deref() {
+        Ok("1") => {
+            let stem: &str = Path::new(model_path) // &Path
+                .file_stem() // Option<&OsStr>
+                .and_then(|s| s.to_str()) // Option<&str>
+                .unwrap_or("model");
+            Some(DebugArtifacts {
+                optimized_model: format!("{stem}.ort"),
+                profile_prefix: format!("{stem}_profile_"),
+            })
+        }
+        Ok(_) => None,
+        Err(_) => None,
     }
-    let stem = Path::new(model_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model");
-    Some(DebugArtifacts {
-        optimized_model: format!("{stem}.ort"),
-        profile_prefix: format!("{stem}_profile_"),
-    })
 }
 
 /// The declared shape and element type of one graph input/output.

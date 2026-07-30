@@ -5,13 +5,13 @@ from typing import Any, Dict, Tuple
 import onnx
 import torch
 
-# postprocess.py
+# postprocess.py / infer.py
 CAUSALLM_EXPORTED_GRAPH = "case2.onnx"
 CAUSALLM_INFERENCE_GRAPH = "inference.onnx"
 LOGITS_NAME = "logits"
 SAMPLE_LOGITS_OP = "SampleLogits"
-SAMPLE_LOGITS_ATTRS = ("topk", "topp", "temperature")
-SAMPLED_TOKEN_NAME = "sampled_token"
+SAMPLE_LOGITS_ATTRS = ("top_k", "top_p", "temperature")
+SAMPLED_TOKEN_NAME = "sampled_token"  # new output name
 EOS_TOKENS_CONST_NAME = "hf2mobile_EOS_tokens"
 
 # export.py
