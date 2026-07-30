@@ -1,26 +1,31 @@
 //! Choosing the next token from a row of logits.
 //!
-//! The model hands back one score per vocabulary entry. Turning those into a single token
-//! is a policy decision, kept here so the decode loop in [`crate::causal_lm`] stays about
-//! running the graph.
+//! # Who calls this
+//!
+//! Not the decode loop — [`crate::causal_lm`] never sees logits. This is the body of the
+//! `SampleLogits` operator in [`crate::sample_logits`], i.e. it runs *inside* the graph, once
+//! per pass, on a row that never leaves ONNX Runtime.
+//!
+//! The file sits here rather than beside that operator for a build reason: `src/onnx_plugins`
+//! compiles the same source into `libhf2mobile_plugins.so` for a mobile runtime to load. One
+//! definition, two binaries, so the two can never disagree about which token a policy picks.
 //!
 //! # The knobs, and the order they apply in
 //!
-//! 1. **temperature** divides the logits. Below 1 sharpens the distribution toward what
-//!    the model is confident about; above 1 flattens it. `0` means greedy — take the
-//!    single best token — which is the default because it is deterministic, and comparing
-//!    an export against the original model needs determinism.
+//! 1. **temperature** divides the logits. Below 1 sharpens the distribution toward what the
+//!    model is confident about; above 1 flattens it. `0` means greedy — take the single best
+//!    token — which is deterministic, and so the right setting for checking an export against
+//!    the model it came from.
 //! 2. **top_k** keeps only the `k` highest-scoring tokens.
-//! 3. **top_p** (nucleus) keeps the smallest set of tokens whose probabilities already sum
-//!    to `p`, so a confident step considers few candidates and an uncertain one considers
-//!    many.
+//! 3. **top_p** (nucleus) keeps the smallest set of tokens whose probabilities already sum to
+//!    `p`, so a confident step considers few candidates and an uncertain one considers many.
 //!
-//! This is the order HuggingFace's `generate` uses. It matters: top_k on raw logits then
-//! top_p on the renormalized survivors is not the same as the reverse.
+//! This is the order HuggingFace's `generate` uses. It matters: top_k on raw logits then top_p
+//! on the renormalized survivors is not the same as the reverse.
 
 use rand::Rng;
 
-/// How to turn logits into a token.
+/// How to turn logits into a token. Built once per session, from the graph node's attributes.
 #[derive(Clone, Copy)]
 pub struct Sampling {
     /// Divides the logits. `<= 0` selects greedy decoding and ignores the other two.
@@ -32,63 +37,23 @@ pub struct Sampling {
     pub top_p: f32,
 }
 
-impl Default for Sampling {
-    /// Greedy: reproducible, and the right baseline for checking an export.
-    fn default() -> Self {
-        Self {
-            temperature: 0.0,
-            top_k: 0,
-            top_p: 1.0,
-        }
-    }
-}
-
 impl Sampling {
     /// Is this configuration just "take the best token"?
     ///
     /// Worth asking, because greedy needs no copy of the logits — [`argmax`] reads ORT's
-    /// buffer where it lies, while sampling has to materialize and rescale a row that can
-    /// be 150k floats wide.
-    pub fn is_greedy(self) -> bool {
+    /// buffer where it lies, while sampling has to materialize and rescale a row that can be
+    /// 150k floats wide.
+    fn is_greedy(self) -> bool {
         self.temperature <= 0.0
     }
 }
 
-/// Index of the largest element. Ties go to the first. NaNs lose every comparison, so they
-/// are skipped rather than poisoning the result — including a NaN in the *first* position,
-/// which is the case worth spelling out: seeding the running best with one would pin the
-/// answer to index 0, because every later `score > NaN` is false. Returns 0 for an empty row
-/// or one that is entirely NaN.
+/// Draw a token from `row` under `cfg`. Returns an index into the vocabulary.
 ///
-/// The running best is carried in a local rather than re-read as `row[best]`, and the walk
-/// goes through the iterator rather than indexing: both spare the loop a bounds check and a
-/// reload per element, which at a 262k vocab it pays once per greedy token.
-pub fn argmax<T: PartialOrd + Copy>(row: &[T]) -> usize {
-    // Seed from the first score that can be compared at all: a NaN does not even order
-    // against itself, so `partial_cmp` returns `None` for one and `Some` for everything
-    // else. (`v == v` says the same thing, but clippy reads it as a mistake.) This stops on
-    // the first element in the normal case, and keeping the test out here leaves the loop
-    // below with one comparison per element rather than an is-it-seeded branch as well.
-    let seed = row
-        .iter()
-        .enumerate()
-        .find_map(|(i, &v)| v.partial_cmp(&v).is_some().then_some((i, v)));
-    let Some((mut best, mut best_score)) = seed else {
-        return 0;
-    };
-    for (i, &score) in row.iter().enumerate().skip(best + 1) {
-        if score > best_score {
-            best = i;
-            best_score = score;
-        }
-    }
-    best
-}
-
-/// Draw a token from `row` under `cfg`.
-///
-/// Takes the model's own logits row — `f32`, `f16` or `bf16` — and converts as it builds the
-/// candidate list, so the widening to `f32` costs no allocation of its own.
+/// Generic over the element type so it can take the model's own logits row — `f32`, `f16` or
+/// `bf16` — and convert as it builds the candidate list, which means widening to `f32` costs no
+/// allocation of its own. (`Into<f32>` is the bound that says "this type can widen to f32";
+/// `half`'s types implement it.)
 pub fn sample<T: Copy + PartialOrd + Into<f32>>(row: &[T], cfg: Sampling) -> usize {
     if row.is_empty() {
         return 0;
@@ -99,8 +64,8 @@ pub fn sample<T: Copy + PartialOrd + Into<f32>>(row: &[T], cfg: Sampling) -> usi
 
     // (id, score) pairs, because every filter below reorders the scores and we still need to
     // know which token each one belongs to. `u32` rather than `usize` keeps the pair at 8
-    // bytes instead of 16 (a `usize` pairs with an `f32` only after 4 bytes of padding) — at
-    // a 262k vocab that is 2 MB per sampled token rather than 4 MB, and no vocabulary comes
+    // bytes instead of 16 (a `usize` pairs with an `f32` only after 4 bytes of padding) — at a
+    // 262k vocab that is 2 MB per sampled token rather than 4 MB, and no vocabulary comes
     // anywhere near 2^32.
     let mut candidates: Vec<(u32, f32)> = row
         .iter()
@@ -120,9 +85,9 @@ pub fn sample<T: Copy + PartialOrd + Into<f32>>(row: &[T], cfg: Sampling) -> usi
     // actually scan, and otherwise take the maximum in one O(n) pass.
     //
     // This is not a corner case. `temperature` alone — top_k and top_p left at their
-    // defaults — is the natural way to ask for sampling, and it skips the top_k filter
-    // above too, so the sort would be an O(V log V) route to a maximum over the *whole*
-    // vocabulary, every token.
+    // defaults — is the natural way to ask for sampling, and it skips the top_k filter above
+    // too, so the sort would be an O(V log V) route to a maximum over the *whole* vocabulary,
+    // every token.
     let max = if cfg.top_p < 1.0 {
         candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         candidates[0].1
@@ -161,8 +126,9 @@ pub fn sample<T: Copy + PartialOrd + Into<f32>>(row: &[T], cfg: Sampling) -> usi
         total = candidates.iter().map(|(_, p)| p).sum();
     }
 
-    // Roulette wheel over the survivors. `total` is their unnormalized sum, so there is no
-    // need to divide through first.
+    // Roulette wheel over the survivors: walk the list subtracting probabilities from a random
+    // point until it runs out. `total` is their unnormalized sum, so there is no need to divide
+    // through first.
     let mut point = rand::rng().random_range(0.0..total);
     for &(id, probability) in &candidates {
         point -= probability;
@@ -172,6 +138,38 @@ pub fn sample<T: Copy + PartialOrd + Into<f32>>(row: &[T], cfg: Sampling) -> usi
     }
     // Only reachable through floating-point drift in the subtraction above.
     candidates[candidates.len() - 1].0 as usize
+}
+
+/// Index of the largest element. Ties go to the first. NaNs lose every comparison, so they are
+/// skipped rather than poisoning the result — including a NaN in the *first* position, which is
+/// the case worth spelling out: seeding the running best with one would pin the answer to index
+/// 0, because every later `score > NaN` is false. Returns 0 for an empty row or one that is
+/// entirely NaN.
+///
+/// The running best is carried in a local rather than re-read as `row[best]`, and the walk goes
+/// through the iterator rather than indexing: both spare the loop a bounds check and a reload
+/// per element, which at a 262k vocab it pays once per greedy token.
+fn argmax<T: PartialOrd + Copy>(row: &[T]) -> usize {
+    // Seed from the first score that can be compared at all: a NaN does not even order
+    // against itself, so `partial_cmp` returns `None` for one and `Some` for everything
+    // else. (`v == v` says the same thing, but clippy reads it as a mistake.) This stops on
+    // the first element in the normal case, and keeping the test out here leaves the loop
+    // below with one comparison per element rather than an is-it-seeded branch as well.
+    let seed = row
+        .iter()
+        .enumerate()
+        .find_map(|(i, &v)| v.partial_cmp(&v).is_some().then_some((i, v)));
+    // `let ... else` is the early return for "no comparable element at all".
+    let Some((mut best, mut best_score)) = seed else {
+        return 0;
+    };
+    for (i, &score) in row.iter().enumerate().skip(best + 1) {
+        if score > best_score {
+            best = i;
+            best_score = score;
+        }
+    }
+    best
 }
 
 #[cfg(test)]

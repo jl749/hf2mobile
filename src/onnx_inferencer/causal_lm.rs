@@ -2,11 +2,11 @@
 //!
 //! # The one graph, two jobs trick
 //!
-//! The exported graph takes `input_ids` of a *dynamic* length `L`, so the same graph
-//! does both halves of generation:
+//! The exported graph takes `input_ids` of a *dynamic* length `L`, so the same graph does
+//! both halves of generation:
 //!
-//! - **prefill** — `L = prompt length`, empty [`KvCache`]. One pass reads the whole
-//!   prompt and predicts the first token. This is what time-to-first-token measures.
+//! - **prefill** — `L = prompt length`, empty [`KvCache`]. One pass reads the whole prompt
+//!   and predicts the first token. This is what time-to-first-token measures.
 //! - **decode** — `L = 1`, cache holding everything so far. One pass per token.
 //!
 //! Both are the same call to [`forward`]; only the slice of tokens differs.
@@ -16,33 +16,27 @@
 //! [`CausalLm::generate`] does not run a generation to completion — it advances one. A
 //! *turn* opens on the first call, survives as many further calls as the caller makes, and
 //! closes when an end-of-sequence token arrives. The [`KvCache`], the token history and the
-//! timings all live in [`Turn`] across those calls, so a caller can poll with
-//! `num_generation = 1` and still pay for prefill exactly once.
-//!
-//! This is what makes token-at-a-time control cheap. The alternative — re-prefilling the
-//! prompt on every call — is quadratic in the length of the reply.
+//! timings all live in [`Turn`] across those calls, so a caller can poll one token at a time
+//! and still pay for prefill exactly once. Re-prefilling the prompt on every call instead
+//! would be quadratic in the length of the reply.
 //!
 //! # Where the token comes from
 //!
 //! Nothing here reads logits. The graph this file runs (`inference.onnx`, from `python -m
-//! hf2mobile.postprocess`) ends in a `com.hf2mobile:SampleLogits` node and returns the token
-//! it picked as a `[1, 1]` int32. The sampling policy was baked into that node's attributes
-//! at export time, so it is not a per-call argument here and a row of logits never leaves
-//! ONNX Runtime — which is the point: at a 262k vocabulary that row is 1 MB per token, and
-//! copying it out only to reduce it to one integer was the most expensive thing a decode
-//! step did that was not arithmetic.
+//! hf2mobile.postprocess`) ends in a `SampleLogits` node and returns the token it picked as a
+//! `[1, 1]` int32. Two consequences: the sampling policy is not an argument here, because it
+//! was baked into that node at export time; and a row of logits never leaves ONNX Runtime,
+//! which at a 262k vocabulary is 1 MB per token not copied.
 //!
-//! Where a turn *stops* comes out of the graph too: the ids in `hf2mobile_EOS_tokens`, read
-//! by [`crate::onnx_file`]. So opening a model takes a graph and a tokenizer, and nothing
-//! else has to be remembered by the caller.
+//! Where a turn *stops* comes out of the graph too — the ids in `hf2mobile_EOS_tokens`, read
+//! by [`crate::onnx_file`]. So opening a model needs a graph and a tokenizer, nothing else.
 //!
 //! # Timing
 //!
-//! TTFT and tokens/sec are measured here rather than in Python, around the
-//! `Session::run` call and nothing else. Tokenizing and streaming to stdout are excluded, so
-//! the numbers describe the model rather than the harness. ONNX Runtime has no per-run
-//! latency accessor — its profiler reports per-*operator* spans to a chrome trace (see
-//! `DEBUG=1`) — so an `Instant` around the call is the measurement.
+//! TTFT and tokens/sec are measured here, around the `Session::run` call and nothing else,
+//! so tokenizing and streaming to stdout stay out of the model's numbers. ONNX Runtime has no
+//! per-run latency accessor — its profiler reports per-*operator* spans to a chrome trace
+//! (see `DEBUG=1`) — so an `Instant` around the call is the measurement.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -67,8 +61,8 @@ const EOS_TOKENS_CONST: &str = "hf2mobile_EOS_tokens";
 /// What one `generate` call produced.
 pub struct Step {
     /// The turn's complete output — but only once an end-of-sequence token has arrived.
-    /// `None` while the turn is still open, which is how a caller polling with
-    /// `num_generation = 1` learns whether to keep going.
+    /// `None` while the turn is still open, which is how a caller polling one token at a
+    /// time learns whether to keep going.
     pub text: Option<String>,
     /// Time to first token: the prefill `Session::run`, in seconds. Fixed once the turn
     /// starts, and grows with prompt length since prefill reads the whole prompt at once.
@@ -101,7 +95,7 @@ struct Turn {
     /// Incremental-detokenizer state. Kept here rather than as a `tokenizers::DecodeStream`
     /// because that type borrows the tokenizer, which cannot outlive a single call — and
     /// this state has to. Without it, a character split across a call boundary would be
-    /// dropped, which with `num_generation = 1` is *every* boundary.
+    /// dropped, which when polling one token at a time is *every* boundary.
     stream: StreamState,
     /// Set when an end-of-sequence token comes up. The turn is over.
     finished: bool,
@@ -129,11 +123,14 @@ impl Turn {
         }
     }
 
+    /// This turn's numbers so far, plus `text` if the turn just closed.
     fn report(&self, text: Option<String>) -> Step {
         let decode_s = self.decode_time.as_secs_f64();
         Step {
             text,
             ttft_s: self.ttft.as_secs_f64(),
+            // Guard the division: before any decode pass there is no elapsed time to divide
+            // by, and 0/0 would be a NaN crossing into Python.
             tps: if decode_s > 0.0 {
                 self.generated.len() as f64 / decode_s
             } else {
@@ -145,14 +142,15 @@ impl Turn {
 
 /// A per-step graph input that is *not* part of the KV cache.
 ///
-/// Which of these a graph asks for depends on how it was exported. A plain attention
-/// export wants `position_ids` and works out rotary embeddings from them; an export
-/// where ONNX Runtime's `GroupQueryAttention` has been fused in computes positions
-/// internally and wants two length counters instead.
+/// Which of these a graph asks for depends on how it was exported. A plain attention export
+/// wants `position_ids` and works out rotary embeddings from them; an export where ONNX
+/// Runtime's `GroupQueryAttention` has been fused in computes positions internally and wants
+/// two length counters instead.
 ///
-/// We resolve the list once at load time — so an unfamiliar input fails immediately with
-/// a clear message rather than on the first token — and only rebuild the (tiny) tensors
-/// per step.
+/// We resolve the list once at load time — so an unfamiliar input fails immediately with a
+/// clear message rather than on the first token — and only rebuild the (tiny) tensors per
+/// step. `Clone, Copy` are derived because this is four bytes describing which input it is:
+/// copying one is cheaper than referring to it, so the compiler is told to just copy.
 #[derive(Clone, Copy)]
 enum StepInput {
     /// The tokens for this pass, `[1, L]` int64.
@@ -177,6 +175,8 @@ impl StepInput {
         }
     }
 
+    /// The name to feed it back to ORT under. The mirror image of `from_name`, kept next to
+    /// it so the two spellings of each name are one line apart.
     fn name(self) -> &'static str {
         match self {
             Self::InputIds => "input_ids",
@@ -197,7 +197,9 @@ pub struct CausalLm {
     /// End-of-sequence ids `generate` stops on, as the graph itself declares them — see
     /// [`open`](Self::open).
     eos_tokens: Vec<i64>,
-    /// The turn in progress, if any. `None` means the next `generate` starts a fresh one.
+    /// The turn in progress. `Option` is how Rust spells "maybe there is one": `None` means
+    /// the next `generate` opens a fresh turn, and the compiler will not let any code read
+    /// the inside without saying which case it is handling.
     turn: Option<Turn>,
 }
 
@@ -212,10 +214,16 @@ impl CausalLm {
     /// (this model names no stop token, so only the caller's budget ends a turn); a *missing*
     /// node means the graph never went through postprocess, and is refused.
     pub fn open(onnx_path: &str, tokenizer_path: &str, intra_threads: Option<usize>) -> Result<Self> {
+        // `?` on a fallible call means "unwrap it, or return the error to my caller".
+        // `with_context` hangs a sentence off that error on the way out, and anyhow keeps the
+        // whole chain — which is what turns a failure deep in ORT into a Python exception
+        // reading "opening ONNX model `x.onnx`: ...".
         let session =
             session::open(onnx_path, intra_threads).with_context(|| format!("opening ONNX model `{onnx_path}`"))?;
+
         // A dtype this machine cannot execute is a re-export, not a runtime problem.
         crate::precision::ensure_executable(&session)?;
+
         // Whatever the cache does not supply is ours to fill in.
         let (cache, other_inputs) = KvCache::discover(&session)?;
         let step_inputs = other_inputs
@@ -224,6 +232,8 @@ impl CausalLm {
                 StepInput::from_name(name)
                     .with_context(|| format!("graph wants an input this runtime does not know how to fill: `{name}`"))
             })
+            // `collect` into a `Result<Vec<_>>` stops at the first input we did not
+            // recognise and returns that error, instead of building a list of maybes.
             .collect::<Result<Vec<_>>>()?;
 
         // `tokenizers` reports errors as boxed trait objects rather than an error type,
@@ -232,8 +242,8 @@ impl CausalLm {
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("loading tokenizer `{tokenizer_path}`"))?;
 
-        // Read after the graph has been checked over, so a graph that is wrong in a more
-        // fundamental way (bf16, no KV cache) still says so first.
+        // Read last, so a graph that is wrong in a more fundamental way (bf16, no KV cache)
+        // reports that first.
         let eos_tokens = onnx_file::int_constant(onnx_path, EOS_TOKENS_CONST)?.with_context(|| {
             format!(
                 "`{onnx_path}` carries no `{EOS_TOKENS_CONST}` node, so nothing in it says where a \
@@ -272,6 +282,9 @@ impl CausalLm {
 
     /// Tokens emitted so far in the current turn.
     pub fn token_ids(&self) -> Vec<i64> {
+        // `map` looks inside the `Option` if there is a turn; `unwrap_or_default` supplies an
+        // empty `Vec` if there is not. The clone is deliberate: the caller is Python, which
+        // cannot hold a borrow of Rust's own list.
         self.turn
             .as_ref()
             .map(|turn| turn.generated.clone())
@@ -281,6 +294,16 @@ impl CausalLm {
     /// How many tokens the current turn's prompt came to.
     pub fn prefill_len(&self) -> usize {
         self.turn.as_ref().map_or(0, |turn| turn.prefill_len)
+    }
+
+    /// How many KV cache tensors the graph declared — two per layer.
+    pub fn kv_slots(&self) -> usize {
+        self.cache.slot_count()
+    }
+
+    /// End-of-sequence ids `generate` stops on, as the graph declared them.
+    pub fn eos_tokens(&self) -> &[i64] {
+        &self.eos_tokens
     }
 
     /// The underlying session, for reading graph metadata.
@@ -294,24 +317,21 @@ impl CausalLm {
         &mut self.session
     }
 
-    /// End-of-sequence ids `generate` stops on, as the graph declared them.
-    pub fn eos_tokens(&self) -> &[i64] {
-        &self.eos_tokens
-    }
-
     /// Continue the current turn, or open one if there is none.
     ///
     /// `prompt` is only read when a turn opens; later calls continue from the KV cache and
-    /// ignore it. That is the point: a caller can poll with `num_generation = 1` and the
-    /// prefill is paid for once.
+    /// ignore it. That is the point: a caller can poll one token at a time and the prefill
+    /// is paid for once.
     ///
     /// Returns [`Step::text`] as `Some` exactly once — on the call where an end-of-sequence
     /// token arrives. After that the turn is closed and further calls warn and do nothing
     /// until [`reset`](Self::reset).
     pub fn generate(&mut self, prompt: &str, num_generation: usize, stream_output: bool) -> Result<Step> {
-        // Destructure `self` into its fields up front. The decode loop borrows the
-        // tokenizer (for streaming) at the same time as it mutably borrows the session,
-        // which the compiler only allows once it can see the two are separate fields.
+        // Take the fields apart up front. The loop below borrows the tokenizer (to stream
+        // text) at the same time as it mutably borrows the session (to run the graph). Rust
+        // forbids handing out `&mut self` and `&self` at once, but it happily allows one
+        // borrow per *field* — and naming them like this is how the compiler sees that these
+        // are different fields and cannot alias.
         let Self {
             session,
             tokenizer,
@@ -334,6 +354,7 @@ impl CausalLm {
         // measures. `forward` reports ORT's own time, so tokenizing is not counted.
         if turn.is_none() {
             let encoding = tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?;
+            // `as i64` widens each id: the tokenizer counts in u32, the graph wants int64.
             let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
             if prompt_ids.is_empty() {
                 // A causal LM predicts token n+1 from tokens 0..n, so it needs at least one
@@ -345,6 +366,8 @@ impl CausalLm {
             let (pending, ttft) = forward(session, cache, step_inputs, &prompt_ids, 0)?;
             *turn = Some(Turn::new(prompt_ids.len(), pending, ttft));
         }
+        // Safe to unwrap the `Option` now: either it held a turn on entry or the block above
+        // just put one there. `expect` documents that reasoning and would panic if it broke.
         let turn = turn.as_mut().expect("a turn was just opened");
 
         for _ in 0..num_generation {
@@ -357,27 +380,14 @@ impl CausalLm {
             turn.generated.push(turn.pending);
 
             if stream_output {
-                let piece = tokenizers::step_decode_stream(
-                    tokenizer,
-                    turn.pending as u32,
-                    true,
-                    &mut turn.stream.ids,
-                    &mut turn.stream.prefix,
-                    &mut turn.stream.prefix_index,
-                );
-                // `None` means the text so far ends mid-character; the decoder holds it
-                // back rather than printing a broken one.
-                if let Ok(Some(piece)) = piece {
-                    print!("{piece}");
-                    let _ = std::io::stdout().flush();
-                }
+                stream_token(tokenizer, turn);
             }
 
             let (next, elapsed) = forward(session, cache, step_inputs, &[turn.pending], turn.kv_len)?;
             turn.pending = next;
             turn.kv_len += 1;
-            // Accumulating per-run durations, rather than timing the loop, keeps the
-            // streaming `print!` above (a syscall per token) out of the throughput.
+            // Accumulating per-run durations, rather than timing the loop, keeps the write
+            // to stdout above (a syscall per token) out of the throughput.
             turn.decode_time += elapsed;
         }
 
@@ -397,15 +407,39 @@ impl CausalLm {
     }
 }
 
+/// Print the text `turn.pending` adds to what is already on screen.
+///
+/// Detokenizing incrementally, not by re-decoding the whole reply each token: the stream
+/// state in [`Turn`] remembers how much text has been printed. A `None` piece means the text
+/// so far ends mid-character, and the decoder holds it back rather than printing a broken
+/// one — so errors here are silently ignored, because streaming is a nicety and losing a
+/// character to it must not fail a generation.
+fn stream_token(tokenizer: &Tokenizer, turn: &mut Turn) {
+    let piece = tokenizers::step_decode_stream(
+        tokenizer,
+        turn.pending as u32,
+        true,
+        &mut turn.stream.ids,
+        &mut turn.stream.prefix,
+        &mut turn.stream.prefix_index,
+    );
+    if let Ok(Some(piece)) = piece {
+        print!("{piece}");
+        // stdout is line-buffered, and tokens rarely end in a newline, so without this the
+        // text would appear in chunks instead of as it is produced.
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// Run `tokens` through the graph; return the next token id and how long ORT took.
 ///
-/// The returned [`Duration`] covers `Session::run` alone — not building the input
-/// tensors — because that is the number a change to the model or the provider actually
-/// moves. Picking the token is inside that window now: it is a node in the graph.
+/// The returned [`Duration`] covers `Session::run` alone — not building the input tensors —
+/// because that is the number a change to the model or the provider actually moves. Picking
+/// the token is inside that window now: it is a node in the graph.
 ///
 /// `kv_len` is how many tokens the KV cache already holds, which is also the absolute
-/// position of `tokens[0]`. Every length the graph asks for is derived from it, so there
-/// is only one counter to get wrong.
+/// position of `tokens[0]`. Every length the graph asks for is derived from it, so there is
+/// only one counter to get wrong.
 ///
 /// A free function rather than a method so it can borrow the session and the cache
 /// separately — `&mut self` would lock both together and the caller could not also hold
@@ -447,24 +481,28 @@ fn forward(
     let elapsed = started.elapsed();
 
     cache.take_update(&mut outputs)?;
+    Ok((sampled_token(&outputs)?, elapsed))
+}
 
-    // One int32, whatever the prompt length and whatever the vocabulary size — the
-    // `SampleLogits` node at the end of the graph already did the reducing. `try_extract_tensor`
-    // borrows ORT's buffer rather than copying it, which at four bytes is beside the point;
-    // what matters is that the row those four bytes came from stayed inside ONNX Runtime.
-    let sampled = outputs.get(SAMPLED_TOKEN).with_context(|| {
+/// Read the one id the graph picked out of its `sampled_token` output.
+///
+/// Four bytes, whatever the prompt length and whatever the vocabulary size — the
+/// `SampleLogits` node at the end of the graph already did the reducing.
+fn sampled_token(outputs: &ort::session::SessionOutputs<'_>) -> Result<i64> {
+    let value = outputs.get(SAMPLED_TOKEN).with_context(|| {
         format!(
             "graph has no `{SAMPLED_TOKEN}` output. This runtime decodes the postprocessed graph, \
              which ends in a `SampleLogits` node — build it with:\n\
              \n    python -m hf2mobile.postprocess <export dir>\n"
         )
     })?;
-    let (_, data) = sampled
+    // `try_extract_tensor` borrows ORT's buffer and checks the element type while doing so;
+    // the shape (the discarded first half of the pair) is `[1, 1]` and tells us nothing.
+    let (_, data) = value
         .try_extract_tensor::<i32>()
         .with_context(|| format!("`{SAMPLED_TOKEN}` is not an int32 tensor"))?;
     let token = *data
         .first()
         .with_context(|| format!("`{SAMPLED_TOKEN}` came back empty; it should hold one id"))?;
-
-    Ok((i64::from(token), elapsed))
+    Ok(i64::from(token))
 }

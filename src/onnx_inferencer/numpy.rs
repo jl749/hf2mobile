@@ -19,13 +19,17 @@ use pyo3::prelude::*;
 
 /// Every dtype that can cross the boundary, as `rust type => ORT element type`.
 ///
-/// One list, used by both directions below, so they can never drift apart. Each `$to`
-/// macro is handed the list and expands it into its own shape — a repetition macro
-/// calling a callback macro, which is Rust's usual answer to "generate the same match
-/// arms twice".
+/// A `macro_rules!` macro writes code before the program is compiled, which is how the same
+/// list can be used to generate two different shapes of code below — `to_ort` needs a chain of
+/// `if`s, `from_ort` needs `match` arms, and neither can be written with a generic function
+/// because each arm names a *different* type.
 ///
-/// bf16 is deliberately absent: numpy has no built-in bfloat16 dtype, so there is
-/// nothing on the Python side to map it to. bf16 models reach the runtime through
+/// The trick is that `with_dtypes!` takes the *name of another macro* and calls it with the
+/// list. So each direction defines its own `convert!` describing one entry, and this hands it
+/// all seven. One list, no chance of the two drifting apart.
+///
+/// bf16 is deliberately absent: numpy has no built-in bfloat16 dtype, so there is nothing on
+/// the Python side to map it to. bf16 models reach the runtime through
 /// [`crate::CausalLMInferencer`], which never converts to numpy.
 macro_rules! with_dtypes {
     ($to:ident) => {

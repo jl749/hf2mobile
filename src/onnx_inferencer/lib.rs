@@ -15,25 +15,28 @@
 //!
 //! # Layout
 //!
-//! Only this file and [`numpy`] touch Python
-//! the runtime underneath is plain Rust and can be tested or reused without an interpreter.
+//! Only this file and [`numpy`] touch Python; the runtime underneath is plain Rust and can be
+//! tested or reused without an interpreter.
 //!
-//! | module           | Python? | job |
-//! |------------------|---------|-----|
-//! | `lib` (here)     | yes     | the `#[pyclass]` wrapper — argument checking and nothing else |
-//! | [`numpy`]        | yes     | numpy array <-> ORT tensor, for the raw `run` escape hatch |
-//! | [`session`]      | no      | open a graph, register the custom op, `DEBUG=1` dumps |
-//! | [`precision`]    | no      | reject a dtype this machine cannot execute |
-//! | [`kv_cache`]     | no      | carry key/value tensors between decode steps, without copying |
-//! | [`onnx_file`]    | no      | read the stop-token ids out of the `.onnx` protobuf |
-//! | [`sample_logits`]| no      | the `SampleLogits` kernel, shared with `src/onnx_plugins` |
-//! | [`sampling`]     | no      | turn a row of logits into a token, inside that kernel |
-//! | [`causal_lm`]    | no      | tokenize, prefill, decode, time |
+//! | module            | Python? | job |
+//! |-------------------|---------|-----|
+//! | `lib` (here)      | yes     | the `#[pyclass]` wrapper — argument checking and nothing else |
+//! | [`numpy`]         | yes     | numpy array <-> ORT tensor, for the raw `run` escape hatch |
+//! | [`session`]       | no      | open a graph, register the custom op, `DEBUG=1` dumps |
+//! | [`precision`]     | no      | reject a dtype this machine cannot execute |
+//! | [`kv_cache`]      | no      | carry key/value tensors between decode steps, without copying |
+//! | [`onnx_file`]     | no      | read the stop-token ids out of the `.onnx` protobuf |
+//! | [`sample_logits`] | no      | the `SampleLogits` kernel, shared with `src/onnx_plugins` |
+//! | [`sampling`]      | no      | turn a row of logits into a token, inside that kernel |
+//! | [`causal_lm`]     | no      | tokenize, prefill, decode, time |
 //!
-//! Errors are `anyhow`, which pyo3 turns into a Python `RuntimeError` carrying the whole context chain
-//!  — so a failure deep in the cache surfaces in Python as "opening ONNX model `x.onnx`: ...".
-//! The exception is [`numpy`], which raises `ValueError` directly: "that array has the wrong dtype"
-//! is a caller mistake, and `ValueError` is the exception a Python caller would actually think to catch for it.
+//! # Errors
+//!
+//! Everything fallible returns `anyhow::Result`, and pyo3 turns an `anyhow` error into a
+//! Python `RuntimeError` carrying the whole context chain — so a failure deep in the cache
+//! surfaces in Python as "opening ONNX model `x.onnx`: ...". The exception is [`numpy`], which
+//! raises `ValueError` directly: "that array has the wrong dtype" is a caller mistake, and
+//! `ValueError` is what a Python caller would think to catch for it.
 
 use anyhow::Result;
 use pyo3::prelude::*;
@@ -48,29 +51,31 @@ mod sampling;
 mod session;
 
 // The `SampleLogits` kernel, compiled straight out of the plugin crate rather than
-// reimplemented: `src/onnx_plugins` builds the same file into the `.so` a mobile runtime
+// reimplemented: `src/onnx_plugins` builds this same file into the `.so` a mobile runtime
 // loads, so the token this runtime picks and the token that runtime picks come from one
 // definition. (The sharing goes both ways — the plugin crate reads [`sampling`] out of this
-// directory in the same manner. Neither crate depends on the other; `cargo` is only being
-// told where a file lives.)
+// directory the same way. Neither crate depends on the other; `#[path]` only tells `cargo`
+// where a file lives.)
 #[path = "../onnx_plugins/sample_logits.rs"]
 mod sample_logits;
 
-/// ONNX Runtime inference over an exported causal-LM graph
+/// ONNX Runtime inference over an exported causal-LM graph.
 ///
-/// `unsendable`: an ORT session is tied to the thread that built it.
-///   this marker enforces pyo3 touching the object from another Python thread raises Err.
-///   (prevent data corruption)
+/// `#[pyclass]` is what makes this Rust struct visible to Python as a class. `unsendable`
+/// tells pyo3 that the object must not travel between Python threads — an ORT session is tied
+/// to the thread that built it — so touching it from another thread raises instead of
+/// corrupting memory.
 #[pyclass(name = "CausalLMInferencer", unsendable)]
 pub struct CausalLMInferencer {
     inner: causal_lm::CausalLm,
     /// Time-to-first-token of the most recent `generate`, in seconds. Zero before prefill.
+    /// `#[pyo3(get)]` publishes the field to Python as a read-only attribute.
     #[pyo3(get)]
     ttft_s: f64,
     /// Decode throughput of the most recent `generate`, in tokens/sec. Zero before prefill.
     #[pyo3(get)]
     tps: f64,
-    /// Triggers the profiler (when `DEBUG=1`)
+    /// Whether `DEBUG=1` asked for a profile, which decides what `Drop` has to flush.
     profiling: bool,
 }
 
@@ -83,18 +88,18 @@ impl CausalLMInferencer {
     /// carries the ids that stop a turn; both are read from the graph, so there is nothing
     /// here to pass them as.
     ///
-    /// Raises if the graph's dtype is not supported (e.g. bfloat16).
-    /// The runtime never rewrites a model(bf16->f32); that is the exporter's job.
+    /// Raises if the graph's dtype is not supported (e.g. bfloat16). The runtime never
+    /// rewrites a model (bf16 -> f32); that is the exporter's job.
     ///
     /// `DEBUG=1` saves the optimized graph (`<model>.ort`) and a chrome://tracing profile.
     #[new]
     #[pyo3(signature = (onnx_path, tokenizer_path, intra_threads = None))]
     fn new(py: Python<'_>, onnx_path: &str, tokenizer_path: &str, intra_threads: Option<usize>) -> Result<Self> {
-        let profiling: bool = session::debug_artifacts(onnx_path).is_some();
-        // Loading a multi-gigabyte graph takes seconds and touches no Python objects.
-        // (release the GIL so that other threads run while ORT works)
-        let inner: causal_lm::CausalLm =
-            py.allow_threads(|| causal_lm::CausalLm::open(onnx_path, tokenizer_path, intra_threads))?;
+        let profiling = session::debug_artifacts(onnx_path).is_some();
+        // Loading a multi-gigabyte graph takes seconds and touches no Python objects, so we
+        // hand the GIL (Python's one-thread-at-a-time lock) back for the duration and let
+        // other Python threads run while ORT works.
+        let inner = py.allow_threads(|| causal_lm::CausalLm::open(onnx_path, tokenizer_path, intra_threads))?;
         Ok(Self {
             inner,
             ttft_s: 0.0,
@@ -105,7 +110,8 @@ impl CausalLMInferencer {
 
     /// Continue the current turn, or start one from `prompt`, and return `(text, (ttft_s, tps))`.
     ///
-    /// `text` is `None` until an end-of-sequence token arrives
+    /// `text` is `None` until an end-of-sequence token arrives:
+    ///
     /// ```python
     /// while True:
     ///     text, (ttft, tps) = lm.generate(prompt, num_generation=1)
@@ -113,11 +119,10 @@ impl CausalLMInferencer {
     ///         break
     /// ```
     ///
-    /// KV cache, token history and the timings all live across the single generation calls
-    /// - prompt is prefilled once and `ttft_s` keeps reporting that first pass
-    /// - **`prompt` is read only when a turn starts**; (prefill input string)
-    ///
-    /// Once a turn ends, its caches are released and further calls warn and do nothing — call `reset()` to start over.
+    /// The KV cache, the token history and the timings all live across those calls, so
+    /// **`prompt` is read only when a turn starts** — it is prefilled once, and `ttft_s` keeps
+    /// reporting that first pass. Once a turn ends its cache is released and further calls
+    /// warn and do nothing; call `reset()` to start over.
     ///
     /// - `num_generation` — how many new tokens to produce *in this call*.
     /// - `stream_output` — print the text to stdout as it is produced.
@@ -133,12 +138,16 @@ impl CausalLMInferencer {
         num_generation: i32,
         stream_output: bool,
     ) -> Result<(Option<String>, (f64, f64))> {
+        // Python's `int` is signed and unbounded; Rust wants a count. Clamping at zero turns
+        // a negative budget into "generate nothing" rather than a huge unsigned number.
         let budget = num_generation.max(0) as usize;
 
-        // Decoding is compute plus, when streaming, writes to stdout — no Python objects
-        // are touched, so the GIL can go.
+        // Decoding is compute plus, when streaming, writes to stdout — no Python objects are
+        // touched, so the GIL can go here too.
         let step = py.allow_threads(|| self.inner.generate(prompt, budget, stream_output))?;
 
+        // Mirrored onto the object as well as returned, so a caller can ignore the tuple and
+        // read `lm.ttft_s` after the fact.
         self.ttft_s = step.ttft_s;
         self.tps = step.tps;
         Ok((step.text, (step.ttft_s, step.tps)))
@@ -168,10 +177,6 @@ impl CausalLMInferencer {
     /// The ids emitted so far this turn, before detokenization. `generate` returns text
     /// because that is what callers want; this is here for the cases where the exact
     /// tokens matter — comparing two runs, or checking an export against a reference.
-    ///
-    /// Read straight from the turn rather than mirrored into a field on every `generate`,
-    /// so a caller polling with `num_generation = 1` does not copy the whole history once
-    /// per token.
     #[getter]
     fn token_ids(&self) -> Vec<i64> {
         self.inner.token_ids()
@@ -189,6 +194,15 @@ impl CausalLMInferencer {
     #[getter]
     fn eos_tokens(&self) -> Vec<i64> {
         self.inner.eos_tokens().to_vec()
+    }
+
+    /// How many KV cache tensors the graph declared — two per layer, keys and values.
+    ///
+    /// Reported from the cache the runtime actually built, so it is the count that will be
+    /// fed back per token rather than a guess made by matching input names in Python.
+    #[getter]
+    fn num_kv_slots(&self) -> usize {
+        self.inner.kv_slots()
     }
 
     /// The graph's input names, in declaration order.
@@ -250,6 +264,8 @@ impl CausalLMInferencer {
     }
 }
 
+/// `Drop` is Rust's destructor: it runs when the object is freed, which for a `#[pyclass]` is
+/// when Python garbage-collects it.
 impl Drop for CausalLMInferencer {
     fn drop(&mut self) {
         // ORT buffers profiling events in memory and writes the trace only when profiling
@@ -264,6 +280,8 @@ impl Drop for CausalLMInferencer {
     }
 }
 
+/// The module initializer Python calls on `import`. `#[pymodule]` generates the C entry point;
+/// the name of this function is the name of the module, which is why it is `_ortrs_binding`.
 #[pymodule]
 fn _ortrs_binding(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CausalLMInferencer>()?;

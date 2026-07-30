@@ -13,16 +13,17 @@
 //! is handed in and out **once per generated token**. Copy it and the copy, not the
 //! matrix multiplies, sets your tokens/sec.
 //!
-//! So we never copy it. ORT hands out a tensor as a reference-counted handle to a
-//! buffer *it* owns (`DynValue` is an `Arc` around ONNX Runtime's `OrtValue`), which
-//! means:
+//! So we never copy it. ORT hands out a tensor as a *handle* to a buffer it owns: a
+//! [`DynValue`] is a reference count around ONNX Runtime's own `OrtValue`, in the same way
+//! Rust's `Arc<T>` is a reference count around a `T`. Cloning a handle copies a pointer and
+//! bumps a counter; the tensor data never moves. So:
 //!
-//! - feeding the cache **in** is [`ort::value::Value::view`] — clone a handle;
-//! - taking the update **out** is [`ort::session::SessionOutputs::remove`] — clone a handle.
+//! - feeding the cache **in** is a borrowed view of the handle ([`KvCache::bind`]);
+//! - taking the update **out** is `SessionOutputs::remove`, which hands over the handle
+//!   ([`KvCache::take_update`]).
 //!
-//! Neither touches the tensor data. Last step's buffers are freed when the last handle
-//! to them drops, at the end of [`KvCache::take_update`]. Cost per token: a handful of
-//! pointer writes, and zero bytes of `memcpy`.
+//! Last step's buffers are freed when the last handle to them is dropped, at the end of
+//! `take_update`. Cost per token: a handful of pointer writes, and zero bytes of `memcpy`.
 //!
 //! # The graph contract
 //!
@@ -32,11 +33,12 @@
 //! them means this file keeps working if the naming or the layer count changes.
 
 use std::collections::HashSet;
+use std::fmt::Debug;
 
 use anyhow::{bail, Context, Result};
 use ndarray::{ArrayD, IxDyn};
 use ort::session::{Session, SessionInputValue, SessionOutputs};
-use ort::tensor::TensorElementType;
+use ort::tensor::{PrimitiveTensorElementType, TensorElementType};
 use ort::value::{DynValue, Tensor};
 
 use crate::session::tensor_type;
@@ -123,9 +125,10 @@ impl KvCache {
 
     /// Append the cache to a list of session inputs, as borrowed views.
     ///
-    /// The `'a` on both sides is the promise that makes this free: the views borrow
-    /// `self`, so the compiler guarantees the cache outlives the run that reads it, and
-    /// no data has to be copied to make that true.
+    /// The `'a` in the signature is a *lifetime*: it says the views pushed into `inputs`
+    /// borrow from `self`, so Rust will refuse to compile any caller that drops or mutates
+    /// the cache while that list is still alive. That guarantee is what makes this free —
+    /// no data has to be copied to prove the buffers outlive the run that reads them.
     pub fn bind<'a>(&'a self, inputs: &mut Vec<(&'a str, SessionInputValue<'a>)>) {
         for slot in &self.slots {
             inputs.push((slot.input.as_str(), SessionInputValue::from(&slot.value)));
@@ -153,6 +156,9 @@ impl KvCache {
 /// `cached_len = 0` (nothing cached yet); `n_kv_heads` and `head_dim` are fixed by the
 /// architecture, so the graph must state them.
 fn empty_shape(name: &str, declared: &[i64]) -> Result<Vec<usize>> {
+    // Destructuring a slice by pattern: this both checks that `declared` has exactly four
+    // entries and names them. `let ... else` handles the mismatch, which is why the happy
+    // path below has no indexing and no length check of its own.
     let [_batch, n_kv_heads, _cached_len, head_dim] = *declared else {
         bail!(
             "expected cache input `{name}` to be rank 4 [batch, heads, cached_len, head_dim], got shape {declared:?}"
@@ -168,24 +174,32 @@ fn empty_shape(name: &str, declared: &[i64]) -> Result<Vec<usize>> {
 ///
 /// The KV cache dtype follows the model — fp32 after an upcast, f16 or bf16 when the
 /// provider runs those natively — so the empty tensor has to match, or ORT rejects it.
-/// We go through `ndarray` because a shape with a `0` in it is not a valid shape for
-/// ORT's `(shape, data)` constructor, but is perfectly fine for an array.
+/// The element type is only known at runtime (it was read out of the graph), while Rust
+/// needs it at compile time; a `match` is the bridge, with one arm per type we support.
 fn empty_tensor(dtype: TensorElementType, shape: &[usize]) -> Result<DynValue> {
-    // Every arm is the same line at a different type, which is exactly what a macro is
-    // for: `$t` is substituted in, and each expansion is type-checked on its own. The
-    // empty `Vec` is not a shortcut — a shape with a 0 in it holds no elements, so
-    // there is genuinely no data to supply.
-    macro_rules! empty {
-        ($t:ty) => {
-            Ok(Tensor::<$t>::from_array(ArrayD::<$t>::from_shape_vec(IxDyn(shape), Vec::new())?)?.into_dyn())
-        };
-    }
-
     match dtype {
-        TensorElementType::Float32 => empty!(f32),
-        TensorElementType::Float16 => empty!(half::f16),
-        TensorElementType::Bfloat16 => empty!(half::bf16),
-        TensorElementType::Float64 => empty!(f64),
+        TensorElementType::Float32 => zeros::<f32>(shape),
+        TensorElementType::Float16 => zeros::<half::f16>(shape),
+        TensorElementType::Bfloat16 => zeros::<half::bf16>(shape),
+        TensorElementType::Float64 => zeros::<f64>(shape),
         other => bail!("unsupported KV cache element type {other:?}; expected a float type"),
     }
+}
+
+/// An ORT tensor of `shape` holding no elements, with `T` as its element type.
+///
+/// Generic, so `zeros::<f32>(..)` and `zeros::<half::f16>(..)` are two functions the
+/// compiler writes from this one body. The bounds after the colon are what `ort` asks of an
+/// element type: `PrimitiveTensorElementType` is the trait that knows "an `f32` is an ONNX
+/// float32", `Debug` is required because `ort` prints the type in its error messages,
+/// `Clone` because handing an array over to ORT may copy its elements, and `'static` because
+/// ORT keeps the buffer alive on its own side, past the end of this call.
+fn zeros<T: PrimitiveTensorElementType + Debug + Clone + 'static>(shape: &[usize]) -> Result<DynValue> {
+    // An empty `Vec` is not a shortcut: `shape` has a 0 in it (`cached_len`), so the array
+    // genuinely holds no elements. We go through `ndarray` because ORT rejects a 0 in its
+    // `(shape, data)` constructor while an array accepts it happily.
+    let empty = ArrayD::<T>::from_shape_vec(IxDyn(shape), Vec::new())?;
+    // `into_dyn` drops the element type from the Rust type (`Tensor<f32>` -> `DynValue`) so
+    // that slots of different dtypes can sit in one `Vec`. ORT still knows what it is.
+    Ok(Tensor::from_array(empty)?.into_dyn())
 }

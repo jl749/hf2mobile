@@ -87,12 +87,11 @@ def main() -> None:
     logger.info(f"constructing CausalLMInferencer with '{os.path.relpath(onnx_path)}'")
     lm = CausalLMInferencer(str(onnx_path), str(tokenizer_path), intra_threads=args.intra_threads)
 
-    # TODO: better rust api instead of parsing here
-    outputs = set(lm.output_names)
-    kv_slots = sum(1 for name in lm.input_names if f"{name}_out" in outputs)
+    # `num_kv_slots` comes from the cache the runtime actually built, so it is the number of
+    # tensors that will be fed back per token rather than a guess made from the input names.
     logger.info(
         f"loaded {len(lm.input_names)} inputs / {len(lm.output_names)} outputs "
-        f"({kv_slots} KV cache slots) | eos: {lm.eos_tokens or 'none — bounded by --num-generation'}"
+        f"({lm.num_kv_slots} KV cache slots) | eos: {lm.eos_tokens or 'none — bounded by --num-generation'}"
     )
     threads = f"{args.intra_threads} intra-op threads" if args.intra_threads else "one thread per core"
     logger.info(f"generating up to {args.num_generation} tokens on {threads} — streaming to stdout")

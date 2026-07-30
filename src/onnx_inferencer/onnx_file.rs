@@ -3,25 +3,26 @@
 //! # Why the runtime reads the graph at all
 //!
 //! `python -m hf2mobile.postprocess` writes the end-of-sequence ids into the graph as a
-//! floating `Constant` node named `hf2mobile_EOS_tokens` (see `postprocess.py`). That is the
-//! one thing a decode loop needs which is neither an input nor an output: where to stop.
-//! Putting it in the graph means a runtime — this one, or an Android app — reads it from the
-//! same file it already has to open, instead of being handed a json to parse or an argument
-//! nobody remembers to pass.
+//! floating `Constant` node named `hf2mobile_EOS_tokens`. That is the one thing a decode loop
+//! needs which is neither an input nor an output: where to stop. Putting it in the graph means
+//! a runtime — this one, or an Android app — reads it from the file it already has to open,
+//! instead of being handed a json to parse or an argument nobody remembers to pass.
 //!
-//! ONNX Runtime cannot hand it back: the node has no consumers, so graph resolution prunes
-//! it long before a session exists. Hence reading the file directly.
+//! ONNX Runtime cannot hand it back: the node has no consumers, so graph resolution prunes it
+//! long before a session exists. Hence reading the file directly.
 //!
-//! This is not the [`crate::precision`] situation in reverse. Nothing here rewrites or
-//! second-guesses the export; it reads a decision the exporter recorded, once, at load.
+//! # How protobuf makes this easy
 //!
-//! # Why by hand
+//! An `.onnx` file is a protobuf message, which on disk is just a flat sequence of fields.
+//! Each field starts with a *tag* holding two numbers: **which** field it is, and **how** its
+//! value is encoded (a variable-length integer, a fixed 4 or 8 bytes, or a length followed by
+//! that many bytes). Names appear nowhere — `.proto` schemas are a compile-time convenience.
 //!
-//! Protobuf's wire format is a flat sequence of `(field number, wire type)` tags, and every
-//! field can be skipped without understanding it. So a reader that wants exactly one field
-//! needs no schema and no code generation — just the field numbers below, and the ability to
-//! seek past everything else. That last part is the point: an export is gigabytes, and this
-//! walk touches a few hundred bytes of it.
+//! The consequence is that a reader can skip any field it does not care about knowing only its
+//! wire type, and nested messages are themselves just length-delimited fields. So this file
+//! needs no schema and no code generation: the field numbers below, and the ability to seek.
+//! That last part is what matters — an export is gigabytes, and this walk reads a few hundred
+//! bytes of it.
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -29,8 +30,8 @@ use std::io::{BufReader, Read};
 use anyhow::{bail, Context, Result};
 
 // Field numbers from `onnx.proto3`. A protobuf field is identified by number rather than by
-// name, so these are the entire schema as far as this file is concerned. They are part of
-// the ONNX format and so do not change.
+// name, so these are the entire schema as far as this file is concerned. They are part of the
+// ONNX format itself and so do not change.
 const MODEL_GRAPH: u64 = 7; // ModelProto.graph
 const GRAPH_NODE: u64 = 1; // GraphProto.node
 const NODE_NAME: u64 = 3; // NodeProto.name
@@ -47,67 +48,77 @@ const TENSOR_DATA_LOCATION: u64 = 14; // TensorProto.data_location
 const INT32: u64 = 6;
 const INT64: u64 = 7;
 
-// Protobuf wire types. 3 and 4 are the deprecated group encodings, which protobuf 3 never
-// emits, and 6 and 7 do not exist.
-const VARINT: u8 = 0;
-const SIXTY_FOUR_BIT: u8 = 1;
-const LENGTH_DELIMITED: u8 = 2;
-const THIRTY_TWO_BIT: u8 = 5;
+// Wire types: how the bytes after a tag are laid out. (3 and 4 are the deprecated group
+// encodings, which protobuf 3 never emits, and 6 and 7 do not exist.)
+const VARINT: u8 = 0; // a variable-length integer
+const SIXTY_FOUR_BIT: u8 = 1; // exactly 8 bytes
+const LENGTH_DELIMITED: u8 = 2; // a length, then that many bytes: strings, bytes, sub-messages
+const THIRTY_TWO_BIT: u8 = 5; // exactly 4 bytes
 
 /// The op type the ids are expected to be stored in.
 const CONSTANT: &str = "Constant";
 /// The attribute a `Constant` node carries its tensor in.
 const VALUE: &str = "value";
 
-/// Refuse to allocate for a tensor larger than this. An id list is a handful of integers;
-/// anything bigger means the name matched something it should not have, and this is a
-/// buffer sized from a number read out of a file.
+/// Refuse to allocate for anything larger than this. An id list is a handful of integers, and
+/// the length being read here came out of a file, so it needs a ceiling.
 const MAX_TENSOR_BYTES: u64 = 64 * 1024;
 
-/// A region of the file: `[start, end)` byte offsets.
-type Region = (u64, u64);
+/// A stretch of the file: byte offsets `[start, end)`.
+///
+/// Regions are how this file talks about sub-messages without reading them. `Copy` is derived
+/// because two integers are cheaper to copy than to reference.
+#[derive(Clone, Copy)]
+struct Region {
+    start: u64,
+    end: u64,
+}
 
 /// The integers held by the `Constant` node named `node_name`, or `None` if the graph has no
 /// node by that name.
 ///
-/// `Some(vec![])` is a real answer, and distinct from `None`: it is what a `Constant`
-/// carrying an empty tensor says, i.e. "this export names no such ids".
+/// `Some(vec![])` is a real answer, and different from `None`: it is what a `Constant` carrying
+/// an empty tensor says, i.e. "this export names no such ids".
 pub fn int_constant(path: &str, node_name: &str) -> Result<Option<Vec<i64>>> {
     let file = File::open(path).with_context(|| format!("reading `{path}` to look for `{node_name}`"))?;
     let end = file.metadata().context("measuring the model file")?.len();
+    // `BufReader` batches the small reads below into few actual syscalls.
     let mut onnx = Onnx {
         file: BufReader::new(file),
         pos: 0,
         end,
     };
 
+    let whole_file = Region { start: 0, end };
     let graph = onnx
-        .submessage((0, end), MODEL_GRAPH)?
+        .submessage(whole_file, MODEL_GRAPH)?
         .with_context(|| format!("`{path}` holds no ONNX graph"))?;
     onnx.constant(graph, node_name)
         .with_context(|| format!("reading `{node_name}` out of `{path}`"))
 }
 
-/// A seekable walk over the file, tracking where it is.
+/// A walk over the file that remembers where it is.
 ///
-/// The position is carried rather than asked for, so skipping a field is arithmetic plus at
-/// most one `seek`, and reading one is a plain `read_exact`.
+/// The position is tracked here rather than asked of the OS, so skipping a field is arithmetic
+/// plus at most one seek, and reading one is a plain `read_exact`.
 struct Onnx {
     file: BufReader<File>,
     /// Offset of the next byte to be read.
     pos: u64,
-    /// Length of the file. Every region is checked against it, so a corrupt length cannot
-    /// send the walk past the end.
+    /// Length of the file. Every region is checked against it, so a corrupt length cannot send
+    /// the walk past the end.
     end: u64,
 }
 
 impl Onnx {
-    /// The body of the first `field` in `region`, or `None` if it holds no such field.
+    // ── walking the ONNX message ──────────────────────────────────────────────
+
+    /// The body of the first `field` inside `region`, or `None` if it holds no such field.
     ///
-    /// Only length-delimited fields, since that is what a nested message is.
+    /// Length-delimited fields only, since that is what a nested message is.
     fn submessage(&mut self, region: Region, field: u64) -> Result<Option<Region>> {
-        self.goto(region.0)?;
-        while self.pos < region.1 {
+        self.goto(region.start)?;
+        while self.pos < region.end {
             let (number, wire) = self.tag()?;
             if number == field && wire == LENGTH_DELIMITED {
                 return Ok(Some(self.region()?));
@@ -119,8 +130,8 @@ impl Onnx {
 
     /// Scan `graph`'s nodes for the `Constant` named `node_name` and return its integers.
     fn constant(&mut self, graph: Region, node_name: &str) -> Result<Option<Vec<i64>>> {
-        self.goto(graph.0)?;
-        while self.pos < graph.1 {
+        self.goto(graph.start)?;
+        while self.pos < graph.end {
             let (number, wire) = self.tag()?;
             if number != GRAPH_NODE || wire != LENGTH_DELIMITED {
                 self.skip(wire)?;
@@ -130,9 +141,9 @@ impl Onnx {
             if let Some(values) = self.node_constant(node, node_name)? {
                 return Ok(Some(values));
             }
-            // `node_constant` stops as soon as it knows this is not the node, which is
-            // usually a few bytes in, so the rest of the node is skipped rather than read.
-            self.goto(node.1)?;
+            // `node_constant` stops as soon as it knows this is not the node — usually a few
+            // bytes in — so the rest of the node is skipped rather than read.
+            self.goto(node.end)?;
         }
         Ok(None)
     }
@@ -140,29 +151,31 @@ impl Onnx {
     /// The integers in `node`, if `node` is the `Constant` called `node_name`.
     ///
     /// `None` means "some other node" and is not a problem. Once the name matches, though,
-    /// anything unexpected about the node *is* an error: the graph says it holds these ids,
-    /// so failing to read them is not something to paper over with a default.
+    /// anything unexpected about the node *is* an error: the graph says it holds these ids, so
+    /// failing to read them is not something to paper over with a default.
     fn node_constant(&mut self, node: Region, node_name: &str) -> Result<Option<Vec<i64>>> {
-        self.goto(node.0)?;
+        self.goto(node.start)?;
         let mut op_type = None;
         let mut attributes: Vec<Region> = Vec::new();
 
-        while self.pos < node.1 {
+        while self.pos < node.end {
             let (number, wire) = self.tag()?;
             match (number, wire) {
                 (NODE_NAME, LENGTH_DELIMITED) => {
-                    // Fields are serialized in field-number order, so the name arrives
-                    // before the attributes — which is what keeps this walk off the weights
-                    // of every other `Constant` in the graph.
+                    // Fields are written in field-number order, so the name (3) arrives before
+                    // the attributes (5). That ordering is what keeps this walk off the
+                    // weights of every other `Constant` in the graph.
                     if self.text()? != node_name {
                         return Ok(None);
                     }
                 }
                 (NODE_OP_TYPE, LENGTH_DELIMITED) => op_type = Some(self.text()?),
                 (NODE_ATTRIBUTE, LENGTH_DELIMITED) => {
+                    // Noted down as offsets and revisited below, rather than read now: at this
+                    // point we may not know yet whether this is even the right node.
                     let attribute = self.region()?;
                     attributes.push(attribute);
-                    self.goto(attribute.1)?;
+                    self.goto(attribute.end)?;
                 }
                 _ => self.skip(wire)?,
             }
@@ -184,37 +197,38 @@ impl Onnx {
 
     /// The tensor in `attribute`, if `attribute` is the one called `name`.
     fn tensor_attribute(&mut self, attribute: Region, name: &str) -> Result<Option<Region>> {
-        self.goto(attribute.0)?;
+        self.goto(attribute.start)?;
         let mut matched = false;
         let mut tensor = None;
 
-        while self.pos < attribute.1 {
+        while self.pos < attribute.end {
             let (number, wire) = self.tag()?;
             match (number, wire) {
                 (ATTR_NAME, LENGTH_DELIMITED) => matched = self.text()? == name,
                 (ATTR_TENSOR, LENGTH_DELIMITED) => {
                     let region = self.region()?;
                     tensor = Some(region);
-                    self.goto(region.1)?;
+                    self.goto(region.end)?;
                 }
                 _ => self.skip(wire)?,
             }
         }
+        // `filter` throws the region away unless the name matched, whichever order they came in.
         Ok(tensor.filter(|_| matched))
     }
 
     /// The integers held by a `TensorProto`, widened to `i64`.
     ///
-    /// int32 and int64 only: those are what an id list is written as, and a float tensor
-    /// here would mean the graph is saying something other than what we came to read.
+    /// int32 and int64 only: those are what an id list is written as, and a float tensor here
+    /// would mean the graph is saying something other than what we came to read.
     fn int_tensor(&mut self, tensor: Region) -> Result<Vec<i64>> {
-        self.goto(tensor.0)?;
+        self.goto(tensor.start)?;
         let mut data_type = None;
-        let mut raw: Option<Region> = None;
-        let mut packed: Option<Region> = None;
+        let mut raw = None;
+        let mut packed = None;
         let mut external = false;
 
-        while self.pos < tensor.1 {
+        while self.pos < tensor.end {
             let (number, wire) = self.tag()?;
             match (number, wire) {
                 (TENSOR_DATA_TYPE, VARINT) => data_type = Some(self.varint()?),
@@ -222,12 +236,12 @@ impl Onnx {
                 (TENSOR_RAW_DATA, LENGTH_DELIMITED) => {
                     let region = self.region()?;
                     raw = Some(region);
-                    self.goto(region.1)?;
+                    self.goto(region.end)?;
                 }
                 (TENSOR_INT32_DATA, LENGTH_DELIMITED) => {
                     let region = self.region()?;
                     packed = Some(region);
-                    self.goto(region.1)?;
+                    self.goto(region.end)?;
                 }
                 _ => self.skip(wire)?,
             }
@@ -245,9 +259,9 @@ impl Onnx {
             ),
         };
 
-        // `onnx.numpy_helper.from_array` writes an array of any size to `raw_data`, so that
-        // is the case that happens; `int32_data` is here because a graph built by hand can
-        // legitimately use it instead.
+        // `raw_data` is the case that happens, because that is what
+        // `onnx.numpy_helper.from_array` writes. `int32_data` is handled too, because a graph
+        // built by hand with `onnx.helper.make_tensor` legitimately uses it instead.
         if let Some(region) = raw {
             let bytes = self.bytes(region)?;
             if bytes.len() % width != 0 {
@@ -256,33 +270,35 @@ impl Onnx {
                     bytes.len()
                 );
             }
+            // `chunks_exact` hands out non-overlapping windows of exactly `width` bytes.
             return Ok(bytes.chunks_exact(width).map(little_endian).collect());
         }
         if let Some(region) = packed {
-            self.goto(region.0)?;
+            self.goto(region.start)?;
             let mut values = Vec::new();
-            while self.pos < region.1 {
-                // An int32 is varint-encoded sign-extended to 64 bits, so this is the right
-                // reinterpretation at either width.
+            while self.pos < region.end {
+                // A negative int32 is varint-encoded as its 64-bit sign extension, so reading
+                // it as a 64-bit value and reinterpreting is correct at either width.
                 values.push(self.varint()? as i64);
             }
             return Ok(values);
         }
-        // A tensor with no data at all: an empty id list, which the exporter writes when the
+        // A tensor with no data at all: an empty id list, which postprocess writes when the
         // model names no stop token.
         Ok(Vec::new())
     }
 
     // ── the protobuf wire format ──────────────────────────────────────────────
 
-    /// Field number and wire type of the next field.
+    /// Field number and wire type of the next field, from one varint: the low three bits are
+    /// the wire type, everything above them is the field number.
     fn tag(&mut self) -> Result<(u64, u8)> {
         let key = self.varint()?;
         Ok((key >> 3, (key & 0b111) as u8))
     }
 
-    /// A base-128 varint: seven bits of payload per byte, low group first, top bit set on
-    /// every byte but the last.
+    /// A base-128 varint: seven bits of the number per byte, lowest bits first, and the top bit
+    /// of each byte set on every byte except the last.
     fn varint(&mut self) -> Result<u64> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
@@ -295,35 +311,39 @@ impl Onnx {
         bail!("a varint runs past ten bytes, so this is not an ONNX file")
     }
 
-    /// The region a length-delimited field's body occupies, leaving the position at its
-    /// start. Bounded by the file length, so a nonsense length is caught here rather than
-    /// turning into a wild read.
+    /// The region a length-delimited field's body occupies, leaving the position at its start.
+    /// Bounded by the file length, so a nonsense length is caught here rather than turning into
+    /// a wild read.
     fn region(&mut self) -> Result<Region> {
         let len = self.varint()?;
         let start = self.pos;
+        // `checked_add` returns `None` instead of wrapping around on overflow, and `filter`
+        // then also rejects any end past the file — either way `with_context` turns the `None`
+        // into the error below.
         let end = start
             .checked_add(len)
             .filter(|&end| end <= self.end)
             .with_context(|| format!("a field at offset {start} claims {len} bytes, past the end of the file"))?;
-        Ok((start, end))
+        Ok(Region { start, end })
     }
 
-    /// The current length-delimited field as a `String`.
+    /// The current length-delimited field, as a `String`.
     fn text(&mut self) -> Result<String> {
         let region = self.region()?;
         let bytes = self.bytes(region)?;
         String::from_utf8(bytes).context("a name in the graph is not valid UTF-8")
     }
 
+    /// Read `region` into memory. The only place this file allocates from a length it read.
     fn bytes(&mut self, region: Region) -> Result<Vec<u8>> {
-        let len = region.1 - region.0;
+        let len = region.end - region.start;
         if len > MAX_TENSOR_BYTES {
             bail!("a field of {len} bytes is far larger than the id list this reader expects");
         }
-        self.goto(region.0)?;
+        self.goto(region.start)?;
         let mut bytes = vec![0u8; len as usize];
         self.file.read_exact(&mut bytes).context("unexpected end of file")?;
-        self.pos = region.1;
+        self.pos = region.end;
         Ok(bytes)
     }
 
@@ -344,19 +364,21 @@ impl Onnx {
             THIRTY_TWO_BIT => self.goto(self.pos + 4)?,
             LENGTH_DELIMITED => {
                 let region = self.region()?;
-                self.goto(region.1)?;
+                self.goto(region.end)?;
             }
             other => bail!("wire type {other} does not appear in an ONNX file"),
         }
         Ok(())
     }
 
+    /// Move to an absolute offset.
     fn goto(&mut self, pos: u64) -> Result<()> {
         if pos == self.pos {
             return Ok(());
         }
-        // `seek_relative` keeps `BufReader`'s buffer when the target is still inside it,
-        // which is the common case here: the fields this walk skips are short.
+        // Relative rather than absolute seeking, because `BufReader::seek_relative` keeps the
+        // bytes it has already buffered when the target is still among them — which is the
+        // common case here, as the fields this walk skips are short.
         self.file
             .seek_relative(pos as i64 - self.pos as i64)
             .with_context(|| format!("seeking to offset {pos}"))?;
@@ -367,8 +389,9 @@ impl Onnx {
 
 /// One little-endian integer, at whichever of the two widths `chunk` is.
 ///
-/// `chunks_exact` guarantees the length, which is what makes the conversions below
-/// infallible.
+/// `try_into` converts the slice to a fixed-size array, which is what `from_le_bytes` needs.
+/// It cannot fail here — `chunks_exact` guarantees the length — and `expect` is how that
+/// reasoning is written down.
 fn little_endian(chunk: &[u8]) -> i64 {
     match chunk.len() {
         4 => i64::from(i32::from_le_bytes(chunk.try_into().expect("four bytes"))),
@@ -380,8 +403,9 @@ fn little_endian(chunk: &[u8]) -> i64 {
 mod tests {
     use super::*;
 
-    /// The encoder side of the format, so the tests can build a graph to read back. Only
-    /// the two wire types an ONNX message needs.
+    // The encoder side of the format, so the tests can build a graph and read it back. Only
+    // the two wire types an ONNX message needs.
+
     fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
@@ -408,8 +432,7 @@ mod tests {
         field(number, LENGTH_DELIMITED, value.as_bytes())
     }
 
-    /// A `ModelProto` holding one `Constant` node per `(name, ids)`, plus a decoy node with
-    /// a tensor big enough that reading it would be a bug.
+    /// A `ModelProto` holding one `Constant` node per `(name, ids)` pair.
     fn model(nodes: &[(&str, &[i32])]) -> Vec<u8> {
         let mut graph = Vec::new();
         for (name, ids) in nodes {
@@ -444,21 +467,23 @@ mod tests {
         path
     }
 
+    fn read(bytes: &[u8], node_name: &str) -> Result<Option<Vec<i64>>> {
+        int_constant(write(bytes).to_str().expect("utf-8 temp path"), node_name)
+    }
+
     #[test]
     fn reads_the_ids_out_of_a_named_constant() {
-        let path = write(&model(&[("hf2mobile_EOS_tokens", &[1, 106])]));
-        let ids = int_constant(path.to_str().unwrap(), "hf2mobile_EOS_tokens").unwrap();
-        assert_eq!(ids, Some(vec![1, 106]));
+        let file = model(&[("hf2mobile_EOS_tokens", &[1, 106])]);
+        assert_eq!(read(&file, "hf2mobile_EOS_tokens").unwrap(), Some(vec![1, 106]));
     }
 
     #[test]
     fn finds_a_constant_that_is_not_the_first_node() {
         // The decoy's tensor is deliberately bigger than `MAX_TENSOR_BYTES`, so a walk that
         // read it instead of skipping it would fail rather than quietly cost time.
-        let path = write(&model(&[("other", &[7; 32768]), ("hf2mobile_EOS_tokens", &[151645])]));
-        let ids = int_constant(path.to_str().unwrap(), "hf2mobile_EOS_tokens").unwrap();
+        let file = model(&[("other", &[7; 32768]), ("hf2mobile_EOS_tokens", &[151645])]);
         assert_eq!(
-            ids,
+            read(&file, "hf2mobile_EOS_tokens").unwrap(),
             Some(vec![151645]),
             "a large earlier node must be skipped, not read"
         );
@@ -466,10 +491,9 @@ mod tests {
 
     #[test]
     fn an_empty_tensor_is_an_empty_list_not_a_missing_node() {
-        let path = write(&model(&[("hf2mobile_EOS_tokens", &[])]));
-        let ids = int_constant(path.to_str().unwrap(), "hf2mobile_EOS_tokens").unwrap();
+        let file = model(&[("hf2mobile_EOS_tokens", &[])]);
         assert_eq!(
-            ids,
+            read(&file, "hf2mobile_EOS_tokens").unwrap(),
             Some(vec![]),
             "the export names no stop token, which is not the same as no node"
         );
@@ -477,16 +501,14 @@ mod tests {
 
     #[test]
     fn a_missing_node_is_none() {
-        let path = write(&model(&[("something_else", &[1])]));
-        let ids = int_constant(path.to_str().unwrap(), "hf2mobile_EOS_tokens").unwrap();
-        assert_eq!(ids, None);
+        let file = model(&[("something_else", &[1])]);
+        assert_eq!(read(&file, "hf2mobile_EOS_tokens").unwrap(), None);
     }
 
     #[test]
     fn truncated_and_absent_files_fail_rather_than_guess() {
-        let full = model(&[("hf2mobile_EOS_tokens", &[1, 106])]);
-        let path = write(&full[..full.len() - 3]);
-        assert!(int_constant(path.to_str().unwrap(), "hf2mobile_EOS_tokens").is_err());
+        let file = model(&[("hf2mobile_EOS_tokens", &[1, 106])]);
+        assert!(read(&file[..file.len() - 3], "hf2mobile_EOS_tokens").is_err());
         assert!(int_constant("/nonexistent/model.onnx", "hf2mobile_EOS_tokens").is_err());
     }
 }

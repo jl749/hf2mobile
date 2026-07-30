@@ -1,8 +1,8 @@
 //! Opening an ONNX Runtime session, and reading what a graph declares.
 //!
-//! Deliberately a couple of free functions over `ort::Session` rather than a wrapper
-//! struct. A wrapper would only forward calls, and forwarding code is code that drifts
-//! out of sync with the library it forwards to.
+//! Deliberately a few free functions over `ort::Session` rather than a wrapper struct. A
+//! wrapper would only forward calls, and forwarding code is code that drifts out of sync with
+//! the library it forwards to.
 
 use std::path::Path;
 
@@ -19,27 +19,28 @@ use crate::sample_logits::{SampleLogits, DOMAIN};
 
 /// Load `path` and get it ready to run.
 ///
-/// `intra_threads` caps the threads ORT uses *inside* a single operator (the big
-/// MatMuls). `None` lets ORT decide, which is one thread per physical core — usually
-/// what you want, unless something else on the machine also needs the cores.
+/// `intra_threads` caps the threads ORT uses *inside* a single operator (the big MatMuls).
+/// `None` lets ORT decide, which is one thread per physical core — usually what you want,
+/// unless something else on the machine also needs the cores.
 ///
-/// Set `DEBUG=1` in the environment to also write the optimized graph and a profiling
-/// trace to the current directory — see [`debug_artifacts`].
+/// Set `DEBUG=1` in the environment to also write the optimized graph and a profiling trace to
+/// the current directory — see [`debug_artifacts`].
 pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
+    // A builder: each call configures one thing and hands the builder back, so they chain.
+    // Each returns a `Result`, hence the `?` after every step.
     let mut builder = Session::builder()?
-        // `inference.onnx` ends in a `com.hf2mobile:SampleLogits` node, which ORT cannot
-        // resolve a kernel for unless we hand it one. Registered in-process from the same
-        // source the `libhf2mobile_plugins.so` build uses, rather than by dlopening that
-        // `.so`: the graph then runs with nothing to configure and no second artifact to
-        // keep in step. (A runtime that is not this one — an Android app — loads the `.so`.)
+        // `inference.onnx` ends in a `com.hf2mobile:SampleLogits` node, and ORT cannot resolve
+        // a kernel for it unless we hand it one. Registered in-process from the same source
+        // that builds `libhf2mobile_plugins.so`, rather than by loading that `.so`: the graph
+        // then runs with nothing to configure and no second artifact to keep in step. (A
+        // runtime that is not this one — an Android app — loads the `.so`.)
         .with_operators(OperatorDomain::new(DOMAIN)?.add(SampleLogits::<f32>::new())?)?
-        // Level3 turns on every graph rewrite ORT has, including layout changes that
-        // are specific to the current CPU. Costs a moment at load, pays it back on the
-        // first token.
+        // Level3 turns on every graph rewrite ORT has, including layout changes that are
+        // specific to the current CPU. Costs a moment at load, pays it back on the first token.
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        // The CPU provider is the only one always compiled into onnxruntime. ORT walks
-        // this list in order and hands each node to the first provider that claims it,
-        // so adding an accelerator later means inserting it *before* CPU here.
+        // The CPU provider is the only one always compiled into onnxruntime. ORT walks this
+        // list in order and hands each node to the first provider that claims it, so adding an
+        // accelerator later means inserting it *before* CPU here.
         .with_execution_providers([CPUExecutionProvider::default().build()])?;
 
     if let Some(n) = intra_threads {
@@ -48,13 +49,13 @@ pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
 
     if let Some(artifacts) = debug_artifacts(path) {
         // `.ort` is ONNX Runtime's own serialized format: the graph *after* Level3
-        // optimization, ready to mmap. Comparing it against the input `.onnx` is how you
-        // see which fusions actually fired.
+        // optimization, ready to mmap. Comparing it against the input `.onnx` is how you see
+        // which fusions actually fired.
         builder = builder
             .with_optimized_model_path(&artifacts.optimized_model)?
             .with_config_entry("session.save_model_format", "ORT")?
-            // ORT appends a timestamp and `.json` to this prefix, and writes nothing
-            // until `Session::end_profiling` is called — see `CausalLMInferencer`'s `Drop`.
+            // ORT appends a timestamp and `.json` to this prefix, and writes nothing until
+            // `Session::end_profiling` is called — see `CausalLMInferencer`'s `Drop`.
             .with_profiling(&artifacts.profile_prefix)?;
         eprintln!(
             "[hf2mobile] DEBUG=1: writing `{}` and a chrome trace `{}*.json`",
@@ -63,19 +64,20 @@ pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
     }
 
     // ORT reports a missing kernel as "Could not find an implementation for <node>", which
-    // names the symptom but not the cause. On the CPU provider the cause is nearly always
-    // a dtype it has no kernels for, so say that here rather than leaving the reader to
-    // work it out.
+    // names the symptom but not the cause. On the CPU provider the cause is nearly always a
+    // dtype it has no kernels for, so say that here rather than leaving the reader to work it
+    // out. (A `SampleLogits` node in the wrong domain lands here too — the message then names
+    // the node, which is enough of a clue.)
     builder
         .commit_from_file(path)
         .with_context(|| format!("ONNXRuntime could not load `{path}`.\n\n{REEXPORT_ADVICE}"))
 }
 
-/// Where the `DEBUG=1` dumps go, or `None` when debugging is off.
+/// Where the `DEBUG=1` dumps go.
 ///
-/// Both land in the current directory (not next to the model, which may be read-only or
-/// on a shared path) and are named after the model file, so two models profiled in one
-/// session do not overwrite each other.
+/// Both land in the current directory (not next to the model, which may be read-only or on a
+/// shared path) and are named after the model file, so two models profiled in one session do
+/// not overwrite each other.
 pub struct DebugArtifacts {
     /// The Level3-optimized graph, in ORT's own format.
     pub optimized_model: String,
@@ -83,28 +85,29 @@ pub struct DebugArtifacts {
     pub profile_prefix: String,
 }
 
+/// The `DEBUG=1` artifact paths for `model_path`, or `None` when debugging is off.
 pub fn debug_artifacts(model_path: &str) -> Option<DebugArtifacts> {
-    match std::env::var("DEBUG").as_deref() {
-        Ok("1") => {
-            let stem: &str = Path::new(model_path) // &Path
-                .file_stem() // Option<&OsStr>
-                .and_then(|s| s.to_str()) // Option<&str>
-                .unwrap_or("model");
-            Some(DebugArtifacts {
-                optimized_model: format!("{stem}.ort"),
-                profile_prefix: format!("{stem}_profile_"),
-            })
-        }
-        Ok(_) => None,
-        Err(_) => None,
+    if std::env::var("DEBUG").as_deref() != Ok("1") {
+        return None;
     }
+    // `file_stem` is the filename without its extension, and both steps that reach it can
+    // fail (no filename; not valid UTF-8), so `unwrap_or` supplies a name rather than giving
+    // up on a debug dump over something this minor.
+    let stem = Path::new(model_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    Some(DebugArtifacts {
+        optimized_model: format!("{stem}.ort"),
+        profile_prefix: format!("{stem}_profile_"),
+    })
 }
 
 /// The declared shape and element type of one graph input/output.
 ///
-/// Dimensions the graph leaves symbolic — batch, sequence length, cached length — come
-/// back as `-1`, because their real value is only known once you feed the graph.
-/// Returns `None` for the (unused here) non-tensor value kinds: sequences and maps.
+/// Dimensions the graph leaves symbolic — batch, sequence length, cached length — come back as
+/// `-1`, because their real value is only known once you feed the graph. Returns `None` for the
+/// (unused here) non-tensor value kinds: sequences and maps.
 pub fn tensor_type(ty: &ValueType) -> Option<(&[i64], TensorElementType)> {
     match ty {
         ValueType::Tensor { ty, shape, .. } => Some((shape, *ty)),
@@ -135,8 +138,10 @@ pub fn numpy_dtype_name(ty: TensorElementType) -> &'static str {
         TensorElementType::Uint8 => "uint8",
         TensorElementType::Bool => "bool",
         TensorElementType::String => "str",
-        // Types numpy has no name for (4-bit ints, complex, undefined). They never
-        // appear in the exports we run, and a wrong guess would be worse than a label.
+        // Types numpy has no name for (4-bit ints, complex, undefined). They never appear in
+        // the exports we run, and a wrong guess would be worse than a label. `debug_assert`
+        // fires in a debug build only, so a test would catch it while a release build carries
+        // on with the label.
         other => {
             debug_assert!(false, "no numpy name for {other:?}");
             UNKNOWN_DTYPE
