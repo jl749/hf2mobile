@@ -14,7 +14,7 @@ publish = false
 [workspace]
 
 # `cdylib` is the artifact onnxruntime loads. `rlib` is there so `cargo test` can build the
-# crate as a library — that is what runs `sampling.rs`'s unit tests.
+# crate as a library — that is what runs `sample_logits.rs`'s unit tests.
 [lib]
 name       = "hf2mobile_plugins"
 crate-type = ["cdylib", "rlib"]
@@ -27,7 +27,7 @@ path       = "lib.rs"
 # gets a kernel too.
 ort  = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "alternative-backend", "half"] }
 half = "2"
-# Used by the shared `sampling.rs` for temperature/top-k/top-p; greedy never touches it.
+# Used by `sample_logits.rs` for the temperature/top-k/top-p draw; greedy never touches it.
 rand = "0.9"
 
 [profile.release]

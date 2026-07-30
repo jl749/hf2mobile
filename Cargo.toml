@@ -23,8 +23,8 @@ half    = "2"
 # messages accumulate context instead of being re-wrapped by hand; pyo3's `anyhow`
 # feature turns that error into a Python exception at the boundary, for free.
 anyhow  = "1"
-# Used by `sampling.rs` inside the `SampleLogits` kernel this crate registers, for the
-# temperature/top-k/top-p draw; a graph baked greedy never touches it.
+# Used by the `SampleLogits` kernel this crate registers (`src/onnx_plugins/sample_logits.rs`)
+# for the temperature/top-k/top-p draw; a graph baked greedy never touches it.
 rand    = "0.9"
 pyo3    = { version = "0.22", features = ["extension-module", "abi3-py312", "anyhow"] }
 numpy   = { version = "0.22", features = ["half"] }

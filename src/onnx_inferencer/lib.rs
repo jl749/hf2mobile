@@ -26,8 +26,7 @@
 //! | [`precision`]     | no      | reject a dtype this machine cannot execute |
 //! | [`kv_cache`]      | no      | carry key/value tensors between decode steps, without copying |
 //! | [`onnx_file`]     | no      | read the stop-token ids out of the `.onnx` protobuf |
-//! | [`sample_logits`] | no      | the `SampleLogits` kernel, shared with `src/onnx_plugins` |
-//! | [`sampling`]      | no      | turn a row of logits into a token, inside that kernel |
+//! | [`sample_logits`] | no      | the `SampleLogits` operator — the file `src/onnx_plugins` owns |
 //! | [`causal_lm`]     | no      | tokenize, prefill, decode, time |
 //!
 //! # Errors
@@ -47,15 +46,13 @@ mod kv_cache;
 mod numpy;
 mod onnx_file;
 mod precision;
-mod sampling;
 mod session;
 
-// The `SampleLogits` kernel, compiled straight out of the plugin crate rather than
-// reimplemented: `src/onnx_plugins` builds this same file into the `.so` a mobile runtime
-// loads, so the token this runtime picks and the token that runtime picks come from one
-// definition. (The sharing goes both ways — the plugin crate reads [`sampling`] out of this
-// directory the same way. Neither crate depends on the other; `#[path]` only tells `cargo`
-// where a file lives.)
+// The `SampleLogits` operator and the sampling policy inside it, compiled straight out of the
+// plugin crate rather than reimplemented: `src/onnx_plugins` builds this same file into the
+// `.so` a mobile runtime loads, so the token this runtime picks and the token that runtime
+// picks come from one definition. The two crates do not depend on each other in any way —
+// `#[path]` only tells `cargo` where a source file lives.
 #[path = "../onnx_plugins/sample_logits.rs"]
 mod sample_logits;
 

@@ -39,14 +39,10 @@ use ort::AsPointer;
 
 use crate::sample_logits::{SampleLogits, DOMAIN};
 
+// The operator, and the sampling policy inside it. `src/onnx_inferencer` compiles this same
+// file into its own binary, so the token a mobile runtime picks and the token the dev runtime
+// picks come from one definition.
 mod sample_logits;
-
-// The sampling policy itself is shared with the Rust runtime rather than reimplemented:
-// same file, one definition of what top-k/top-p/temperature mean, so the plugin and
-// `hf2mobile.quantize` cannot drift into picking tokens differently. Outside this package
-// directory, which `cargo build` is fine with (this crate is never published).
-#[path = "../onnx_inferencer/sampling.rs"]
-mod sampling;
 
 /// The ONNX Runtime C API version this was built against — `ort` rc.10 targets onnxruntime
 /// 1.22, i.e. API version 22.
