@@ -10,7 +10,14 @@ import onnx
 import torch
 import transformers
 
-from hf2mobile.constant import INPUT_KWARGS_TYPE, KV_CACHE_PARAM_NAME, SUPPORTED_TARGETS
+from hf2mobile.constant import (
+    GENERATION_CONFIG_FILE,
+    INPUT_KWARGS_TYPE,
+    KV_CACHE_PARAM_NAME,
+    SUPPORTED_TARGETS,
+    TOKENIZER_CONFIG_FILE,
+    TOKENIZER_FILE,
+)
 from hf2mobile.exporter.onnx.postprocess.sliding_window import attach_sliding_window_mask_onnx
 from hf2mobile.tracing import (
     HookRegisterInterface,
@@ -169,6 +176,33 @@ class CausalLMExporter(
             raise RuntimeError(f"`CausalLMExporter.export(...)` has not assigned `self.target`.")
 
     # ================ CausalLMExporter METHODS  ================ #
+    def save_tokenizer_config(self) -> List[str]:
+        saved: List[str] = []
+
+        repo_id = self.model.config._name_or_path
+        tokenizer = transformers.AutoTokenizer.from_pretrained(repo_id, use_fast=True)
+        saved += [os.path.basename(path) for path in tokenizer.save_pretrained(".")]
+        assert TOKENIZER_FILE in saved, f"`tokenizer.json` not saved. ({repo_id=})"
+
+        try:
+            self.model.generation_config.save_pretrained(".")
+            saved.append(GENERATION_CONFIG_FILE)
+            eos = self.model.generation_config.eos_token_id
+        except Exception as e:
+            logger.warning(f"  could not save {GENERATION_CONFIG_FILE}: {e}")
+            eos = tokenizer.eos_token_id
+        finally:
+            if eos is not None:
+                eos_token_ids = [int(i) for i in (eos if isinstance(eos, (list, tuple)) else [eos])]
+            else:
+                raise ValueError(f"No EOS tokens found under {TOKENIZER_CONFIG_FILE}, {GENERATION_CONFIG_FILE}")
+
+        if eos_token_ids:
+            logger.info(f"  🏁 extracted EOS tokens: {eos_token_ids} 🏁 ")
+
+        logger.info(f"  saved runtime configs: {sorted(set(saved))}")
+        return saved
+
     def export(
         self,
         target: str,
@@ -185,6 +219,8 @@ class CausalLMExporter(
             )
             os.makedirs(work_dir, exist_ok=True)
             os.chdir(work_dir)
+
+            self.save_tokenizer_config()
 
             self.target = target.upper()
             assert (

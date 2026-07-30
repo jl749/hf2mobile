@@ -21,6 +21,9 @@ DEBUG_CONFIG = {
 
 # exporter/causallm.py
 SUPPORTED_TARGETS = ["ORT", "QNN"]
+TOKENIZER_FILE = "tokenizer.json"
+TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+GENERATION_CONFIG_FILE = "generation_config.json"
 
 # tracing/register.py
 CUSTOM_LIB_NAME = "hf_module2plugin"

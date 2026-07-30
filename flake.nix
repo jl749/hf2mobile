@@ -18,7 +18,7 @@
 
     # Upstream rust dist tarballs instead of nixpkgs' rustc/cargo: the latter drag in rustc-bootstrap + llvm-lib (~590MB extra download).
     rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
-      extensions = [ "rustfmt" "rust-analyzer" ];
+      extensions = [ "rustfmt" "rust-analyzer" "rust-src" ];
     };
 
     envVars = {
