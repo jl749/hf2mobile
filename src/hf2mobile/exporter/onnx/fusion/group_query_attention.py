@@ -89,6 +89,7 @@ def _gqa_rule(
     shared: Dict[str, ir.Value],
     head_dim: int,
     qknorm_after_transpose: bool = False,
+    qknorm_in_f32: bool = True,
     with_mask: bool = False,
 ) -> pattern.RewriteRule:
     """
@@ -97,6 +98,10 @@ def _gqa_rule(
     `qknorm_after_transpose` selects where the (optional) per-head QK norm sits in the traced graph:
       * False (Qwen3):  `Reshape(4d) -> [RMSNorm] -> Transpose -> RotaryEmbedding`
       * True  (Gemma3): `Reshape(4d) -> Transpose -> [RMSNorm] -> RotaryEmbedding`
+
+    `qknorm_in_f32` only applicable if `qknorm_after_transpose=True`
+      * True (Gemma3:f32):   `Reshape(4d) -> Transpose -> [RMSNorm] -> RotaryEmbedding`
+      * False (Gemma3:bf16): `Reshape(4d) -> Transpose -> Cast(f32) -> [RMSNorm] -> Cast(bf16) -> RotaryEmbedding`
     """
     num_heads, num_kv_heads = hf_config.num_attention_heads, hf_config.num_key_value_heads
     sliding_window = getattr(hf_config, "sliding_window", None)
@@ -183,6 +188,15 @@ def _gqa_rule(
 
     if qknorm_after_transpose:
 
+        def _pat_qk_norm(op: pattern.OpsetPatternBuilder, val_in: pattern.Var, scale: pattern.Var, tag: str):
+            """{Q|K} -> Transpose -> [Cast(fp32) ->] RMSNorm(fp32 scale) [-> Cast(act)]"""
+            val_t = op.Transpose(val_in, perm=[0, 2, 1, 3])
+            if qknorm_in_f32:
+                return op.RMSNormalization(val_t, scale, _outputs=[f"{tag}_normed"])
+            val_f32 = op.Cast(val_t, to=onnx.TensorProto.FLOAT)
+            normed_f32 = op.RMSNormalization(val_f32, scale, _outputs=[f"{tag}_normed"])
+            return op.Cast(normed_f32, _outputs=[f"{tag}_cast"])
+
         def _pat_base(
             op: pattern.OpsetPatternBuilder,
             q_in: pattern.Var,
@@ -198,18 +212,10 @@ def _gqa_rule(
             past_value: pattern.Var,
             attn_mask: pattern.Var | None = None,
         ):
-            # {Q} -> Transpose -> Cast(fp32) -> RMSNorm(fp32 scale) -> Cast(act) -> RotaryEmbedding -> {Q}
-            q_t = op.Transpose(q_in, perm=[0, 2, 1, 3])
-            q_f32 = op.Cast(q_t, to=onnx.TensorProto.FLOAT)
-            q_normed_f32 = op.RMSNormalization(q_f32, q_norm_scale, _outputs=["q_normed"])
-            q_normed = op.Cast(q_normed_f32, _outputs=["q_cast"])
-            q_rope = op.RotaryEmbedding(q_normed, cos, sin)
-            # {K} -> Transpose -> Cast(fp32) -> RMSNorm(fp32 scale) -> Cast(act) -> RotaryEmbedding -> Concat -> {new_K}
-            k_t = op.Transpose(k_in, perm=[0, 2, 1, 3])
-            k_f32 = op.Cast(k_t, to=onnx.TensorProto.FLOAT)
-            k_normed_f32 = op.RMSNormalization(k_f32, k_norm_scale, _outputs=["k_normed"])
-            k_normed = op.Cast(k_normed_f32, _outputs=["k_cast"])
-            k_rope = op.RotaryEmbedding(k_normed, cos, sin)
+            # {Q} -> ..QK norm.. -> RotaryEmbedding -> {Q}
+            q_rope = op.RotaryEmbedding(_pat_qk_norm(op, q_in, q_norm_scale, "q"), cos, sin)
+            # {K} -> ..QK norm.. -> RotaryEmbedding -> Concat -> {new_K}
+            k_rope = op.RotaryEmbedding(_pat_qk_norm(op, k_in, k_norm_scale, "k"), cos, sin)
             return _pat_tail(op, q_rope, k_rope, v_in, v_shape, o_shape, past_key, past_value, attn_mask)
 
         if with_mask:
@@ -274,23 +280,25 @@ def _gqa_rule(
             k_norm_scale: ir.Value,
             q_normed: ir.Value,
             k_normed: ir.Value,
-            q_cast: ir.Value,
             cos: ir.Value,
             sin: ir.Value,
             past_key: ir.Value,
             past_value: ir.Value,
             attn_out: ir.Value,
-            **_,
+            **bound,
         ):
-            # activation dtype = the `to` of the matched cast-back (bf16/fp16)
-            act_dtype = q_cast.producer().attributes["to"].as_int()
+            # cast back `to` attribute either bf16 or f16 (None if not exist)
+            act_dtype = None if qknorm_in_f32 else bound["q_cast"].producer().attributes["to"].as_int()
 
             def _norm_to_3d(val_4d: ir.Value, scale: ir.Value, normed: ir.Value, flat_shape: ir.Value) -> ir.Value:
                 """Re-emit the fp32 per-head norm on the pre-transpose (N, L, H, E`) tensor, flatten to 3d."""
                 norm_attrs = {name: attr.value for name, attr in normed.producer().attributes.items()}
-                val_f32 = op.Cast(val_4d, to=onnx.TensorProto.FLOAT)
-                out_f32 = op.RMSNormalization(val_f32, scale, **norm_attrs)
-                out_4d = op.Cast(out_f32, to=act_dtype)
+                if act_dtype is None:
+                    out_4d = op.RMSNormalization(val_4d, scale, **norm_attrs)
+                else:
+                    val_f32 = op.Cast(val_4d, to=onnx.TensorProto.FLOAT)
+                    out_f32 = op.RMSNormalization(val_f32, scale, **norm_attrs)
+                    out_4d = op.Cast(out_f32, to=act_dtype)
                 return op.Reshape(out_4d, flat_shape)
 
             q3d = _norm_to_3d(q_in, q_norm_scale, q_normed, shared["q_3d_shape"])
@@ -451,8 +459,10 @@ def fuse_group_query_attention(
     graph_ir.inputs.extend([shared[_SEQLENS_K_NAME], shared[_TOTAL_SEQLEN_NAME]])  # add new model inputs
 
     rules = [
-        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, with_mask=True),
-        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, with_mask=False),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, qknorm_in_f32=True, with_mask=True),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, qknorm_in_f32=True, with_mask=False),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, qknorm_in_f32=False, with_mask=True),
+        _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=True, qknorm_in_f32=False, with_mask=False),
         _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=False, with_mask=True),
         _gqa_rule(hf_config, shared, head_dim, qknorm_after_transpose=False, with_mask=False),
     ]

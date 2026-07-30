@@ -16,7 +16,8 @@ Pattern (Qwen3RMSNorm expansion from torch.onnx.export):
 Replaced with:
     RMSNormalization(x, scale, epsilon=eps, stash_type=FLOAT, axis=-1)
 
-Three rule variants cover fp16, bf16, and fp32 (no-cast) models.
+Three rule variants cover fp16, bf16, and fp32 (no-cast) models, each matched commutatively.
+`Mul(normed, scale)` == `Mul(scale, normed)`
 """
 
 from typing import Tuple
@@ -184,7 +185,8 @@ _RMS_RULE_SET = pattern.RewriteRuleSet(
         _gemma_cast_rule(onnx.TensorProto.FLOAT16),
         _gemma_cast_rule(onnx.TensorProto.BFLOAT16),
         _fp32_rule(),
-    ]
+    ],
+    commute=True,
 )
 
 

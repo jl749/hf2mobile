@@ -200,7 +200,7 @@ class CausalLMExporter(
         if eos_token_ids:
             logger.info(f"  🏁 extracted EOS tokens: {eos_token_ids} 🏁 ")
 
-        logger.info(f"  saved runtime configs: {sorted(set(saved))}")
+        logger.info(f"  🏁 saved runtime configs: {sorted(set(saved))} 🏁")
         return saved
 
     def export(

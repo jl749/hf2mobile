@@ -65,13 +65,21 @@ class _ColorFormatter(logging.Formatter):
 
 
 def _get_logger() -> logging.Logger:
+    _NOISY_LOGGERS = ("torch.onnx._internal.exporter._registration",)
     log = logging.getLogger(_LOGGER_NAME)
     if not log.handlers:
         handler = logging.StreamHandler(sys.stderr)
         use_color = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
         handler.setFormatter(_ColorFormatter(use_color=use_color))
         log.addHandler(handler)
-        log.setLevel(logging.DEBUG if _env_debug_enabled() else logging.INFO)
+        if _env_debug_enabled():
+            log.setLevel(logging.DEBUG)
+            for _name in _NOISY_LOGGERS:
+                logging.getLogger(_name).setLevel(logging.WARNING)
+        else:
+            log.setLevel(logging.INFO)
+            for _name in _NOISY_LOGGERS:
+                logging.getLogger(_name).setLevel(logging.ERROR)
         log.propagate = False  # do not double-emit via the root logger
     return log
 
