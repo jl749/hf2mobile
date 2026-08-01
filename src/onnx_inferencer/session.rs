@@ -87,20 +87,20 @@ pub struct DebugArtifacts {
 
 /// The `DEBUG=1` artifact paths for `model_path`, or `None` when debugging is off.
 pub fn debug_artifacts(model_path: &str) -> Option<DebugArtifacts> {
-    if std::env::var("DEBUG").as_deref() != Ok("1") {
-        return None;
+    match std::env::var("DEBUG").as_deref() {
+        Ok("1") => {
+            let stem = Path::new(model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model");
+            Some(DebugArtifacts {
+                optimized_model: format!("{stem}.ort"),
+                profile_prefix: format!("{stem}_profile_"),
+            })
+        },
+        Ok(_) => None,
+        Err(_) => None
     }
-    // `file_stem` is the filename without its extension, and both steps that reach it can
-    // fail (no filename; not valid UTF-8), so `unwrap_or` supplies a name rather than giving
-    // up on a debug dump over something this minor.
-    let stem = Path::new(model_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model");
-    Some(DebugArtifacts {
-        optimized_model: format!("{stem}.ort"),
-        profile_prefix: format!("{stem}_profile_"),
-    })
 }
 
 /// The declared shape and element type of one graph input/output.

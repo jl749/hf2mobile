@@ -27,7 +27,7 @@
 //! | [`kv_cache`]      | no      | carry key/value tensors between decode steps, without copying |
 //! | [`onnx_file`]     | no      | read the stop-token ids out of the `.onnx` protobuf |
 //! | [`sample_logits`] | no      | the `SampleLogits` operator — the file `src/onnx_plugins` owns |
-//! | [`causal_lm`]     | no      | tokenize, prefill, decode, time |
+//! | [`causallm`]     | no      | tokenize, prefill, decode, time |
 //!
 //! # Errors
 //!
@@ -41,7 +41,9 @@ use anyhow::Result;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-mod causal_lm;
+use crate::causallm::Step;
+
+mod causallm;
 mod kv_cache;
 mod numpy;
 mod onnx_file;
@@ -64,7 +66,7 @@ mod sample_logits;
 /// corrupting memory.
 #[pyclass(name = "CausalLMInferencer", unsendable)]
 pub struct CausalLMInferencer {
-    inner: causal_lm::CausalLm,
+    inner: causallm::CausalLm,
     /// Time-to-first-token of the most recent `generate`, in seconds. Zero before prefill.
     /// `#[pyo3(get)]` publishes the field to Python as a read-only attribute.
     #[pyo3(get)]
@@ -82,21 +84,20 @@ impl CausalLMInferencer {
     ///
     /// `onnx_path` is `inference.onnx` — the graph `python -m hf2mobile.postprocess` writes.
     /// It ends in a `SampleLogits` node, so it hands back a token rather than logits, and it
-    /// carries the ids that stop a turn; both are read from the graph, so there is nothing
+    /// carries the EOS ids that stop a turn; both are read from the graph, so there is nothing
     /// here to pass them as.
     ///
-    /// Raises if the graph's dtype is not supported (e.g. bfloat16). The runtime never
-    /// rewrites a model (bf16 -> f32); that is the exporter's job.
+    /// Raises if the graph's dtype is not supported (e.g. bfloat16) by the runtime.
     ///
     /// `DEBUG=1` saves the optimized graph (`<model>.ort`) and a chrome://tracing profile.
     #[new]
     #[pyo3(signature = (onnx_path, tokenizer_path, intra_threads = None))]
     fn new(py: Python<'_>, onnx_path: &str, tokenizer_path: &str, intra_threads: Option<usize>) -> Result<Self> {
-        let profiling = session::debug_artifacts(onnx_path).is_some();
+        let profiling: bool = session::debug_artifacts(onnx_path).is_some();
         // Loading a multi-gigabyte graph takes seconds and touches no Python objects, so we
         // hand the GIL (Python's one-thread-at-a-time lock) back for the duration and let
         // other Python threads run while ORT works.
-        let inner = py.allow_threads(|| causal_lm::CausalLm::open(onnx_path, tokenizer_path, intra_threads))?;
+        let inner = py.allow_threads(|| causallm::CausalLm::open(onnx_path, tokenizer_path, intra_threads))?;
         Ok(Self {
             inner,
             ttft_s: 0.0,
@@ -125,8 +126,7 @@ impl CausalLMInferencer {
     /// - `stream_output` — print the text to stdout as it is produced.
     ///
     /// There is no `temperature`/`top_k`/`top_p` here: the graph's `SampleLogits` node holds
-    /// the policy, baked in by `python -m hf2mobile.postprocess --temp/--top_k/--top_p`. That
-    /// is what a mobile runtime gets, so it is what this one runs.
+    /// the policy, baked in by `python -m hf2mobile.postprocess --temp/--top_k/--top_p`.
     #[pyo3(signature = (prompt, num_generation = 64, stream_output = false))]
     fn generate(
         &mut self,
@@ -137,11 +137,11 @@ impl CausalLMInferencer {
     ) -> Result<(Option<String>, (f64, f64))> {
         // Python's `int` is signed and unbounded; Rust wants a count. Clamping at zero turns
         // a negative budget into "generate nothing" rather than a huge unsigned number.
-        let budget = num_generation.max(0) as usize;
+        let budget: usize = num_generation.max(0) as usize;
 
         // Decoding is compute plus, when streaming, writes to stdout — no Python objects are
         // touched, so the GIL can go here too.
-        let step = py.allow_threads(|| self.inner.generate(prompt, budget, stream_output))?;
+        let step: Step = py.allow_threads(|| self.inner.generate(prompt, budget, stream_output))?;
 
         // Mirrored onto the object as well as returned, so a caller can ignore the tuple and
         // read `lm.ttft_s` after the fact.

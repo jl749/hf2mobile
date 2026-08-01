@@ -206,18 +206,9 @@ pub struct CausalLm {
 impl CausalLm {
     /// Load a generation graph and its tokenizer.
     ///
-    /// The stop ids are read out of the graph rather than passed in. They cannot be guessed
-    /// from `tokenizer.json` — that records a vocabulary, not a chat protocol, so it has no
-    /// "this is the EOS" field, and a guess that misses turns into generation that never
-    /// stops. What does know is the export, and `python -m hf2mobile.postprocess` writes the
-    /// answer into the graph as `hf2mobile_EOS_tokens`. An empty list there is a real answer
-    /// (this model names no stop token, so only the caller's budget ends a turn); a *missing*
-    /// node means the graph never went through postprocess, and is refused.
+    /// The EOS tokens are read from the ONNX graph. (cannot be guessed from `tokenizer.json`)
+    /// `python -m hf2mobile.postprocess` saves the EOS tokens under the inference graph as `hf2mobile_EOS_tokens`.
     pub fn open(onnx_path: &str, tokenizer_path: &str, intra_threads: Option<usize>) -> Result<Self> {
-        // `?` on a fallible call means "unwrap it, or return the error to my caller".
-        // `with_context` hangs a sentence off that error on the way out, and anyhow keeps the
-        // whole chain — which is what turns a failure deep in ORT into a Python exception
-        // reading "opening ONNX model `x.onnx`: ...".
         let session =
             session::open(onnx_path, intra_threads).with_context(|| format!("opening ONNX model `{onnx_path}`"))?;
 
