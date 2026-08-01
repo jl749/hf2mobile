@@ -50,14 +50,24 @@ OUTPUT_SPECS_TYPE = Tuple[Any, ...]
 # exporter/submodules/subgraph.py
 SUBGRAPH_MAP_TYPE = Dict[int, Dict[str, str]]
 
-# causallm_postprocessor.py
+# onnx/postprocess/sliding_window.py
 SLIDING_WINDOW_MASK_ONNX = Path(__file__).parent.joinpath("exporter", "onnx", "postprocess", "sliding_window_mask.onnx")
 
 
 @functools.lru_cache(maxsize=1)
-def _swa_onnx_template() -> onnx.ModelProto:
-    """`sliding_window_mask.onnx` template graph (cached with Constant weights)."""
-    return onnx.load(str(SLIDING_WINDOW_MASK_ONNX))
+def _swa_onnx_template_bytes() -> bytes:
+    """Serialized `sliding_window_mask.onnx` template graph (cached)."""
+    return SLIDING_WINDOW_MASK_ONNX.read_bytes()
+
+
+def _swa_onnx_template_ir() -> "ir.Model":
+    """
+    A private copy of the template graph.
+    Each caller bakes its own `swa_windowsize` Constant into the graph it gets back, so this must hand out a fresh model every call.
+    """
+    import onnx_ir as ir
+
+    return ir.from_proto(onnx.load_from_string(_swa_onnx_template_bytes()))
 
 
 # exporter/onnx/fusion/

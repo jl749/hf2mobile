@@ -6,7 +6,7 @@ from os import PathLike
 from pathlib import Path
 from typing import List, Sequence
 
-import onnx
+import onnx_ir as ir
 import torch
 import transformers
 
@@ -27,7 +27,7 @@ from hf2mobile.tracing import (
     register_dynamic_cache_pytree,
 )
 from hf2mobile.utils.logger import logger
-from hf2mobile.utils.onnx_helper import optimize_onnx, save_onnx
+from hf2mobile.utils.onnx_helper import optimize_onnx, save_onnx_ir
 
 from .onnx.fusion import fuse_group_query_attention, fuse_rms_norm
 from .onnx.postprocess import CausalLMONNXPostprocessor
@@ -66,8 +66,10 @@ class CausalLMExporter(
         """Model inference logic for tracing"""
         _TRACE_L = 11
         _MAX_GENERATION_STEPS = 3
-        assert self.model.config.sliding_window is None or self.model.config.sliding_window >= _TRACE_L, (
-            f"{self.model.config.sliding_window=} < {_TRACE_L=}: the window would truncate within the "
+        assert (
+            getattr(self.model.config, "sliding_window", None) is None or self.model.config.sliding_window >= _TRACE_L
+        ), (
+            f"sliding_window={getattr(self.model.config, "sliding_window")} < {_TRACE_L=}: the window would truncate within the "
             "trace length and mask suppression during export would change traced behavior."
         )
         trace_input_ids = torch.LongTensor([[57] * _TRACE_L])
@@ -112,10 +114,13 @@ class CausalLMExporter(
             input_dict["use_cache"] = False
             yield input_dict, None
 
-    def _post_process_final_onnx(self, case_idx: int, onnx_path: str | PathLike):
+    def _postprocess_final_onnx(self, case_idx: int, model_ir: ir.Model, onnx_path: str | PathLike):
         """
-        Postprocess method that optimizes the final FuncProto merged ONNX graph
+        Postprocess method that optimizes the final function-merged ONNX graph
         Called at the end of `self.merge_subgraphs_into_main_graph(...)`
+
+        `model_ir` carries its weights as mmapped external tensors, so every pass below is graph
+        surgery over metadata — the weights only move when `save_onnx_ir` streams them out.
         """
         LOG_PREFIX = "POSTPROCESS:"
         if case_idx >= 2:
@@ -124,42 +129,45 @@ class CausalLMExporter(
         if self.target == "ORT":
             if case_idx == 0:
                 if logger.isEnabledFor(logging.DEBUG):
-                    self.make_dynamic_onnx(onnx_path, allowzero=1)
-                    model = onnx.load(onnx_path, load_external_data=True)
-                    attach_sliding_window_mask_onnx(model, self._name2module)
-                    model, _n = fuse_rms_norm(model)
-                    save_onnx(model, f"debug__{onnx_path}")
+                    self.make_dynamic_onnx(model_ir, allowzero=1)
+                    attach_sliding_window_mask_onnx(model_ir, self._name2module)
+                    _n = fuse_rms_norm(model_ir)
+                    save_onnx_ir(model_ir, f"debug__{onnx_path}")
                     Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)
+                del model_ir
                 Path(onnx_path).unlink(missing_ok=True)
                 Path(onnx_path).with_suffix(".onnx.data").unlink(missing_ok=True)
             elif case_idx == 1:
                 # ===== POSTPROCESS: dynamic IO + Reshape ===== #
-                self.make_dynamic_onnx(onnx_path, allowzero=1)
+                self.make_dynamic_onnx(model_ir, allowzero=1)
                 logger.info(f"  {LOG_PREFIX} applied dynamic shaping on `{onnx_path=}`")
 
                 # ===== FUSION: fuse the main graph RMSNorms ===== #
-                model = onnx.load(onnx_path, load_external_data=True)
-                model, _n = fuse_rms_norm(model)  # fuse main graph RMSNorms (subgraphs are already fused)
+                _n = fuse_rms_norm(model_ir)  # main graph RMSNorms (subgraphs are already fused)
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph RMSNorm(s) in {onnx_path}")
 
                 # ===== POSTPROCESS: attach sliding window ===== #
-                attach_sliding_window_mask_onnx(model, self._name2module)
+                attach_sliding_window_mask_onnx(model_ir, self._name2module)
 
                 # ========================== save debug_case2.onnx ============================ #
-                # ===== flat FuncProtos, fold Constants, drop floating nodes(s)/tensor(s) ===== #
+                # ===== flat functions, fold Constants, drop floating nodes(s)/tensor(s) ===== #
                 if logger.isEnabledFor(logging.DEBUG):
-                    save_onnx(model, f"debug__{onnx_path}")
+                    # NOTE: no reload after this — `ir.save` restores the model's own tensor
+                    #   references on the way out, and re-opening `onnx_path` here would rewind to
+                    #   the pre-postprocess graph and silently drop everything above
+                    save_onnx_ir(model_ir, f"debug__{onnx_path}")
                     Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)
-                model = optimize_onnx(model)
+
+                optimize_onnx(model_ir)
 
                 # ===== FUSION: fuse the main graph GroupQueryAttentions ===== #
-                model, _n = fuse_group_query_attention(model, self.hf_config)  # must be called after optimize_onnx
+                _n = fuse_group_query_attention(model_ir, self.hf_config)  # must be called after optimize_onnx
                 if _n:
                     logger.info(f"  {LOG_PREFIX} fused {_n} main-graph GroupQueryAttention(s) in {onnx_path}")
                 # TODO: SkipLayerNormalization, SkipSimplifiedLayerNormalization, SimplifiedLayerNormalization fusing
 
-                save_onnx(model, onnx_path)
+                save_onnx_ir(model_ir, onnx_path)
                 logger.info(f"  {LOG_PREFIX} flattened model local function and saved under `{onnx_path=}`")
         elif self.target == "QNN":
             return NotImplemented

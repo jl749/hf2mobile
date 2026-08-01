@@ -39,7 +39,7 @@ Replaced with (custom domain):
 """
 
 import re
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import onnx
@@ -415,11 +415,11 @@ def _gqa_rule(
 
 
 def fuse_group_query_attention(
-    model: onnx.ModelProto,
+    model_ir: ir.Model,
     hf_config: transformers.PretrainedConfig,
-) -> Tuple[onnx.ModelProto, int]:
+) -> int:
     """
-    Rewrite every attention block around `com.microsoft.GroupQueryAttention`.
+    Rewrite every attention block around `com.microsoft.GroupQueryAttention` (in-place).
 
     `RotaryEmbedding` nodes and cos/sin_cache tables (`Gather`s) will be fused. (Attribute `do_rotary=1`)
     main graph loses `position_ids` and gains `seqlens_k`(int32, [batch]) and `total_sequence_length`(int32, [1])
@@ -430,14 +430,13 @@ def fuse_group_query_attention(
     ```
 
     Args:
-        model: final inlined ONNX model.
+        model: final FunctionProto inlined ONNX model.
         hf_config: HF model config providing `num_attention_heads` / `num_key_value_heads` / `head_dim`.
     Returns:
-        `(patched_model, num_fused_attention_blocks)` — the input `model` is returned untouched when nothing matches.
+        num_fused_attention_blocks
     """
     head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
 
-    model_ir = ir.from_proto(model)
     graph_ir: ir.Graph = model_ir.graph
 
     def _shape_initializer(name: str, embed_dim: int) -> ir.Value:
@@ -468,8 +467,13 @@ def fuse_group_query_attention(
     ]
     n_fused = pattern.RewriteRuleSet(rules).apply_to_model(model_ir)
     if not n_fused:
+        # NOTE: undo the change since the above changes were in-place
         logger.warning("fuse_group_query_attention: 0 attention pattern matched.")
-        return model, 0
+        for unused in (shared[_SEQLENS_K_NAME], shared[_TOTAL_SEQLEN_NAME]):
+            graph_ir.inputs.remove(unused)
+        for unused_name in ("gqa_q_3d_shape", "gqa_kv_3d_shape"):
+            graph_ir.initializers.pop(unused_name, None)
+        return 0
 
     # NOTE: the cos/sin_cache Gathers are dangling (unused) -> delete "position_ids"
     RemoveUnusedNodesPass()(model_ir)
@@ -477,10 +481,9 @@ def fuse_group_query_attention(
         if graph_input.name == "position_ids" and not graph_input.uses():
             graph_ir.inputs.remove(graph_input)
 
-    new_model: onnx.ModelProto = ir.to_proto(model_ir)
-    update_opset(new_model, "com.microsoft", 1)
+    update_opset(model_ir, domain="com.microsoft", version=1)
     logger.debug(f"fuse_group_query_attention: fused {n_fused} attention block(s) into GroupQueryAttention")
-    return new_model, n_fused
+    return n_fused
 
 
 __all__ = ["fuse_group_query_attention"]
