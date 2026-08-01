@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-import onnx
+import onnx_ir as ir
 
 from .constant import (
     CAUSALLM_EXPORTED_GRAPH,
@@ -50,7 +50,14 @@ from .constant import (
     TOKENIZER_FILE,
 )
 from .utils.logger import logger
-from .utils.onnx_helper import drop_vi_by_name, save_onnx, update_opset
+from .utils.onnx_helper import (
+    drop_graph_io_by_name,
+    load_onnx_ir,
+    make_constant_node,
+    prepend_nodes_to_graph,
+    save_onnx_ir,
+    update_opset,
+)
 
 # transformer attr name -> postprocess flag name
 SAMPLING_PARAMS = {
@@ -150,49 +157,51 @@ def resolve_eos_tokens(export_dir: Path) -> List[int]:
 
 
 def attach_sample_logits(
-    model: onnx.ModelProto,
+    model_ir: ir.Model,
     sampling: Dict[str, float],
     eos_tokens: List[int],
     *,
     keep_logits: bool = False,
 ) -> None:
-    """Append `SampleLogits` to `model`'s graph and prepend the EOS const node."""
-    graph: onnx.GraphProto = model.graph
-    if not any(vi.name == LOGITS_NAME for vi in graph.output):
+    """Append `SampleLogits` to `model_ir`'s graph and prepend the EOS const node."""
+    graph = model_ir.graph
+    logits = next((v for v in graph.outputs if v.name == LOGITS_NAME), None)
+    if logits is None:
         raise SystemExit(f"the graph declares no `{LOGITS_NAME}` output; is this a CausalLM graph?")
-    if any(node.op_type == SAMPLE_LOGITS_OP for node in graph.node):
+    if any(node.op_type == SAMPLE_LOGITS_OP for node in graph):
         raise SystemExit(f"the graph already carries a `{SAMPLE_LOGITS_OP}` node — nothing to do")
 
     # ===== `hf2mobile_EOS_tokens` (floating Constant, index 0) ===== #
-    eos_tensor = onnx.numpy_helper.from_array(np.asarray(eos_tokens, dtype=np.int32), name=EOS_TOKENS_CONST_NAME)
-    graph.node.insert(
-        0,
-        onnx.helper.make_node(
-            "Constant",
-            inputs=[],
-            outputs=[EOS_TOKENS_CONST_NAME],
-            value=eos_tensor,
-            name=EOS_TOKENS_CONST_NAME,
-        ),
-    )
+    eos_node = make_constant_node(EOS_TOKENS_CONST_NAME, np.asarray(eos_tokens, dtype=np.int32))
+    eos_node.name = EOS_TOKENS_CONST_NAME
+    prepend_nodes_to_graph(graph, [eos_node])
 
     # ===== `SampleLogits` (graph tail) ===== #
-    attributes = {name: sampling[name] for name in SAMPLE_LOGITS_ATTRS}
-    graph.node.append(
-        onnx.helper.make_node(
+    sampled = ir.Value(name=SAMPLED_TOKEN_NAME, type=ir.TensorType(ir.DataType.INT32), shape=ir.Shape([1, 1]))
+    graph.append(
+        ir.Node(
+            ONNX_DOMAIN_NAME,
             SAMPLE_LOGITS_OP,
-            inputs=[LOGITS_NAME],
-            outputs=[SAMPLED_TOKEN_NAME],
+            inputs=[logits],
+            # NOTE: `top_k` is an int attribute and `top_p`/`temperature` are floats — the plugin
+            #   reads them as `required_attr(.., "int"/"float")` and a wrong type fails at load
+            attributes={
+                name: (
+                    ir.AttrInt64(name, int(sampling[name]))
+                    if name == "top_k"
+                    else ir.AttrFloat32(name, float(sampling[name]))
+                )
+                for name in SAMPLE_LOGITS_ATTRS
+            },
+            outputs=[sampled],
             name=f"node_{SAMPLE_LOGITS_OP}",
-            domain=ONNX_DOMAIN_NAME,
-            **attributes,
         )
     )
-    graph.output.append(onnx.helper.make_tensor_value_info(SAMPLED_TOKEN_NAME, onnx.TensorProto.INT32, [1, 1]))
+    graph.outputs.append(sampled)
     if not keep_logits:
-        drop_vi_by_name(graph.output, {LOGITS_NAME})
+        drop_graph_io_by_name(graph.outputs, {LOGITS_NAME})
 
-    update_opset(model, ONNX_DOMAIN_NAME, 1)
+    update_opset(model_ir, ONNX_DOMAIN_NAME, 1)
 
 
 def postprocess(
@@ -215,11 +224,11 @@ def postprocess(
     sampling = resolve_sampling_params(export_dir, {"top_k": top_k, "top_p": top_p, "temperature": temperature})
     eos_tokens = eos_tokens if eos_tokens is not None else resolve_eos_tokens(export_dir)
 
-    model = onnx.load(graph_path, load_external_data=True)  # TODO: share weight?
-    attach_sample_logits(model, sampling, eos_tokens, keep_logits=keep_logits)
+    model_ir = load_onnx_ir(graph_path)  # mmapped: the weights are copied only by the save below
+    attach_sample_logits(model_ir, sampling, eos_tokens, keep_logits=keep_logits)
 
     out_path = Path(output) if output else export_dir.joinpath(CAUSALLM_INFERENCE_GRAPH)
-    save_onnx(model, out_path)
+    save_onnx_ir(model_ir, out_path)
 
     policy = ", ".join(f"{name}={sampling[name]}" for name in SAMPLING_PARAMS)
     logger.info(f"postprocess: {SAMPLE_LOGITS_OP}({policy}) -> `{SAMPLED_TOKEN_NAME}` (1, 1) int32")

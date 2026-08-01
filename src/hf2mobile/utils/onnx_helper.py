@@ -1,79 +1,83 @@
-import tempfile
+"""
+`onnx_ir` centered ONNX helpers.
+
+The pipeline holds graphs as `ir.Model` and touches `onnx.ModelProto` only where a C++ API demands one.
+Two reasons:
+
+* memory — `ir.load` mmaps external tensors, so a multi-GB graph costs page cache the kernel can evict rather than heap.
+  `onnx.load(load_external_data=True)` reads every weight into RAM.
+* use-def — `ir.Value` knows its producer and its consumers.
+  so graph surgery is a local edit rather than a rebuild of fwd/bwd dictionaries.
+
+The one trap worth naming: `ir.Function` accepts initializers, but serialization **silently drops them**
+  `FunctionProto` has no initializer field and nothing raises.
+  Anything that becomes a function has to carry its weights as `Constant` nodes (see `graph_to_function`).
+"""
+
+import shutil
 from os import PathLike
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Set
+from typing import Any, List, Sequence, Set
 
-import onnx
-import onnx.external_data_helper  # NOTE: `import onnx` alone does not expose this submodule
+import numpy as np
 import onnx_ir as ir
 import onnxscript.optimizer
-from onnx_ir.passes.common import InlinePass, LiftConstantsToInitializersPass, RemoveUnusedNodesPass
+from onnx_ir.passes.common import (
+    InlinePass,
+    LiftConstantsToInitializersPass,
+    RemoveUnusedNodesPass,
+    ShapeInferencePass,
+)
 
 from hf2mobile.constant import ONNX_DOMAIN_NAME
 
 # ===================== onnx/ ===================== #
 
 
-def onnx_to_function(
-    submodule_onnx_path: str,
+def graph_to_function(
+    submodule_onnx_path: str | PathLike,
     function_name: str,
     domain: str = ONNX_DOMAIN_NAME,
-) -> onnx.FunctionProto:
+) -> ir.Function:
     """
-    Load a standalone submodule ONNX and convert its graph to a FunctionProto.
+    Load a standalone submodule ONNX and convert its graph to an `ir.Function`.
 
-    FunctionProto does not accept graph-level initializers.
-    Hence, initializers are inlined as `Constant` nodes prepended to the function body.
+    Functions cannot carry initializers — `FunctionProto` has no field for them and `ir.to_proto` drops them without complaint.
+    Every initializer is re-emitted as a `Constant` node at the head of the body.
     """
-    m = onnx.load(submodule_onnx_path, load_external_data=True)
+    model_ir = load_onnx_ir(submodule_onnx_path)
+    graph = model_ir.graph
 
-    const_nodes = [
-        onnx.helper.make_node("Constant", inputs=[], outputs=[init.name], value=init, name=f"const_{init.name}")
-        for init in m.graph.initializer
-    ]
-    submodule_nodes = list(m.graph.node)
+    const_nodes = []
+    for init in tuple(graph.initializers.values()):
+        out = ir.Value(name=init.name, type=init.type, shape=init.shape)
+        const_nodes.append(
+            ir.Node(
+                "",
+                "Constant",
+                inputs=[],
+                attributes={"value": ir.AttrTensor("value", init.const_value)},
+                outputs=[out],
+                name=f"const_{init.name}",
+            )
+        )
+        ir.convenience.replace_all_uses_with(init, out)
+        graph.initializers.pop(init.name)
 
-    func = onnx.helper.make_function(
-        domain=domain,
-        fname=function_name,
-        inputs=[i.name for i in m.graph.input],
-        outputs=[o.name for o in m.graph.output],
-        nodes=const_nodes + submodule_nodes,
-        opset_imports=list(m.opset_import),
-    )
-    return func
-
-
-def ensure_opset_imports(model: onnx.ModelProto, new_imports) -> None:
-    """Add opset imports from a function into the model if not already present."""
-    existing = {(o.domain, o.version) for o in model.opset_import}
-    existing_domains = {o.domain for o in model.opset_import}
-    for op in new_imports:
-        if op.domain in existing_domains:
-            continue  # do not clash with existing version pins
-        if (op.domain, op.version) in existing:
-            continue
-        model.opset_import.append(op)
+    prepend_nodes_to_graph(graph, const_nodes)  # const nodes go first when toposort
+    return ir.Function(domain=domain, name=function_name, graph=graph, attributes=())
 
 
-def update_opset(model: onnx.ModelProto, domain: str, version: int) -> None:
-    """
-    If `onnx.OperatorSetIdProto(domain, version)` does not exist under opset_import add it.
-    If opset_import exists but the version is lower upgrade it.
-    """
-    for oi in model.opset_import:
-        if oi.domain == domain:
-            if oi.version < version:
-                oi.version = version  # NOTE: version up the opset
-            return
-    model.opset_import.append(onnx.helper.make_opsetid(domain, version))
+def update_opset(model_ir: ir.Model, domain: str, version: int) -> None:
+    """Pin `domain` to at least `version`, never downgrading an existing pin."""
+    if model_ir.opset_imports.get(domain, -1) < version:
+        model_ir.opset_imports[domain] = version
 
 
-def drop_attributes(node: onnx.NodeProto, names_to_drop: Set[str]) -> None:
-    """Drop AttributeProtos by their names from the passed NodeProto"""
-    keep = [a for a in node.attribute if a.name not in names_to_drop]
-    del node.attribute[:]
-    node.attribute.extend(keep)
+def drop_attributes(node: ir.Node, names_to_drop: Set[str]) -> None:
+    """Drop attributes by name from `node`."""
+    for name in names_to_drop:
+        node.attributes.pop(name, None)
 
 
 # ===================== onnx/fusion ===================== #
@@ -82,103 +86,169 @@ def drop_attributes(node: onnx.NodeProto, names_to_drop: Set[str]) -> None:
 def get_scalar(val: ir.Value) -> float | None:
     """Extract a scalar float from a constant-valued IR Value, or None."""
     try:
-        cv = val.const_value
-        if cv is None:
+        const_val = val.const_value
+        if const_val is None:
             return None
-        return float(cv.numpy().flat[0])
+        const_val_npy = const_val.numpy()
+        if const_val_npy.size != 1:
+            return None
+        return float(const_val_npy.flat[0])
     except Exception:
         return None
 
 
-def get_fwd_dict(nodes: Sequence[onnx.NodeProto]) -> Dict[str, List[onnx.NodeProto]]:
-    consumers: Dict[str, List[onnx.NodeProto]] = {}
-    for node in nodes:
-        for edge_name in node.input:
-            consumers.setdefault(edge_name, []).append(node)
-    return consumers
+def get_const_tensor(val: ir.Value | None) -> ir.TensorProtocol | None:
+    """
+    The constant tensor behind `val`, whether it arrived as an initializer or a `Constant` node.
 
-
-def get_bwd_dict(nodes: Sequence[onnx.NodeProto]) -> Dict[str, onnx.NodeProto]:
-    return {out: n for n in nodes for out in n.output}
+    IMPORTANT: `Value.const_value` is set for initializers but not for a `Constant` node's output.
+    """
+    if val is None:
+        return None
+    if val.const_value is not None:
+        return val.const_value  # `val` was initializer
+    producer = val.producer()
+    if producer is not None and producer.op_type == "Constant":
+        attr = producer.attributes.get("value")
+        if attr is not None:
+            return attr.value  # `val` was Constant
+    return None
 
 
 # ===================== onnx/postprocess ===================== #
 
 
-def set_vi_axis(vi: onnx.ValueInfoProto, axis: int, value: int | str) -> None:
-    """Set a dim on `vi`: an `int` writes a fixed `dim_value`, a `str` a symbolic `dim_param`."""
-    dim = vi.type.tensor_type.shape.dim[axis]
-    if isinstance(value, str):
-        dim.ClearField("dim_value")
-        dim.dim_param = value
-    elif isinstance(value, int):
-        dim.ClearField("dim_param")
-        dim.dim_value = value
+def set_value_axis(value: ir.Value, axis: int, dim: int | str) -> None:
+    """Set one axis of `value`'s shape: an `int` is a fixed dim, a `str` a symbolic one."""
+    if value.shape is None:
+        raise ValueError(f"`{value.name}` has no shape to set axis {axis} on.")
+    dims = list(value.shape)
+    dims[axis] = dim
+    value.shape = ir.Shape(dims)
+
+
+def get_value_shape(value: ir.Value) -> List[int | str | None] | None:
+    """
+    `value`'s shape(symbolic or int) in plain Python, or None when it has no shape at all.
+
+    e.g.
+    >>> get_value_shape(logits) # [1, 'L', 262144]
+    """
+    if value.shape is None:
+        return None
+    return [dim.value if isinstance(dim, ir.SymbolicDim) else int(dim) for dim in value.shape]
+
+
+def drop_graph_io_by_name(io: list[ir.Value], names: Set[str]) -> None:
+    """
+    Remove named entries from a graph's inputs/outputs in place (assumes they have no consumers).
+
+    e.g.
+    >>> drop_graph_io_by_name(graph.input, {"attention_mask"})
+    """
+    keep = [v for v in io if v.name not in names]
+    del io[:]
+    io.extend(keep)
+
+
+# TODO: support various attribute dtype
+def update_node_attribute(node: ir.Node, attribute_name: str, value: Any) -> None:
+    """Set an int attribute on `node`, adding it when absent."""
+    node.attributes[attribute_name] = ir.AttrInt64(attribute_name, int(value))
+
+
+def make_constant_node(name: str, array: np.ndarray) -> ir.Node:
+    """A `Constant` node wrapping `array`, its output named `name`."""
+    tensor = ir.tensor(array, name=name)
+    out = ir.Value(name=name, type=ir.TensorType(tensor.dtype), shape=ir.Shape(tensor.shape))
+    return ir.Node(
+        "",
+        "Constant",
+        inputs=[],
+        attributes={"value": ir.AttrTensor("value", tensor)},
+        outputs=[out],
+        name=f"const_{name}",
+    )
+
+
+def append_node_input(node: ir.Node, value: ir.Value) -> None:
+    """
+    Append `value` to `node`'s inputs.
+
+    `Node.inputs` is an immutable tuple — the IR owns it because every entry carries a use-def link.
+    `resize_inputs` grows it with a `None` slot and `replace_input_with` registers the usage.
+    """
+    node.resize_inputs(len(node.inputs) + 1)
+    node.replace_input_with(len(node.inputs) - 1, value)
+
+
+def prepend_nodes_to_graph(graph: ir.Graph | ir.Function, nodes: Sequence[ir.Node]) -> None:
+    """Insert `nodes` at the head of `graph`, keeping their relative order."""
+    if not nodes:
+        return
+    first = next(iter(graph), None)
+    if first is None:
+        graph.extend(nodes)
     else:
-        raise TypeError(f"`{value=}` must be int (dim_value) or str (dim_param), got {type(value).__name__}.")
-
-
-def get_vi_axis(vi: onnx.ValueInfoProto, axis: int) -> int | str | None:
-    """Return a dim of `vi`: `int` for a fixed `dim_value`, `str` for a symbolic `dim_param`, None if unset."""
-    dim = vi.type.tensor_type.shape.dim[axis]
-    if dim.HasField("dim_param"):
-        return dim.dim_param
-    if dim.HasField("dim_value"):
-        return dim.dim_value
-    return None
-
-
-def drop_vi_by_name(vis: Sequence[onnx.ValueInfoProto], names: Set[str]) -> None:
-    """Remove named entries from the given `vis` inplace (NOTE: assumes they have no consumers)."""
-    keep = [vi for vi in vis if vi.name not in names]
-    del vis[:]
-    vis.extend(keep)
-
-
-def update_node_attribute(node: onnx.NodeProto, attribute_name: str, value: Any):
-    """Update node attribute using the new value."""
-    attr = next((a for a in node.attribute if a.name == attribute_name), None)
-    if attr is None:
-        node.attribute.append(onnx.helper.make_attribute(attribute_name, value))
-    elif attr.i != value:
-        attr.i = value
+        for node in nodes:
+            graph.insert_before(first, node)
 
 
 # ===================== GENERAL ===================== #
-def save_onnx(model: onnx.ModelProto, save_path: str | PathLike):
-    data_path = Path(f"{save_path}.data")
-    data_path.unlink(missing_ok=True)
-    onnx.save(
-        model,
-        save_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=data_path.name,
-        size_threshold=1024,
-    )
-    onnx.external_data_helper.load_external_data_for_model(model, str(data_path.resolve().parent))
 
 
-def optimize_onnx(model: onnx.ModelProto):
+def load_onnx_ir(onnx_path: str | PathLike) -> ir.Model:
+    """Load an ONNX as an `ir.Model`, mmapping its external tensors instead of reading them into RAM."""
+    return ir.load(Path(onnx_path).resolve())
+
+
+def save_onnx_ir(model_ir: ir.Model, save_path: str | PathLike) -> None:
     """
-    pure-Python onnx_ir passes
-    onnx.inliner/onnxoptimizer round-trip the full model through GB-scale protobuf C++ (de)serialization
-    which could be the source of silent nondeterministic weight corruption
+    Save an `ir.Model` with its tensors externalized into a sibling `{save_path}.data`.
+
+    Writing directly to `{save_path}.data` is *correct* (`ir.save` notices the destination is the file)
+    but that buffering tensors form the file is a full copy of the weights in RAM,
+    which is the whole thing this path exists to avoid (measured 1.60 GB vs 0.35 GB on fp32 gemma-3-270m).
+    Staging to a fresh file lets it stream tensor by tensor instead, and the rename is atomic.
+    Do NOT `unlink` the destination first: `ir.save` re-opens each source tensor by path, so deleting it raises `FileNotFoundError`.
+        `.{save name}.stage_dir/{save name}` -> {save_path}
+        `.{save name}.stage_dir/{save name}.data` -> {save_path}.data
+    """
+    save_path = Path(save_path)
+    stage_dir = save_path.parent.joinpath(f".{save_path.name}.stage_dir")
+    shutil.rmtree(stage_dir, ignore_errors=True)  # in case it exists (clean mkdir)
+    stage_dir.mkdir(parents=True)
+    try:
+        staged_onnx_path = stage_dir.joinpath(save_path.name)
+        ir.save(model_ir, staged_onnx_path, external_data=f"{save_path.name}.data", size_threshold_bytes=1024)
+        staged_data = Path(f"{staged_onnx_path}.data")
+        staged_onnx_path.rename(save_path)  # move onnx to `save_path`
+        if staged_data.is_file():
+            staged_data.rename(f"{save_path}.data")  # (if exist) move data to `save_path`
+        else:
+            Path(f"{save_path}.data").unlink(missing_ok=True)  # original data not needed anymore
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+
+def optimize_onnx(model_ir: ir.Model) -> None:
+    """
+    Flatten and clean `model_ir` in place.
+
+    **pure-Python onnx_ir passes**
+    onnx.inliner/onnxoptimizer round-trip the full model through GB-scale protobuf C++ (de)serialization.
+    This could be the source of silent nondeterministic weight corruption.
 
     - inline local functions + drop unused ones
     - Constant to initializers
     - clean dead nodes + drop unused initializers
+    - infer shapes
+
+    `ShapeInferencePass` swaps the big initializers out for graph inputs before it serializes to proto for the C++ inferencer,
+    so the weights are never copied (no disk round-trip).
     """
-    model_ir = ir.from_proto(model)
     InlinePass()(model_ir)
     onnxscript.optimizer.fold_constants(model_ir)
     LiftConstantsToInitializersPass()(model_ir)
     RemoveUnusedNodesPass()(model_ir)
-    model = ir.to_proto(model_ir)
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_dir = Path(temp_dir)
-        temp_onnx_path = temp_dir.joinpath("delete_me.onnx")
-        save_onnx(model, str(temp_onnx_path))
-        onnx.shape_inference.infer_shapes_path(str(temp_onnx_path), check_type=True, strict_mode=False)
-        model = onnx.load(str(temp_onnx_path))
-    return model
+    ShapeInferencePass(check_type=True, strict_mode=False, data_prop=False)(model_ir)

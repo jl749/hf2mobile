@@ -22,15 +22,14 @@ Afterwards the cos/sin graph-input VIs are halved on the last axis: the opset-23
 RotaryEmbedding takes head_dim//2 caches, not the traced full-head_dim tensors.
 """
 
-from typing import Tuple
+from typing import Set
 
-import onnx
 import onnx_ir as ir
 from onnxscript import rewriter
 from onnxscript.rewriter import pattern
 
 from hf2mobile.utils.logger import logger
-from hf2mobile.utils.onnx_helper import get_vi_axis, set_vi_axis, update_opset
+from hf2mobile.utils.onnx_helper import get_value_shape, set_value_axis
 
 
 def _unwrap_unsqueeze(val: ir.Value) -> ir.Value | None:
@@ -92,58 +91,59 @@ def _rope_rule() -> pattern.RewriteRule:
     return pattern.RewriteRule(pat, repl)
 
 
-def _halve_cache_input_vis(model: onnx.ModelProto) -> None:
+def _halve_cache_input_vis(model_ir: ir.Model) -> None:
     """
-    Halve the last axis of the graph-input VIs consumed as RotaryEmbedding cos/sin caches.
+    Halve the last axis of the graph inputs consumed as RotaryEmbedding cos/sin caches.
 
-    The torch rotate_half convention traces cos/sin at full `head_dim`,
-    so the subgraph's cos/sin graph inputs are declared `(1, L, head_dim)`.
-    The fused opset-23 `RotaryEmbedding` instead takes `head_dim//2` caches for both cos/sin caches
-    so the declared width must follow: `(1, L, head_dim)` -> `(1, L, head_dim//2)`.
-    Returns the number of VIs rewritten.
+    * The torch rotate_half convention traces cos/sin at full `head_dim`,
+      so the subgraph's cos/sin graph inputs are declared `(1, L, head_dim)`.
+    * The fused opset-23 `RotaryEmbedding` instead takes `head_dim//2` caches for both cos/sin caches
+      so the declared width must follow: `(1, L, head_dim)` -> `(1, L, head_dim//2)`.
     """
-    cache_names = set()
-    for node in model.graph.node:
-        if node.op_type == "RotaryEmbedding" and len(node.input) >= 3:
-            cache_names.update(node.input[1:3])
+    caches: Set[ir.Value] = {
+        cache
+        for node in model_ir.graph
+        if node.op_type == "RotaryEmbedding"
+        for cache in node.inputs[1:3]  # RotaryEmbedding takes (X, cos_cache, sin_cache)
+        if cache is not None
+    }
 
-    for vi in model.graph.input:
-        if vi.name not in cache_names:
+    for graph_input in model_ir.graph.inputs:
+        if graph_input not in caches:
             continue
-        last_axis = len(vi.type.tensor_type.shape.dim) - 1
-        width = get_vi_axis(vi, last_axis)
-        if isinstance(width, int) and width % 2 == 0:
-            set_vi_axis(vi, last_axis, width // 2)
+        shape = get_value_shape(graph_input)
+        if isinstance(shape[-1], int) and shape[-1] % 2 == 0:
+            set_value_axis(graph_input, len(shape) - 1, shape[-1] // 2)
         else:
-            logger.warning(f"fuse_rope: cannot halve cache input {vi.name!r} last axis ({width!r}); left as-is.")
+            logger.warning(
+                f"fuse_rope: cannot halve cache input {graph_input.name!r} last axis ({shape[-1]!r}); left as-is."
+            )
 
 
-def fuse_rope(model: onnx.ModelProto) -> Tuple[onnx.ModelProto, int]:
+def fuse_rope(model_ir: ir.Model) -> int:
     """
-    Fuse rotate_half RoPE subgraphs into opset-23 RotaryEmbedding nodes.
+    Fuse rotate_half RoPE subgraphs into opset-23 RotaryEmbedding nodes (in-place).
 
-    Each explicit subgraph — `x*cos + rotate_half(x)*sin` — is replaced by a
-    single standard `RotaryEmbedding(X, cos_cache, sin_cache)` node (opset 23, default ONNX domain).
-    The rule fires independently for Q and K, so two fusions are expected per attention layer.
-    The Unsqueeze nodes that PyTorch inserts to broadcast cos/sin over heads are looked through
-    so the replacement receives the raw `(N, L, E)` caches; the Unsqueeze nodes become dead code.
+    * Each explicit subgraph: `x*cos + rotate_half(x)*sin` is replaced by a single
+      standard `RotaryEmbedding(X, cos_cache, sin_cache)` node (opset 23, default ONNX domain).
+    * The rule fires independently for each Q and K branches, so two fusions are expected per attention layer.
+    * The Unsqueeze nodes that PyTorch inserts to broadcast cos/sin over heads are looked through
+      so the replacement receives the raw `(N, L, E)` caches; the Unsqueeze nodes become dead code.
 
-    Args:
-        model: input ONNX model.
     Returns:
-        `(patched_model, num_fusions)`
+        num_fused_rope_nodes
     """
     rule_set = pattern.RewriteRuleSet([_rope_rule()])
-    model_ir = ir.from_proto(model)
-    new_model_ir = rewriter.rewrite(model_ir, pattern_rewrite_rules=rule_set)
-    new_model: onnx.ModelProto = ir.to_proto(new_model_ir)
+    rewriter.rewrite(model_ir, pattern_rewrite_rules=rule_set)
 
-    n_fused = sum(1 for n in new_model.graph.node if n.op_type == "RotaryEmbedding")
+    n_fused = sum(1 for n in model_ir.graph if n.op_type == "RotaryEmbedding")
     if n_fused:
-        update_opset(new_model, domain="", version=23)
-        _halve_cache_input_vis(new_model)
+        model_opset = model_ir.opset_imports.get("", 0)
+        if model_opset < 23:
+            logger.warning(f"fuse_rope: RotaryEmbedding requires at least opset-23, found `{model_opset=}`")
+        _halve_cache_input_vis(model_ir)
         logger.debug(f"fuse_rope: fused {n_fused} RotaryEmbedding node(s)")
-    return new_model, n_fused
+    return n_fused
 
 
 __all__ = ["fuse_rope"]

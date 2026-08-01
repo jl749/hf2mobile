@@ -20,8 +20,6 @@ Three rule variants cover fp16, bf16, and fp32 (no-cast) models, each matched co
 `Mul(normed, scale)` == `Mul(scale, normed)`
 """
 
-from typing import Tuple
-
 import onnx
 import onnx_ir as ir
 from onnxscript import rewriter
@@ -190,25 +188,25 @@ _RMS_RULE_SET = pattern.RewriteRuleSet(
 )
 
 
-def fuse_rms_norm(model: onnx.ModelProto) -> Tuple[onnx.ModelProto, int]:
+def fuse_rms_norm(model_ir: ir.Model) -> int:
     """
-    Fuse expanded RMSNorm subgraphs into opset-23 RMSNormalization nodes.
+    Fuse expanded RMSNorm subgraphs into opset-23 RMSNormalization nodes (in-place).
 
     Args:
         model: input ONNX model (modified in-place via onnx_ir round-trip).
 
     Returns:
-        `(patched_model, num_fusions)`
+        num_fused_rmsnorm_nodes
     """
-    model_ir = ir.from_proto(model)
-    new_model_ir = rewriter.rewrite(model_ir, pattern_rewrite_rules=_RMS_RULE_SET)
-    new_model: onnx.ModelProto = ir.to_proto(new_model_ir)
+    rewriter.rewrite(model_ir, pattern_rewrite_rules=_RMS_RULE_SET)
 
-    n_fused = sum(1 for n in new_model.graph.node if n.op_type == "RMSNormalization")
+    n_fused = sum(1 for n in model_ir.graph if n.op_type == "RMSNormalization")
     if n_fused > 0:
-        update_opset(new_model, domain="", version=23)
+        model_opset = model_ir.opset_imports.get("", 0)
+        if model_opset < 23:
+            logger.warning(f"fuse_rms_norm: RMSNormalization requires at least opset-23, found `{model_opset=}`")
         logger.debug(f"fuse_rms_norm: fused {n_fused} RMSNormalization node(s)")
-    return new_model, n_fused
+    return n_fused
 
 
 __all__ = ["fuse_rms_norm"]

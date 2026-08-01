@@ -3,7 +3,6 @@ from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
 
-import onnx
 import torch
 import transformers
 
@@ -17,7 +16,7 @@ from hf2mobile.tracing import (
     sig2fwdspecs,
 )
 from hf2mobile.utils.logger import logger
-from hf2mobile.utils.onnx_helper import save_onnx
+from hf2mobile.utils.onnx_helper import load_onnx_ir, save_onnx_ir
 
 _ONNX_OUTPUT_NAME = "attn_output"
 
@@ -101,11 +100,11 @@ def export(
             opset_version=opset_version,
             output_names=output_names,
         )
-    _m = onnx.load(str(onnx_path), load_external_data=True)
-    _m, _n_rms = fuse_rms_norm(_m)
-    _m, _n_rope = fuse_rope(_m)
+    _m = load_onnx_ir(onnx_path)
+    _n_rms = fuse_rms_norm(_m)
+    _n_rope = fuse_rope(_m)
     # TODO: fuse_attention (eager mode)
-    save_onnx(_m, onnx_path)
+    save_onnx_ir(_m, onnx_path)
     if _n_rms:
         logger.debug(f"  fused {_n_rms} RMSNorm(s) in {onnx_path.name}")
     if _n_rope:
