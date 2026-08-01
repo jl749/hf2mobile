@@ -2,3 +2,5 @@ __pycache__/
 .venv/
 .uv_cache/
 .hf_cache/
+.cargo/
+target/

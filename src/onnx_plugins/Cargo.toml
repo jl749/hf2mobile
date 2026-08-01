@@ -1,0 +1,35 @@
+[package]
+name    = "hf2mobile-plugins"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Deliberately its own workspace rather than a member of the root crate's build.
+#
+# Cargo unifies features across everything built in one invocation, and these two crates
+# need *opposite* `ort` configurations: `_ortrs_binding` loads onnxruntime itself
+# (`load-dynamic`), while this one is loaded *by* onnxruntime and takes the `OrtApi` handed
+# to `RegisterCustomOps` (`alternative-backend`). Unified, `alternative-backend` would win
+# and `_ortrs_binding` would panic on the first `ort` call for want of `ort::set_api`.
+[workspace]
+
+# `cdylib` is the artifact onnxruntime loads. `rlib` is there so `cargo test` can build the
+# crate as a library — that is what runs `sample_logits.rs`'s unit tests.
+[lib]
+name       = "hf2mobile_plugins"
+crate-type = ["cdylib", "rlib"]
+path       = "lib.rs"
+
+[dependencies]
+# `alternative-backend` (= ort-sys/disable-linking) means this crate neither links nor
+# dlopens onnxruntime: it is already running inside it, and `RegisterCustomOps` is handed
+# the `OrtApiBase` to use. `half` registers f16 as a tensor element type, so an fp16 export
+# gets a kernel too.
+ort  = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "alternative-backend", "half"] }
+half = "2"
+# Used by `sample_logits.rs` for the temperature/top-k/top-p draw; greedy never touches it.
+rand = "0.9"
+
+[profile.release]
+lto       = "thin"
+opt-level = 3

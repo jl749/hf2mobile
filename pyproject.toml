@@ -1,15 +1,15 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "hf2mobile"
 version = "0.1.0"
-description = "Export Hugging Face causal LMs to hardware-targeted ONNX models (ORT / QNN)."
+description = "Export/optimize HuggingFace torch models for mobile deployment (supports ONNXRuntime - CPUEP/QNNEP)."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "jlee" }]
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 keywords = ["onnx", "transformers", "huggingface", "quantization", "onnxruntime", "qnn"]
 
 dependencies = [
@@ -20,23 +20,21 @@ dependencies = [
     "onnx-ir>=0.2",
     "onnxscript>=0.7",
     "onnxruntime>=1.22",
-    "onnxoptimizer>=0.4",
 ]
 
 [project.scripts]
 hf2mobile-export = "hf2mobile.export:main"
 
-[project.urls]
-Homepage = "https://github.com/your-org/hf-quantizer"
-
 # ---------------------------------------------------------------------------
-# Build (src layout). Ship the ONNX template graphs alongside the package.
+# maturin: mixed Rust/Python project.
+#   - python-source = "src"  -> the `hf2mobile` package lives under src/
+#   - module-name            -> the Rust cdylib is installed as `hf2mobile._ortrs_binding`
+# The Rust crate (Cargo.toml at the repo root) has its sources in src/ort_inferencer.
 # ---------------------------------------------------------------------------
-[tool.hatch.build.targets.wheel]
-packages = ["src/hf2mobile"]
-
-[tool.hatch.build.targets.sdist]
-only-include = ["src/hf2mobile", "README.md", "pyproject.toml"]
+[tool.maturin]
+python-source = "src"
+module-name = "hf2mobile._ortrs_binding"
+features = ["pyo3/extension-module"]
 
 # ---------------------------------------------------------------------------
 # uv: resolve torch from the CPU wheel index for reproducible CPU installs.

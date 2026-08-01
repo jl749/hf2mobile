@@ -5,6 +5,15 @@ from typing import Any, Dict, Tuple
 import onnx
 import torch
 
+# postprocess.py / infer.py
+CAUSALLM_EXPORTED_GRAPH = "case2.onnx"
+CAUSALLM_INFERENCE_GRAPH = "inference.onnx"
+LOGITS_NAME = "logits"
+SAMPLE_LOGITS_OP = "SampleLogits"
+SAMPLE_LOGITS_ATTRS = ("top_k", "top_p", "temperature")
+SAMPLED_TOKEN_NAME = "sampled_token"  # new output name
+EOS_TOKENS_CONST_NAME = "hf2mobile_EOS_tokens"
+
 # export.py
 DEBUG_CONFIG = {
     "num_hidden_layers": 2,
@@ -21,11 +30,14 @@ DEBUG_CONFIG = {
 
 # exporter/causallm.py
 SUPPORTED_TARGETS = ["ORT", "QNN"]
+TOKENIZER_FILE = "tokenizer.json"
+TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+GENERATION_CONFIG_FILE = "generation_config.json"
 
 # tracing/register.py
 CUSTOM_LIB_NAME = "hf_module2plugin"
 CUSTOM_LIB = torch.library.Library(CUSTOM_LIB_NAME, "DEF")
-ONNX_DOMAIN_NAME = "com.jerry"
+ONNX_DOMAIN_NAME = "com.hf2mobile"
 ONNX_TORCHLIB_ATTRIBUTE_NAME = "torchlib_op_name"  # placeholder node attr carrying the registered op name
 
 # tracing/tensor_metadata.py

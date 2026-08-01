@@ -27,7 +27,7 @@ hf2mobile-export Qwen/Qwen2.5-0.5B-Instruct --target {ORT,QNN}
 ### ONNX standardized the *operator* level tracing
 
 ONNX defined a portable vocabulary of computation primitives — `MatMul`, `Conv`, `ReLU`, `Attention`.
-For classical ML graphs, the operator level tracing was enough to cover majority of the model proting cases.
+For classical ML graphs, the operator level tracing was enough to cover majority of the model porting cases.
 
 
 ### The operator level tracing is too low to be the unit of portability today
@@ -104,7 +104,7 @@ Adding a new architecture is usually a thin subclass of `CausalLMExporter` (see 
 
 The graph progresses through the export like this:
 
-| <img src="docs/1_module_level_graph.svg" width="260"> | <img src="docs/2_module_level_postprocessed_graph.svg" width="260"> | <img src="docs/3_fianl_graph.svg" width="260"> |
+| <img src="docs/1_module_level_graph.svg" width="260"> | <img src="docs/2_module_level_postprocessed_graph.svg" width="260"> | <img src="docs/3_final_graph.svg" width="260"> |
 | :---: | :---: | :---: |
 | Initial module-level graph | Postprocessed module-level graph | Flattened operator-level graph (ORT: CPU-EP target) |
 

@@ -1,0 +1,37 @@
+[package]
+name    = "hf2mobile-ort"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Built by maturin into `hf2mobile._ortrs_binding` (see [tool.maturin] in pyproject.toml).
+# Sources live under src/onnx_inferencer/ so they sit next to the Python package.
+[lib]
+name       = "_ortrs_binding"
+crate-type = ["cdylib"]
+path       = "src/onnx_inferencer/lib.rs"
+
+[dependencies]
+# `load-dynamic` dlopens libonnxruntime at runtime (path via ORT_DYLIB_PATH), so we
+# reuse the .so shipped by the pip `onnxruntime` package instead of bundling one.
+# `half` registers f16/bf16 as tensor element types, which the KV cache needs in
+# order to stay dtype-agnostic.
+ort     = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray", "half"] }
+ndarray = "0.16"
+half    = "2"
+# `anyhow` gives every fallible function one error type, so `?` works everywhere and
+# messages accumulate context instead of being re-wrapped by hand; pyo3's `anyhow`
+# feature turns that error into a Python exception at the boundary, for free.
+anyhow  = "1"
+# Used by the `SampleLogits` kernel this crate registers (`src/onnx_plugins/sample_logits.rs`)
+# for the temperature/top-k/top-p draw; a graph baked greedy never touches it.
+rand    = "0.9"
+pyo3    = { version = "0.22", features = ["extension-module", "abi3-py312", "anyhow"] }
+numpy   = { version = "0.22", features = ["half"] }
+# HuggingFace tokenizers — the performant (Rust) tokenizer. Inference only, so we drop
+# the training-only extras (esaxx_fast, progressbar) and keep the onig regex backend.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[profile.release]
+lto       = "thin"
+opt-level = 3
