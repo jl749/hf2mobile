@@ -293,15 +293,13 @@ block in `pyproject.toml`). To use CUDA wheels instead, remove that block.
 
 ## 📦 Install
 
-### Default
-
-**From a built wheel** — the wheel carries the compiled extension, so no Rust toolchain is needed:
+### HostPC
 
 ```bash
-uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
+uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl   # a built wheel: no Rust toolchain needed
 ```
 
-**From source (development):**
+From source, for development:
 
 ```bash
 uv sync                     # Python dependencies
@@ -310,32 +308,14 @@ maturin develop --release   # compile the Rust extension into the venv  (~45s co
 
 Re-run `maturin develop --release` after any change under `src/onnx_inferencer/` — Python imports the *installed* `.so`, so a bare `cargo build` will not be picked up.
 
-### Build from scratch
-
-**The wheel** (contains the compiled extension, so it is platform-specific — `abi3-py312`, one wheel per OS/arch):
+To build the artifacts themselves:
 
 ```bash
-maturin build --release -o dist/
+maturin build --release -o dist/                                    # the wheel (abi3-py312, one per OS/arch)
+cargo build --release --manifest-path src/onnx_plugins/Cargo.toml   # libhf2mobile_plugins.so
 ```
 
-**The Android CLI** (`hf2mobile-infer` for `aarch64-linux-android` — no Python on the device, so this is a plain cargo build with the NDK on `$PATH`):
-
-```bash
-nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
-# -> target/aarch64-linux-android/release/hf2mobile-infer
-
-file target/aarch64-linux-android/release/hf2mobile-infer
-# ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64, for Android 24
-```
-
-`.cargo/config.toml` names the API-24 clang for both the linker and the `cc` crate; API 24 (Android 7.0) is the floor ONNX Runtime's own Android builds target. `nix develop .#android -c llvm-strip <binary>` roughly halves the 9 MB if the push is slow. The host build of the same binary is just `cargo build --release`.
-
-**The ONNXRuntime plugin library** (only needed to load an `hf2mobile` graph from a runtime *other* than `hf2mobile.infer`, which registers the operator in-process):
-
-```bash
-cargo build --release --manifest-path src/onnx_plugins/Cargo.toml
-# -> src/onnx_plugins/target/release/libhf2mobile_plugins.so
-```
+The plugin `.so` is only needed to load an `hf2mobile` graph from a runtime *other* than `hf2mobile.infer`, which registers the operator in-process:
 
 ```python
 import onnxruntime as ort
@@ -345,6 +325,19 @@ opts.register_custom_ops_library("src/onnx_plugins/target/release/libhf2mobile_p
 session = ort.InferenceSession("inference.onnx", opts)
 ```
 
+### Android
+
+Nothing is *installed* on the device — one binary is cross-compiled and pushed (see [Usage](#-usage-cli)):
+
+```bash
+nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
+
+file target/aarch64-linux-android/release/hf2mobile-infer
+# ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64, for Android 24
+```
+
+`.cargo/config.toml` points cargo and the `cc` crate at the NDK's API-24 clang — API 24 (Android 7.0) is the floor ONNX Runtime's own Android builds target. `llvm-strip` roughly halves the 9 MB if the push is slow. The same source built for the host is just `cargo build --release`.
+
 ---
 
 ## 🚀 Usage (CLI)
@@ -352,9 +345,11 @@ session = ort.InferenceSession("inference.onnx", opts)
 <details>
 <summary><b>Click to expand</b> — export, postprocess, infer, run on device</summary>
 
-Two entry points: `hf2mobile-export` builds the shippable graph (export **and** postprocess), `hf2mobile-inference` runs it — and `hf2mobile-infer`, the Rust binary, runs the same thing on a phone (step 4). The two stages are also importable/runnable on their own — `python3 -m hf2mobile.export --skip_postprocess` then `python3 -m hf2mobile.postprocess {export dir}` — which is what you want when re-baking the decode policy without re-exporting.
+Two entry points: `hf2mobile-export` builds the shippable graph (export **and** postprocess), `hf2mobile-inference` runs it. The two stages are also runnable on their own — `python3 -m hf2mobile.export --skip_postprocess` then `python3 -m hf2mobile.postprocess {export dir}` — which is what you want when re-baking the decode policy without re-exporting.
 
-### 1. `hf2mobile.export` — HF → ONNX
+### HostPC
+
+#### 1. `hf2mobile.export` — HF → ONNX
 
 ```bash
 hf2mobile-export {HF repo id} --target {ORT|QNN}
@@ -386,7 +381,7 @@ Output lands in a timestamped directory named `{date}__{target}__{model}`:
 
 Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot of each, plus the standalone module subgraphs.
 
-### 2. `hf2mobile.postprocess` — bake in the decode policy
+#### 2. `hf2mobile.postprocess` — bake in the decode policy
 
 Run for you by `hf2mobile-export` unless `--skip_postprocess` is passed; run it directly to re-bake the policy of an existing export without re-exporting.
 
@@ -407,7 +402,7 @@ python3 -m hf2mobile.postprocess {export dir} --top_k 64 --top_p 0.95 --temp 1.0
 
 Writes `inference.onnx` beside `case2.onnx`. Anything omitted is resolved from the export's own configs, so the plain form reproduces what `model.generate` would have done.
 
-### 3. `hf2mobile.infer` — run it
+#### 3. `hf2mobile.infer` — run it
 
 ```bash
 hf2mobile-inference {export dir} --prompt "Where is Paris?"
@@ -425,9 +420,25 @@ python3 -m hf2mobile.infer {export dir} --prompt "Where is Paris?"
 
 Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s. No sampling flags — the policy is in the graph.
 
-### 4. `hf2mobile-infer` — run it on the device
+#### Examples
 
-The same run as step 3 with no interpreter involved: one executable, the same flags, the same output. Build it as shown in [Install](#-install), then push three things and run:
+```bash
+# Gemma 3 (270M), end to end
+hf2mobile-export google/gemma-3-270m-it --target ORT --export_dtype float32
+hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
+
+# Force greedy decoding regardless of what the model's config says
+hf2mobile-export google/gemma-3-270m-it --target ORT --temp 0
+# ... or re-bake an export you already have
+python3 -m hf2mobile.postprocess 2026-08-01__ORT__google-gemma-3-270m-it --temp 0
+
+# Fast smoke test with a tiny random-init model (no real weights downloaded)
+hf2mobile-export meta-llama/Llama-3.2-1B-Instruct --target ORT --debug
+```
+
+### Android
+
+Step 3 without the interpreter: one executable, the same flags, the same output. Build it as shown in [Install](#-install), then push three files and run:
 
 ```bash
 D=/data/local/tmp/hf2mobile
@@ -447,40 +458,13 @@ Paris is a French city, which is known for its iconic landmarks and rich history
 [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
 
-*(above is the same binary run on the host; a phone's numbers will differ)*
+*(above is the host build of the same binary; a phone's numbers will differ)*
 
-| Argument           | Description                                                                  | Default |
-| ------------------ | ---------------------------------------------------------------------------- | ------- |
-| `export_dir`       | A **postprocessed** export directory, as pushed to the device.               | —       |
-| `--prompt`         | User prompt.                                                                  | required |
-| `--skip_template`  | Feed `--prompt` verbatim instead of through the model's chat template.        | off |
-| `--num-generation` | Maximum tokens to generate.                                                   | `512` |
-| `--intra-threads`  | ORT intra-op thread count.                                                    | one per core |
-| `--ort-dylib`      | Where to dlopen ONNX Runtime from.                                            | `$ORT_DYLIB_PATH`, else beside the binary or in the export dir |
-
-Notes for a device run:
+Flags are step 3's, plus `--ort-dylib` — where to dlopen ONNX Runtime from. It defaults to `$ORT_DYLIB_PATH`, then next to the binary, then the export directory, which is why the push above needs nothing set in the environment.
 
 - **`/data/local/tmp`, not `/sdcard`** — the latter is mounted `noexec`.
-- **No `ORT_DYLIB_PATH` needed.** The binary looks beside itself and in the export directory, which is why pushing the `.so` next to it is enough.
-- **Sweep `--intra-threads`.** On big.LITTLE the default (one thread per core) puts work on little cores that then hold the fast ones up; matching the big cluster is often quicker than using every core.
+- **Sweep `--intra-threads`.** On big.LITTLE the default (one thread per core) puts work on little cores that then hold the fast ones up; matching the big cluster is often quicker.
 - **Compare a second run against the first.** Thermal throttling shows up as tok/s falling across a run, so one number on a warm phone is not a measurement.
-- The binary runs on the host too (`./target/release/hf2mobile-infer …`), which is the way to check an export before pushing it anywhere.
-
-### Examples
-
-```bash
-# Gemma 3 (270M), end to end
-hf2mobile-export google/gemma-3-270m-it --target ORT --export_dtype float32
-hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
-
-# Force greedy decoding regardless of what the model's config says
-hf2mobile-export google/gemma-3-270m-it --target ORT --temp 0
-# ... or re-bake an export you already have
-python3 -m hf2mobile.postprocess 2026-08-01__ORT__google-gemma-3-270m-it --temp 0
-
-# Fast smoke test with a tiny random-init model (no real weights downloaded)
-hf2mobile-export meta-llama/Llama-3.2-1B-Instruct --target ORT --debug
-```
 
 </details>
 
