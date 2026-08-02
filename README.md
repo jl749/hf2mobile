@@ -18,7 +18,6 @@ python3 -m hf2mobile.infer       2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Wher
 - [Tested architectures](#tested-architectures)
 - [Requirements](#requirements)
 - [Install](#install)
-- [Build](#build)
 - [Usage (CLI)](#usage-cli)
 - [Roadmap](#roadmap)
 
@@ -149,7 +148,7 @@ Everything else follows from that. With the baseline runtime holding the cache, 
 
 ### A descriptive graph, and a generic runtime to read it
 
-The exporter and the runtime are one deliverable, designed against each other. The graph carries the **description** — module identity survives the trace, cache slots are named, the sampling policy and the EOS ids are baked in — and the Rust runtime beside it ([Runtime (Rust)](#runtime-rust)) stays small and model-agnostic precisely because it can read all of that out of the file.
+The exporter and the runtime are one deliverable, designed against each other. The graph carries the **description** — module identity survives the trace, cache slots are named, the sampling policy and the EOS ids are baked in — and the Rust runtime beside it ([CausalLM inference](#example-causallm-inference)) stays small and model-agnostic precisely because it can read all of that out of the file.
 
 Attention shows the division. `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work by nature, and the runtime owns that. Driving it takes no per-model knowledge: cache slots are discovered by convention (`x` / `x_out`), stop tokens are read straight from the graph, and `SampleLogits` returns a token id rather than a megabyte-wide logits row. One loop runs every exported model, and it is small enough to cross-compile for a phone.
 
@@ -244,16 +243,6 @@ text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 
 ---
 
-## Tested architectures
-
-| Architecture          | Example model                     |
-| --------------------- | --------------------------------- |
-| `LlamaForCausalLM`    | `meta-llama/Llama-3.2-1B-Instruct` |
-| `Qwen2ForCausalLM`    | `Qwen/Qwen2.5-0.5B-Instruct`      |
-| `Qwen3ForCausalLM`    | `Qwen/Qwen3-0.6B`                 |
-| `Gemma3ForCausalLM`   | `google/gemma-3-270m-it`          |
-
----
 
 ## Requirements
 
@@ -274,6 +263,14 @@ block in `pyproject.toml`). To use CUDA wheels instead, remove that block.
 
 ## Install
 
+### Default
+
+**From a built wheel** — the wheel carries the compiled extension, so no Rust toolchain is needed:
+
+```bash
+uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
+```
+
 **From source (development):**
 
 ```bash
@@ -283,15 +280,7 @@ maturin develop --release   # compile the Rust extension into the venv  (~45s co
 
 Re-run `maturin develop --release` after any change under `src/onnx_inferencer/` — Python imports the *installed* `.so`, so a bare `cargo build` will not be picked up.
 
-**From a built wheel:**
-
-```bash
-uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
-```
-
----
-
-## Build
+### Build from scratch
 
 **The wheel** (contains the compiled extension, so it is platform-specific — `abi3-py312`, one wheel per OS/arch):
 
@@ -317,6 +306,9 @@ session = ort.InferenceSession("inference.onnx", opts)
 ---
 
 ## Usage (CLI)
+
+<details>
+<summary>Click to expand</summary>
 
 Three commands, run in order. Each takes the *export directory* the previous one produced.
 
@@ -384,6 +376,13 @@ Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s.
 
 ### Examples
 
+Supported architectures
+- `LlamaForCausalLM`
+- `Qwen2ForCausalLM`
+- `Qwen3ForCausalLM`
+- `Gemma3ForCausalLM`
+
+---
 ```bash
 # Gemma 3 (270M), end to end
 python3 -m hf2mobile.export google/gemma-3-270m-it --target ORT --export_dtype float32
@@ -396,6 +395,8 @@ python3 -m hf2mobile.postprocess 2026-08-01__ORT__google-gemma-3-270m-it --temp 
 # Fast smoke test with a tiny random-init model (no real weights downloaded)
 python3 -m hf2mobile.export meta-llama/Llama-3.2-1B-Instruct --target ORT --debug
 ```
+
+</details>
 
 ---
 
