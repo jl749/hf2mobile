@@ -237,26 +237,28 @@ def postprocess(
     return out_path, sampling, eos_tokens
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="python -m hf2mobile.postprocess",
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("export_dir", help="an export directory produced by `python -m hf2mobile.export`")
-    parser.add_argument(
+def sampling_parser() -> argparse.ArgumentParser:
+    """The flags that decide what this stage bakes into the graph, as a reusable parent parser.
+
+    Kept out of `main` so `hf2mobile.export` — which runs this stage itself — can offer the
+    same flags with `parents=[sampling_parser()]` instead of restating them, and feed the
+    result straight to `postprocess` via `sampling_kwargs`.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    group = parser.add_argument_group("decode policy (baked into the inference graph)")
+    group.add_argument(
         "--top_k",
         type=int,
         default=None,
         help=f"keep only the k highest-scoring tokens (0 = off). Overrides {GENERATION_CONFIG_FILE}'s `top_k`.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--top_p",
         type=float,
         default=None,
         help=f"nucleus sampling threshold (1.0 = off). Overrides {GENERATION_CONFIG_FILE}'s `top_p`.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--temp",
         "--temperature",
         dest="temperature",
@@ -267,7 +269,7 @@ def main() -> None:
             f"Overrides {GENERATION_CONFIG_FILE}'s `temperature`."
         ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--eos_tokens",
         type=int,
         action="append",
@@ -277,28 +279,43 @@ def main() -> None:
             f"Overrides whatever the export's {GENERATION_CONFIG_FILE}/{TOKENIZER_CONFIG_FILE} say."
         ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--keep_logits",
         action="store_true",
         help="also keep `logits` as a graph output, for comparing the sampled token against the row it came from.",
     )
-    parser.add_argument(
+    group.add_argument(
         "-o",
         "--output",
         default=None,
         help=f"write the patched graph here instead of `<export dir>/{CAUSALLM_INFERENCE_GRAPH}`.",
     )
+    return parser
+
+
+def sampling_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """The flags `sampling_parser()` parsed, as `postprocess(...)` keyword arguments."""
+    return {
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "temperature": args.temperature,
+        "eos_tokens": args.eos_tokens,
+        "keep_logits": args.keep_logits,
+        "output": args.output,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="python -m hf2mobile.postprocess",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[sampling_parser()],
+    )
+    parser.add_argument("export_dir", help="an export directory produced by `python -m hf2mobile.export`")
     args = parser.parse_args()
 
-    postprocess(
-        args.export_dir,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        temperature=args.temperature,
-        eos_tokens=args.eos_tokens,
-        keep_logits=args.keep_logits,
-        output=args.output,
-    )
+    postprocess(args.export_dir, **sampling_kwargs(args))
 
 
 if __name__ == "__main__":
