@@ -15,7 +15,6 @@ python3 -m hf2mobile.infer       2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Wher
 - [Motivation](#motivation)
 - [How hf2mobile tackles it](#how-hf2mobile-tackles-it)
 - [How it works](#how-it-works)
-- [Tested architectures](#tested-architectures)
 - [Requirements](#requirements)
 - [Install](#install)
 - [Usage (CLI)](#usage-cli)
@@ -166,7 +165,8 @@ The result is a single, extensible pipeline that produces correctly-specialized 
 <summary>Click to expand</summary>
 
 ### EXAMPLE: CausalLM exporter
-Every supported model inherits `CausalLMExporter` (`src/hf2mobile/exporter/causallm.py`), which drives a five-stage export. A single run produces **two graphs** — a **prefill** case (processes the full prompt) and a **generation** case (single-token decode with KV cache in/out) — because those are the two distinct shapes a decoder actually runs at inference time.
+
+Every supported model inherits `CausalLMExporter` (`src/hf2mobile/exporter/causallm.py`), which drives a five-stage export. A single run traces **two cases** — **prefill** (the full prompt) and **generation** (single-token decode with KV cache in/out) — because those are the two distinct shapes a decoder actually runs at inference time. For `ORT` the deliverable is the generation graph alone, whose dynamic `L` covers both.
 
 | Stage | What happens | Where it lives |
 | ----- | ------------ | -------------- |
@@ -243,12 +243,11 @@ text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 
 ---
 
-
 ## Requirements
 
 - Python **>= 3.12**
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
-- A **Rust toolchain** + [`maturin`](https://www.maturin.rs/) — `hf2mobile` is a mixed Rust/Python project, so a build compiles the `_ortrs_binding` extension module
+- A **Rust toolchain** + [`maturin`](https://www.maturin.rs/) — only to build from source; `hf2mobile` is a mixed Rust/Python project, and a build compiles the `_ortrs_binding` extension module
 
 Everything above comes from `flake.nix`; nothing needs to be installed globally:
 
@@ -320,6 +319,8 @@ python3 -m hf2mobile.export {HF repo id} --target {ORT|QNN}
 hf2mobile-export {HF repo id} --target {ORT|QNN}
 ```
 
+Supported architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Gemma3ForCausalLM`.
+
 | Argument         | Description                                                              | Default |
 | ---------------- | ----------------------------------------------------------------------- | ------- |
 | `repo_id`        | Hugging Face repo id of the model to export.                            | —       |
@@ -334,7 +335,7 @@ Output lands in a timestamped directory named `{date}__{target}__{model}`:
 ├── case2.onnx + case2.onnx.data   the dynamic-L generation graph (serves prefill and decode both)
 ├── tokenizer.json                 handed to the runtime, which does all the tokenizing
 ├── tokenizer_config.json          the chat template
-└── generation_config.json         the sampling policy + EOS ids that stage 2 reads
+└── generation_config.json         the sampling policy + EOS ids that `postprocess` reads
 ```
 
 Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot of each, plus the standalone module subgraphs.
@@ -376,13 +377,6 @@ Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s.
 
 ### Examples
 
-Supported architectures
-- `LlamaForCausalLM`
-- `Qwen2ForCausalLM`
-- `Qwen3ForCausalLM`
-- `Gemma3ForCausalLM`
-
----
 ```bash
 # Gemma 3 (270M), end to end
 python3 -m hf2mobile.export google/gemma-3-270m-it --target ORT --export_dtype float32
