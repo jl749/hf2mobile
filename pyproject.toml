@@ -24,17 +24,22 @@ dependencies = [
 
 [project.scripts]
 hf2mobile-export = "hf2mobile.export:main"
+hf2mobile-inference = "hf2mobile.infer:main"
 
 # ---------------------------------------------------------------------------
 # maturin: mixed Rust/Python project.
 #   - python-source = "src"  -> the `hf2mobile` package lives under src/
 #   - module-name            -> the Rust cdylib is installed as `hf2mobile._ortrs_binding`
-# The Rust crate (Cargo.toml at the repo root) has its sources in src/ort_inferencer.
+# The Rust crate (Cargo.toml at the repo root) has its sources in src/onnx_inferencer.
 # ---------------------------------------------------------------------------
 [tool.maturin]
 python-source = "src"
 module-name = "hf2mobile._ortrs_binding"
-features = ["pyo3/extension-module"]
+# `python` compiles the pyo3 boundary; `no-default-features` drops the crate's `cli` feature,
+# whose argument parser and Jinja renderer only exist for the `hf2mobile-infer` binary (that
+# binary declares `required-features = ["cli"]`, so this build skips it entirely).
+features = ["pyo3/extension-module", "python"]
+no-default-features = true
 
 # ---------------------------------------------------------------------------
 # uv: resolve torch from the CPU wheel index for reproducible CPU installs.

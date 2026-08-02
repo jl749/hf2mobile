@@ -1,4 +1,4 @@
-//! `hf2mobile._ortrs_binding` — ONNX Runtime inference for exported models, in Rust.
+//! `hf2mobile._ortrs_binding` — the Python boundary.
 //!
 //! ```python
 //! from hf2mobile.inference import CausalLMInferencer
@@ -8,55 +8,17 @@
 //! print(lm.ttft_s, lm.tps)
 //! ```
 //!
-//! The graph it runs is the postprocessed one (`python -m hf2mobile.postprocess`): it returns
-//! the token it sampled, not a row of logits, and it carries the ids that end a turn. So the
-//! two paths above are the whole configuration — the sampling policy and the stop tokens were
-//! decided at export time and travel with the model.
-//!
-//! # Layout
-//!
-//! Only this file and [`numpy`] touch Python; the runtime underneath is plain Rust and can be
-//! tested or reused without an interpreter.
-//!
-//! | module            | Python? | job |
-//! |-------------------|---------|-----|
-//! | `lib` (here)      | yes     | the `#[pyclass]` wrapper — argument checking and nothing else |
-//! | [`numpy`]         | yes     | numpy array <-> ORT tensor, for the raw `run` escape hatch |
-//! | [`session`]       | no      | open a graph, register the custom op, `DEBUG=1` dumps |
-//! | [`precision`]     | no      | reject a dtype this machine cannot execute |
-//! | [`kv_cache`]      | no      | carry key/value tensors between decode steps, without copying |
-//! | [`onnx_file`]     | no      | read the stop-token ids out of the `.onnx` protobuf |
-//! | [`sample_logits`] | no      | the `SampleLogits` operator — the file `src/onnx_plugins` owns |
-//! | [`causallm`]     | no      | tokenize, prefill, decode, time |
-//!
-//! # Errors
-//!
-//! Everything fallible returns `anyhow::Result`, and pyo3 turns an `anyhow` error into a
-//! Python `RuntimeError` carrying the whole context chain — so a failure deep in the cache
-//! surfaces in Python as "opening ONNX model `x.onnx`: ...". The exception is [`numpy`], which
-//! raises `ValueError` directly: "that array has the wrong dtype" is a caller mistake, and
-//! `ValueError` is what a Python caller would think to catch for it.
+//! Only this file and [`numpy`](crate::numpy) touch Python; the runtime underneath is plain
+//! Rust, which is how the same engine also ships as the `hf2mobile-infer` binary (see
+//! [`cli`](crate::cli)). Compiled only under the `python` feature, which maturin turns on.
 
 use anyhow::Result;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::causallm::Step;
-
-mod causallm;
-mod kv_cache;
-mod numpy;
-mod onnx_file;
-mod precision;
-mod session;
-
-// The `SampleLogits` operator and the sampling policy inside it, compiled straight out of the
-// plugin crate rather than reimplemented: `src/onnx_plugins` builds this same file into the
-// `.so` a mobile runtime loads, so the token this runtime picks and the token that runtime
-// picks come from one definition. The two crates do not depend on each other in any way —
-// `#[path]` only tells `cargo` where a source file lives.
-#[path = "../onnx_plugins/sample_logits.rs"]
-mod sample_logits;
+use crate::causallm::{self, Step};
+use crate::numpy;
+use crate::session;
 
 /// ONNX Runtime inference over an exported causal-LM graph.
 ///
