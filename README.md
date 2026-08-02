@@ -204,7 +204,7 @@ The graph progresses through the export like this:
 
 ---
 
-### EXAMPLE: CausalLM inference
+### EXAMPLE: CausalLM inferencer
 
 The exported graph is only half the deliverable; a runtime has to load it. `hf2mobile` ships two Rust crates that share one source file:
 
@@ -216,26 +216,21 @@ The exported graph is only half the deliverable; a runtime has to load it. `hf2m
 
 They are separate crates (and separate cargo workspaces) because they need opposite `ort` configurations: the runtime dlopens onnxruntime, the plugin is already running inside it. But `sample_logits.rs` is compiled into **both**, so the token a mobile runtime picks and the token the dev runtime picks come from one definition.
 
-#### `com.hf2mobile:SampleLogits`
+Nothing tells the engine *how* to decode. The policy is a `SampleLogits` node and the stop ids are a `hf2mobile_EOS_tokens` constant, both baked into the graph by postprocess:
 
 ```text
 logits [1, L, vocab]  --SampleLogits(top_k, top_p, temperature)-->  sampled_token [1, 1] int32
 ```
 
-The sampling policy is a set of node attributes baked in at postprocess time, not an argument passed per call. That is the whole point: a 262k-wide fp32 logits row is 1 MB per token, and copying it out of ONNXRuntime only to reduce it to one integer is the most expensive thing a decode step does that isn't arithmetic. `--temp 0` bakes in greedy.
+A 262k-wide fp32 logits row is 1 MB per token, so reducing it to one integer *inside* the graph is the copy the decode loop most wants back. What the engine adds around that: a zero-copy KV cache (tensors stay ORT-side between steps), one dynamic-`L` graph serving both prefill and decode, and TTFT/tok-s per run. `DEBUG=1` also dumps the Level3-optimized graph and a `chrome://tracing` profile.
 
-`python -m hf2mobile.postprocess` reads the policy from the export's `generation_config.json` / `tokenizer_config.json` (`do_sample: false` ⇒ greedy), so by default the graph decodes the way `model.generate` would have.
+Two front ends, one engine — a cargo feature picks which is compiled:
 
-#### Stop tokens travel with the graph
+#### HostPC
 
-The EOS ids go into the graph as a floating `Constant` named `hf2mobile_EOS_tokens`. It is the one thing a decode loop needs that is neither an input nor an output, and putting it in the model means a runtime reads it from the file it already has to open — no json to parse, no argument nobody remembers to pass. ONNXRuntime prunes the node before a session exists (it has no consumers), so the runtime walks the protobuf wire format directly to read it.
-
-#### What the runtime does
-
-- **Zero-copy KV cache** — cache tensors stay ORT-side across decode steps, bound by borrowed handle and taken back by handle. Cost per token is a few pointer writes, not tens of MB of `memcpy`. Cache slots are *discovered* (any input `x` with a matching output `x_out`), so layer count and naming can change without touching Rust.
-- **Turn-based generation** — a turn spans calls, so `generate(..., num_generation=1)` polls one token at a time and still pays for prefill exactly once.
-- **One graph, two jobs** — the dynamic-`L` graph serves both prefill (`L = prompt length`, empty cache) and decode (`L = 1`).
-- **`DEBUG=1`** — also writes the Level3-optimized graph as `<model>.ort` and a `chrome://tracing` profile.
+```bash
+hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?"
+```
 
 ```python
 from hf2mobile.inference import CausalLMInferencer
@@ -244,21 +239,30 @@ lm = CausalLMInferencer("inference.onnx", "tokenizer.json")
 text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 ```
 
-#### The same engine, on the phone
+#### Android
 
-Everything above is plain Rust — only the `#[pyclass]` wrapper and the numpy bridge touch Python — so the engine also builds as a standalone executable, `hf2mobile-infer`. One crate, two front ends, picked by a cargo feature: `python` compiles the extension module, `cli` compiles the binary's argument parsing and chat templating, and neither knows about the other.
+`hf2mobile-infer` is the same engine with the pyo3 layer swapped for a CLI, so it cross-compiles — no interpreter, no app, no JNI, and no `libhf2mobile_plugins.so` (the operator is compiled in). Three files go to the phone: the binary, an `arm64-v8a` `libonnxruntime.so` (dlopened, so it is found beside the binary at runtime), and the export directory.
 
-That is what makes on-device measurement cheap. Three files go to the phone and nothing else:
+```bash
+nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
 
-| on the device | why |
-| --- | --- |
-| `hf2mobile-infer` | the engine; ~9 MB, statically carries everything but ONNX Runtime |
-| `libonnxruntime.so` (`arm64-v8a`) | dlopened at startup — `ort/load-dynamic` means the path is a runtime decision, not a link-time one |
-| the export directory | `inference.onnx`, its weights, `tokenizer.json`, and the chat template |
+D=/data/local/tmp/hf2mobile && adb shell mkdir -p $D
+adb push target/aarch64-linux-android/release/hf2mobile-infer libonnxruntime.so $D/
+adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/
+adb shell chmod +x $D/hf2mobile-infer
 
-No app, no JNI, no Python, and no `libhf2mobile_plugins.so` — `SampleLogits` is compiled into the binary and registered in-process. The decode policy and the stop tokens are already in the graph, so a device run is configured by exactly the same flags as a host run, which is what makes the two numbers comparable.
+adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it --prompt 'Where is Paris?'"
+```
 
-The one thing the binary has to do for itself is what `transformers` was doing on the host: **apply the model's chat template**. It renders the export's own Jinja (`chat_template.jinja`, or `chat_template` inside `tokenizer_config.json` for older exports) with the same context `apply_chat_template` builds, so the prompt that reaches the model is the one the model was tuned for — token-for-token identical to the Python path.
+```text
+[hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
+Paris is a French city, which is known for its iconic landmarks and rich history.
+[hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
+```
+
+*(that run is the same binary on the host — a device's numbers will differ, the point is that the two are directly comparable)*
+
+The binary applies the model's chat template itself — the job `transformers` does on the host — rendering the export's own Jinja, so the prompt reaching the model is token-for-token what the Python path produces.
 
 </details>
 
@@ -429,11 +433,11 @@ The same run as step 3 with no interpreter involved: one executable, the same fl
 D=/data/local/tmp/hf2mobile
 adb shell mkdir -p $D
 adb push target/aarch64-linux-android/release/hf2mobile-infer $D/
-adb push libonnxruntime.so $D/                       # jni/arm64-v8a/ out of the AAR
-adb push 2026-08-01__ORT__Qwen-Qwen3-0.6B $D/        # the whole export directory
+adb push libonnxruntime.so $D/                            # jni/arm64-v8a/ out of the AAR
+adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/      # the whole export directory
 adb shell chmod +x $D/hf2mobile-infer
 
-adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__Qwen-Qwen3-0.6B \
+adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
            --prompt 'Where is Paris?' --num-generation 64"
 ```
 
@@ -442,6 +446,8 @@ adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__Qwen-Qwen3-0.6B \
 Paris is a French city, which is known for its iconic landmarks and rich history.
 [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
+
+*(above is the same binary run on the host; a phone's numbers will differ)*
 
 | Argument           | Description                                                                  | Default |
 | ------------------ | ---------------------------------------------------------------------------- | ------- |
