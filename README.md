@@ -162,8 +162,12 @@ The result is a single, extensible pipeline that produces correctly-specialized 
 
 ---
 
-## How it works (example: CausalLM pipeline)
+## How it works
 
+<details>
+<summary>Click to expand</summary>
+
+### EXAMPLE: CausalLM exporter
 Every supported model inherits `CausalLMExporter` (`src/hf2mobile/exporter/causallm.py`), which drives a five-stage export. A single run produces **two graphs** — a **prefill** case (processes the full prompt) and a **generation** case (single-token decode with KV cache in/out) — because those are the two distinct shapes a decoder actually runs at inference time.
 
 | Stage | What happens | Where it lives |
@@ -198,7 +202,7 @@ The graph progresses through the export like this:
 
 ---
 
-## Runtime (Rust)
+### EXAMPLE: CausalLM inference
 
 The exported graph is only half the deliverable; a runtime has to load it. `hf2mobile` ships two Rust crates that share one source file:
 
@@ -209,7 +213,7 @@ The exported graph is only half the deliverable; a runtime has to load it. `hf2m
 
 They are separate crates (and separate cargo workspaces) because they need opposite `ort` configurations: the runtime dlopens onnxruntime, the plugin is already running inside it. But `sample_logits.rs` is compiled into **both**, so the token a mobile runtime picks and the token the dev runtime picks come from one definition.
 
-### `com.hf2mobile:SampleLogits`
+#### `com.hf2mobile:SampleLogits`
 
 ```text
 logits [1, L, vocab]  --SampleLogits(top_k, top_p, temperature)-->  sampled_token [1, 1] int32
@@ -219,11 +223,11 @@ The sampling policy is a set of node attributes baked in at postprocess time, no
 
 `python -m hf2mobile.postprocess` reads the policy from the export's `generation_config.json` / `tokenizer_config.json` (`do_sample: false` ⇒ greedy), so by default the graph decodes the way `model.generate` would have.
 
-### Stop tokens travel with the graph
+#### Stop tokens travel with the graph
 
 The EOS ids go into the graph as a floating `Constant` named `hf2mobile_EOS_tokens`. It is the one thing a decode loop needs that is neither an input nor an output, and putting it in the model means a runtime reads it from the file it already has to open — no json to parse, no argument nobody remembers to pass. ONNXRuntime prunes the node before a session exists (it has no consumers), so the runtime walks the protobuf wire format directly to read it.
 
-### What the runtime does
+#### What the runtime does
 
 - **Zero-copy KV cache** — cache tensors stay ORT-side across decode steps, bound by borrowed handle and taken back by handle. Cost per token is a few pointer writes, not tens of MB of `memcpy`. Cache slots are *discovered* (any input `x` with a matching output `x_out`), so layer count and naming can change without touching Rust.
 - **Turn-based generation** — a turn spans calls, so `generate(..., num_generation=1)` polls one token at a time and still pays for prefill exactly once.
@@ -236,6 +240,8 @@ from hf2mobile.inference import CausalLMInferencer
 lm = CausalLMInferencer("inference.onnx", "tokenizer.json")
 text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 ```
+
+</details>
 
 ---
 
