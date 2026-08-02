@@ -14,8 +14,7 @@ python3 -m hf2mobile.infer       2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Wher
 
 - [Motivation](#motivation)
 - [How hf2mobile tackles it](#how-hf2mobile-tackles-it)
-- [How it works (pipeline)](#how-it-works-pipeline)
-- [Runtime (Rust)](#runtime-rust)
+- [How it works](#how-it-works)
 - [Tested architectures](#tested-architectures)
 - [Requirements](#requirements)
 - [Install](#install)
