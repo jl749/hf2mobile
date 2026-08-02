@@ -1,6 +1,11 @@
 # hf2mobile
 
-Export HuggingFace `transformers` LMs into mobile-targeted ONNX graphs (ONNXRuntime CPU-EP, QNN-EP).
+**Export HuggingFace `transformers` LMs into mobile-targeted ONNX graphs (ONNXRuntime CPU-EP, QNN-EP).**
+
+![Python](https://img.shields.io/badge/python-%3E%3D3.12-3776AB?logo=python&logoColor=white)
+![Rust](https://img.shields.io/badge/rust-extension-000000?logo=rust&logoColor=white)
+![ONNX Runtime](https://img.shields.io/badge/onnxruntime-%3E%3D1.22-005CED?logo=onnx&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ```bash
 python3 -m hf2mobile.export      Qwen/Qwen3-0.6B --target ORT --export_dtype float32           # module-level trace + ORT fusions -> case2.onnx
@@ -10,22 +15,22 @@ python3 -m hf2mobile.infer       2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Wher
 
 ---
 
-## Table of Contents
+## 📖 Table of Contents
 
-- [Motivation](#motivation)
-- [How hf2mobile tackles it](#how-hf2mobile-tackles-it)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Install](#install)
-- [Usage (CLI)](#usage-cli)
-- [Roadmap](#roadmap)
+- [🎯 Motivation](#-motivation) — why operator-level ONNX stopped being enough
+- [🧩 How hf2mobile tackles it](#-how-hf2mobile-tackles-it) — the module boundary as the unit of export
+- [🔧 How it works](#-how-it-works) — the export stages and the Rust runtime
+- [📋 Requirements](#-requirements)
+- [📦 Install](#-install)
+- [🚀 Usage (CLI)](#-usage-cli)
+- [🧭 Roadmap](#-roadmap)
 
 ---
 
-## Motivation
+## 🎯 Motivation
 
 <details>
-<summary>Click to expand</summary>
+<summary><b>Click to expand</b> — why operator-level ONNX stopped being enough</summary>
 
 ### ONNX standardized the *operator* level tracing
 
@@ -109,10 +114,10 @@ Placing the seam is also how the trade above stops being one. It only bites when
 
 ---
 
-## How hf2mobile tackles it
+## 🧩 How hf2mobile tackles it
 
 <details>
-<summary>Click to expand</summary>
+<summary><b>Click to expand</b> — the module boundary as the unit of export</summary>
 
 `hf2mobile` is a framework built **on top of the HuggingFace `transformers` library**. The middle ground the motivation ends on has a concrete location — the **module boundary** — and everything below follows from keeping it. Instead of lowering a model to a flat operator graph and hoping each backend copes, it works one level up:
 
@@ -159,10 +164,10 @@ The result is a single, extensible pipeline that produces correctly-specialized 
 
 ---
 
-## How it works
+## 🔧 How it works
 
 <details>
-<summary>Click to expand</summary>
+<summary><b>Click to expand</b> — export stages, the graph at each step, and the Rust runtime</summary>
 
 ### EXAMPLE: CausalLM exporter
 
@@ -243,7 +248,7 @@ text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 
 ---
 
-## Requirements
+## 📋 Requirements
 
 - Python **>= 3.12**
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
@@ -260,7 +265,7 @@ block in `pyproject.toml`). To use CUDA wheels instead, remove that block.
 
 ---
 
-## Install
+## 📦 Install
 
 ### Default
 
@@ -304,10 +309,10 @@ session = ort.InferenceSession("inference.onnx", opts)
 
 ---
 
-## Usage (CLI)
+## 🚀 Usage (CLI)
 
 <details>
-<summary>Click to expand</summary>
+<summary><b>Click to expand</b> — export, postprocess, infer</summary>
 
 Three commands, run in order. Each takes the *export directory* the previous one produced.
 
@@ -394,16 +399,16 @@ python3 -m hf2mobile.export meta-llama/Llama-3.2-1B-Instruct --target ORT --debu
 
 ---
 
-## Roadmap
+## 🧭 Roadmap
 
 Grouped by the axis each item unblocks. Checked items ship in the current export path; the rest are ordered roughly by priority within each group.
 
-### QNN target (Qualcomm HTP)
+### 📱 QNN target (Qualcomm HTP)
 
 - [ ] **ONNX → DLC conversion & compilation.** CLI to lower the exported ONNX to a Qualcomm DLC and compile per HTP target (v79, v81, …), fetching the resulting `EPContext` `.so`. This is what makes a QNN export actually loadable on-device.
 - [ ] **QNN-scheme quantization.** Quantize following the QNN quantization scheme (HTP prefers `u16` activations over `u8` — see the Quantization group below).
 
-### ORT target (ONNXRuntime)
+### 🧠 ORT target (ONNXRuntime)
 
 - [ ] **More contrib-op fusions.** Extend beyond RMSNorm/GQA to the remaining layer-norm family (`SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`, `SimplifiedLayerNormalization`) so the graph maps onto ORT's optimized kernels.
 - [ ] **MoE and LoRA plugins.** Add module exporters for data-dependent expert routing (MoE) and adapter weights (LoRA) — two of the module types the current static per-case export does not yet cover.
@@ -412,7 +417,7 @@ Grouped by the axis each item unblocks. Checked items ship in the current export
 - [ ] **Multimodal support.** Extend beyond text-only causal LMs to vision-language models (`Qwen2.5-VL`, `Phi-4-multimodal`, …): a separately traced vision encoder feeding a decoder whose sequence length is set by the input image.
 - [ ] **ORT-scheme quantization.** Quantize following the ORT quantization scheme.
 
-### Quantization
+### 🎚 Quantization
 
 Targeting `u16` activations for QNN instead of `u8`, to preserve accuracy on HTP.
 
@@ -420,7 +425,7 @@ Targeting `u16` activations for QNN instead of `u8`, to preserve accuracy on HTP
 - [ ] **SpinQuant / QuaRot (`f16s8`).** Rotation-based outlier suppression (hadamard matrix), starting with the `R1` rotation only(WoQ) before adding the rest.
 - [ ] **AWQ / GPTQ (`f16s8`).** Weight-only PTQ methods for the weight-quantized path.
 
-### Runtime & benchmarking
+### ⏱ Runtime & benchmarking
 
 - [x] **Host-CPU runtime.** Rust ONNXRuntime engine (`hf2mobile._ortrs_binding`) with a zero-copy KV cache and an in-graph `SampleLogits` operator; reports TTFT and TPS per run.
 - [x] **Loadable custom-op library.** `libhf2mobile_plugins.so` — the same operator, as a `.so` any ONNXRuntime binding can register.
