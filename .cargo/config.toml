@@ -1,4 +1,4 @@
-# Cross-compiling `hf2mobile-infer` for a phone. The full walkthrough is RUST_DEV_README §10.
+# Cross-compiling `hf2mobile-infer` for a phone (`nix develop .#android` puts the NDK on $PATH).
 #
 # Rust needs to be told which C compiler links an Android binary, and the `cc` crate needs the
 # same one to build oniguruma (the regex engine inside `tokenizers`). The NDK names its
