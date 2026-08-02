@@ -18,10 +18,10 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 
 - [🎯 Motivation](#-motivation) — why operator-level ONNX stopped being enough
 - [🧩 How hf2mobile tackles it](#-how-hf2mobile-tackles-it) — the module boundary as the unit of export
-- [🔧 How it works](#-how-it-works) — the export stages and the Rust runtime
+- [🔧 How it works](#-how-it-works) — the export stages, and the Rust runtime that runs the result on a phone
 - [📋 Requirements](#-requirements)
 - [📦 Install](#-install)
-- [🚀 Usage (CLI)](#-usage-cli)
+- [🚀 Usage (CLI)](#-usage-cli) — export → postprocess → infer, on the host or over `adb`
 - [🧭 Roadmap](#-roadmap)
 
 ---
@@ -244,6 +244,22 @@ lm = CausalLMInferencer("inference.onnx", "tokenizer.json")
 text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 ```
 
+#### The same engine, on the phone
+
+Everything above is plain Rust — only the `#[pyclass]` wrapper and the numpy bridge touch Python — so the engine also builds as a standalone executable, `hf2mobile-infer`. One crate, two front ends, picked by a cargo feature: `python` compiles the extension module, `cli` compiles the binary's argument parsing and chat templating, and neither knows about the other.
+
+That is what makes on-device measurement cheap. Three files go to the phone and nothing else:
+
+| on the device | why |
+| --- | --- |
+| `hf2mobile-infer` | the engine; ~9 MB, statically carries everything but ONNX Runtime |
+| `libonnxruntime.so` (`arm64-v8a`) | dlopened at startup — `ort/load-dynamic` means the path is a runtime decision, not a link-time one |
+| the export directory | `inference.onnx`, its weights, `tokenizer.json`, and the chat template |
+
+No app, no JNI, no Python, and no `libhf2mobile_plugins.so` — `SampleLogits` is compiled into the binary and registered in-process. The decode policy and the stop tokens are already in the graph, so a device run is configured by exactly the same flags as a host run, which is what makes the two numbers comparable.
+
+The one thing the binary has to do for itself is what `transformers` was doing on the host: **apply the model's chat template**. It renders the export's own Jinja (`chat_template.jinja`, or `chat_template` inside `tokenizer_config.json` for older exports) with the same context `apply_chat_template` builds, so the prompt that reaches the model is the one the model was tuned for — token-for-token identical to the Python path.
+
 </details>
 
 ---
@@ -259,6 +275,12 @@ Everything above comes from `flake.nix`; nothing needs to be installed globally:
 ```bash
 nix develop      # rustc, cargo, rustfmt, rust-analyzer, maturin, python312, uv — and activates .venv
 ```
+
+**To run on an Android device**, additionally:
+
+- The **Android NDK** (its clang links the binary and builds the C sources inside `tokenizers`) and **`adb`** — both in a second shell, `nix develop .#android`, so the multi-GB NDK stays out of the day-to-day one. The `aarch64-linux-android` standard library is already on the toolchain in both shells.
+- An **ONNX Runtime built for `arm64-v8a`** — `jni/arm64-v8a/libonnxruntime.so` out of the [`onnxruntime-android` AAR](https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/). The copy in your `.venv` is an x86-64 host build and will not load on a phone.
+- A device with USB debugging on. Nothing needs root: `/data/local/tmp` is writable *and* executable by `adb shell`.
 
 The package pins CPU-only PyTorch wheels by default (see the `[tool.uv.index]`
 block in `pyproject.toml`). To use CUDA wheels instead, remove that block.
@@ -292,6 +314,18 @@ Re-run `maturin develop --release` after any change under `src/onnx_inferencer/`
 maturin build --release -o dist/
 ```
 
+**The Android CLI** (`hf2mobile-infer` for `aarch64-linux-android` — no Python on the device, so this is a plain cargo build with the NDK on `$PATH`):
+
+```bash
+nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
+# -> target/aarch64-linux-android/release/hf2mobile-infer
+
+file target/aarch64-linux-android/release/hf2mobile-infer
+# ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64, for Android 24
+```
+
+`.cargo/config.toml` names the API-24 clang for both the linker and the `cc` crate; API 24 (Android 7.0) is the floor ONNX Runtime's own Android builds target. `nix develop .#android -c llvm-strip <binary>` roughly halves the 9 MB if the push is slow. The host build of the same binary is just `cargo build --release`.
+
 **The ONNXRuntime plugin library** (only needed to load an `hf2mobile` graph from a runtime *other* than `hf2mobile.infer`, which registers the operator in-process):
 
 ```bash
@@ -312,9 +346,9 @@ session = ort.InferenceSession("inference.onnx", opts)
 ## 🚀 Usage (CLI)
 
 <details>
-<summary><b>Click to expand</b> — export, postprocess, infer</summary>
+<summary><b>Click to expand</b> — export, postprocess, infer, run on device</summary>
 
-Two entry points: `hf2mobile-export` builds the shippable graph (export **and** postprocess), `hf2mobile-inference` runs it. The two stages are also importable/runnable on their own — `python3 -m hf2mobile.export --skip_postprocess` then `python3 -m hf2mobile.postprocess {export dir}` — which is what you want when re-baking the decode policy without re-exporting.
+Two entry points: `hf2mobile-export` builds the shippable graph (export **and** postprocess), `hf2mobile-inference` runs it — and `hf2mobile-infer`, the Rust binary, runs the same thing on a phone (step 4). The two stages are also importable/runnable on their own — `python3 -m hf2mobile.export --skip_postprocess` then `python3 -m hf2mobile.postprocess {export dir}` — which is what you want when re-baking the decode policy without re-exporting.
 
 ### 1. `hf2mobile.export` — HF → ONNX
 
@@ -387,15 +421,44 @@ python3 -m hf2mobile.infer {export dir} --prompt "Where is Paris?"
 
 Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s. No sampling flags — the policy is in the graph.
 
-The same run without Python is `hf2mobile-infer`, the Rust binary — same flags, same output, and cross-compilable to a phone:
+### 4. `hf2mobile-infer` — run it on the device
+
+The same run as step 3 with no interpreter involved: one executable, the same flags, the same output. Build it as shown in [Install](#-install), then push three things and run:
 
 ```bash
-nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
-adb push target/aarch64-linux-android/release/hf2mobile-infer libonnxruntime.so {export dir} /data/local/tmp/hf2mobile/
-adb shell "/data/local/tmp/hf2mobile/hf2mobile-infer /data/local/tmp/hf2mobile/{export dir} --prompt 'Where is Paris?'"
+D=/data/local/tmp/hf2mobile
+adb shell mkdir -p $D
+adb push target/aarch64-linux-android/release/hf2mobile-infer $D/
+adb push libonnxruntime.so $D/                       # jni/arm64-v8a/ out of the AAR
+adb push 2026-08-01__ORT__Qwen-Qwen3-0.6B $D/        # the whole export directory
+adb shell chmod +x $D/hf2mobile-infer
+
+adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__Qwen-Qwen3-0.6B \
+           --prompt 'Where is Paris?' --num-generation 64"
 ```
 
-`libonnxruntime.so` must be the device's ABI — take `jni/arm64-v8a/libonnxruntime.so` out of the [`onnxruntime-android` AAR](https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/); the one in your `.venv` is an x86-64 host build. The binary dlopens whatever it finds beside itself, so nothing needs `ORT_DYLIB_PATH` set. `libhf2mobile_plugins.so` is *not* needed either: `SampleLogits` is compiled into the binary and registered in-process. Push to `/data/local/tmp` — `/sdcard` is mounted `noexec`.
+```text
+[hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
+Paris is a French city, which is known for its iconic landmarks and rich history.
+[hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
+```
+
+| Argument           | Description                                                                  | Default |
+| ------------------ | ---------------------------------------------------------------------------- | ------- |
+| `export_dir`       | A **postprocessed** export directory, as pushed to the device.               | —       |
+| `--prompt`         | User prompt.                                                                  | required |
+| `--skip_template`  | Feed `--prompt` verbatim instead of through the model's chat template.        | off |
+| `--num-generation` | Maximum tokens to generate.                                                   | `512` |
+| `--intra-threads`  | ORT intra-op thread count.                                                    | one per core |
+| `--ort-dylib`      | Where to dlopen ONNX Runtime from.                                            | `$ORT_DYLIB_PATH`, else beside the binary or in the export dir |
+
+Notes for a device run:
+
+- **`/data/local/tmp`, not `/sdcard`** — the latter is mounted `noexec`.
+- **No `ORT_DYLIB_PATH` needed.** The binary looks beside itself and in the export directory, which is why pushing the `.so` next to it is enough.
+- **Sweep `--intra-threads`.** On big.LITTLE the default (one thread per core) puts work on little cores that then hold the fast ones up; matching the big cluster is often quicker than using every core.
+- **Compare a second run against the first.** Thermal throttling shows up as tok/s falling across a run, so one number on a warm phone is not a measurement.
+- The binary runs on the host too (`./target/release/hf2mobile-infer …`), which is the way to check an export before pushing it anywhere.
 
 ### Examples
 
@@ -447,7 +510,8 @@ Targeting `u16` activations for QNN instead of `u8`, to preserve accuracy on HTP
 
 - [x] **Host-CPU runtime.** Rust ONNXRuntime engine (`hf2mobile._ortrs_binding`) with a zero-copy KV cache and an in-graph `SampleLogits` operator; reports TTFT and TPS per run.
 - [x] **Loadable custom-op library.** `libhf2mobile_plugins.so` — the same operator, as a `.so` any ONNXRuntime binding can register.
-- [ ] **On-device Android execution.** Cross-compile both crates for `aarch64-linux-android` so an exported model runs end-to-end on device.
+- [x] **Android CLI.** `hf2mobile-infer` — the engine as a standalone `aarch64-linux-android` executable (no Python, no app), which renders the model's chat template itself and finds ONNX Runtime beside itself. `adb push` binary + `libonnxruntime.so` + export directory, and an exported model decodes on the device it was exported for.
+- [ ] **Android CI / device verification.** The cross build and the produced ELF are checked; running it against a physical device is still manual. Also cross-compile `src/onnx_plugins` for `aarch64-linux-android`, which an app driving ORT through its Java API needs.
 - [ ] **Benchmark harness.** Extend the per-run TTFT/TPS numbers into peak memory and a comparison across targets.
 - [ ] **More logits dtypes.** `SampleLogits` has an fp32 kernel only; fp16 needs one registration each side.
 - [ ] **Regression testing (pytest).** Extend the per-architecture suite under `tests/`, including numerical parity of the exported graph against the `transformers` baseline it was traced from.
