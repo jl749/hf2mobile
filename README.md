@@ -94,22 +94,10 @@ For testing:
 nix develop
 
 # 1. Build the whl and so
-maturin build --release -o dist/                                    # build the wheel
+maturin build --release -o dist/
 
 # 2. Install
 uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
-
-# 3. Run Inference
-## METHOD1 (use hf2mobild.infer module)
-hf2mobile-inference {export dir} --prompt "Where is Paris?"
-## METHOD2 (rewrite inference loop with python api)
-cargo build --release --manifest-path src/onnx_plugins/Cargo.toml   # libhf2mobile_plugins.so
-python3 << 'EOF'
-import onnxruntime as ort
-opts = ort.SessionOptions()
-opts.register_custom_ops_library("src/onnx_plugins/target/release/libhf2mobile_plugins.so")
-session = ort.InferenceSession("{export dir}/inference.onnx", opts)
-EOF
 ```
 
 ### Android
@@ -124,13 +112,11 @@ cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
 file target/aarch64-linux-android/release/hf2mobile-infer # ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64, for Android 24
 
 # 2. Install
+D=/data/local/tmp/hf2mobile
 ORT=1.27.0  # match the host: python -c 'import onnxruntime; print(onnxruntime.__version__)'
 curl -sLO https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/$ORT/onnxruntime-android-$ORT.aar
 unzip -j onnxruntime-android-$ORT.aar 'jni/arm64-v8a/libonnxruntime.so' -d .
 file libonnxruntime.so # ELF 64-bit LSB shared object, ARM aarch64, for Android 24, stripped
-
-# 3. Run Inference
-D=/data/local/tmp/hf2mobile
 adb shell mkdir -p $D
 adb push target/aarch64-linux-android/release/hf2mobile-infer libonnxruntime.so $D/
 adb shell chmod +x $D/hf2mobile-infer
@@ -209,6 +195,10 @@ hf2mobile-export google/gemma-3-270m-it --target ORT --temp 0
 hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
 ```
 
+<video src="https://github.com/jl749/hf2hw/raw/main/docs/hostpc_inference_example.webm" controls muted width="600">
+  <a href="docs/hostpc_inference_example.webm">hostpc_inference_example.webm</a> — decoding in the venv on the host.
+</video>
+
 </details>
 
 <details>
@@ -223,20 +213,11 @@ D=/data/local/tmp/hf2mobile
 adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/
 adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
            --prompt 'Where is Paris?' --num-generation 64"
-# [hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
-# Paris is a French city, which is known for its iconic landmarks and rich history.
-# [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
 
-The host command with a different binary in front of it — same flags, plus one:
-
-| Argument      | Description                               | Default |
-| ------------- | ----------------------------------------- | ------- |
-| `--ort-dylib` | Where to dlopen `libonnxruntime.so` from. | `$ORT_DYLIB_PATH`, else beside the binary, else the export dir |
-
-- **`/data/local/tmp`, not `/sdcard`** — the latter is mounted `noexec`.
-- **Sweep `--intra-threads`.** The default (one per core) puts work on little cores that then hold the big ones up.
-- **Compare a second run against the first.** Falling tok/s within a run is thermal throttling, so one number on a warm phone is not a measurement.
+<video src="https://github.com/jl749/hf2hw/raw/main/docs/android_inference_example.webm" controls muted width="600">
+  <a href="docs/android_inference_example.webm">android_inference_example.webm</a> — decoding on-device over <code>adb</code>.
+</video>
 
 </details>
 
