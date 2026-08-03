@@ -161,21 +161,21 @@ hf2mobile-export {HF repo id} --target {ORT|QNN}
 | `-t`, `--target` | Export target: `ORT` or `QNN`. Graph topology may change based on it.   | `ORT`   |
 | `--export_dtype` | `float32` / `float16` / `bfloat16`. Casts the weights before tracing, fixing the exported graph's dtype. | the model's own dtype |
 | `--debug`        | Force a tiny random-init model (2 layers) + DEBUG logging for a fast smoke test. Also keeps the intermediate graphs. | off |
-| `--skip_postprocess` | Stop after the ONNX export, leaving `inference.onnx` to a separate `hf2mobile.postprocess` run. | off |
-| *(postprocess flags)* | `--top_k`, `--top_p`, `--temp`, `--eos_tokens`, `--keep_logits`, `-o` — the same parser as [2.](#2-hf2mobilepostprocess--bake-in-the-decode-policy), reused here. | from `generation_config.json` |
+| `--skip_postprocess` | Stop after the ONNX export, leaving the decode policy to a separate `python3 -m hf2mobile.postprocess {export dir}` run. | off |
+| *(postprocess flags)* | `--top_k`, `--top_p`, `--temp`, `--eos_tokens`, `--keep_logits`, `-o` — the postprocess parser, reused here. | from `generation_config.json` |
 
-Output lands in a timestamped directory named `{date}__{target}__{model}`:
+Output lands in a timestamped `{date}__{target}__{model}/`:
 
 ```
 2026-08-01__ORT__Qwen-Qwen3-0.6B/
-├── case2.onnx + case2.onnx.data           the dynamic-L generation graph (serves prefill and decode both)
-├── inference.onnx + inference.onnx.data   case2 + the baked-in decode policy — what you ship (see 2.)
-├── tokenizer.json                         handed to the runtime, which does all the tokenizing
-├── tokenizer_config.json                  the chat template
-└── generation_config.json                 the sampling policy + EOS ids that `postprocess` reads
+├── case2.onnx + .data           the dynamic-L graph — serves prefill and decode both
+├── inference.onnx + .data       case2 + the baked-in decode policy — what you ship
+├── tokenizer.json               the runtime does all the tokenizing
+├── tokenizer_config.json        the chat template
+└── generation_config.json       the sampling policy + EOS ids postprocess reads
 ```
 
-Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot as well as `case1.onnx`, plus the standalone module subgraphs.
+Prefill and generation are traced separately, but the ORT deliverable is the one dynamic-`L` graph that serves both, so `case1.onnx` is deleted at the end. `--debug` keeps it, plus the module subgraphs.
 
 #### 2. `hf2mobile.infer` — run it
 
@@ -212,46 +212,13 @@ hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is P
 <details>
 <summary><b>📱 Android</b> — export on the host, run it over <code>adb</code></summary>
 
-#### 1. `hf2mobile.export` — HF → ONNX
-```bash
-nix develop .#android
-
-hf2mobile-export {HF repo id} --target {ORT|QNN}
-```
-
-Supported architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Gemma3ForCausalLM`.
-
-| Argument         | Description                                                              | Default |
-| ---------------- | ----------------------------------------------------------------------- | ------- |
-| `repo_id`        | Hugging Face repo id of the model to export.                            | —       |
-| `-t`, `--target` | Export target: `ORT` or `QNN`. Graph topology may change based on it.   | `ORT`   |
-| `--export_dtype` | `float32` / `float16` / `bfloat16`. Casts the weights before tracing, fixing the exported graph's dtype. | the model's own dtype |
-| `--debug`        | Force a tiny random-init model (2 layers) + DEBUG logging for a fast smoke test. Also keeps the intermediate graphs. | off |
-| `--skip_postprocess` | Stop after the ONNX export, leaving `inference.onnx` to a separate `hf2mobile.postprocess` run. | off |
-| *(postprocess flags)* | `--top_k`, `--top_p`, `--temp`, `--eos_tokens`, `--keep_logits`, `-o` — the same parser as [2.](#2-hf2mobilepostprocess--bake-in-the-decode-policy), reused here. | from `generation_config.json` |
-
-Output lands in a timestamped directory named `{date}__{target}__{model}`:
-
-```
-2026-08-01__ORT__Qwen-Qwen3-0.6B/
-├── case2.onnx + case2.onnx.data           the dynamic-L generation graph (serves prefill and decode both)
-├── inference.onnx + inference.onnx.data   case2 + the baked-in decode policy — what you ship (see 2.)
-├── tokenizer.json                         handed to the runtime, which does all the tokenizing
-├── tokenizer_config.json                  the chat template
-└── generation_config.json                 the sampling policy + EOS ids that `postprocess` reads
-```
-
-Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot as well as `case1.onnx`, plus the standalone module subgraphs.
-
-#### 2. `hf2mobile-infer` - run it
-
-The three files this needs — the cross-compiled binary, `libonnxruntime.so` and the export directory from step 1 — are pushed to `$D` in [Install → Android](#android).
+Exporting is host work — [step 1 above](#1-hf2mobileexport--hf--onnx), unchanged. What differs is the run: the binary and `libonnxruntime.so` are already on the device from [Install → Android](#android), so only the export directory still has to go over.
 
 ```bash
 nix develop .#android
 
 D=/data/local/tmp/hf2mobile
-adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/   # step 1's output, if not already there
+adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/
 adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
            --prompt 'Where is Paris?' --num-generation 64"
 # [hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
@@ -259,20 +226,15 @@ adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
 # [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
 
-| Argument           | Description                                                                  | Default |
-| ------------------ | ---------------------------------------------------------------------------- | ------- |
-| `export_dir`       | A **postprocessed** export directory (must hold `inference.onnx`).           | —       |
-| `--prompt`         | User prompt.                                                                  | required |
-| `--skip_template`  | Feed `--prompt` verbatim instead of through the tokenizer's chat template. `--skip-template` is accepted too. | off |
-| `--num-generation` | Maximum tokens to generate.                                                   | `512` |
-| `--intra-threads`  | ORT intra-op thread count.                                                    | one per core |
-| `--ort-dylib`      | Where to dlopen `libonnxruntime.so` from.                                     | `$ORT_DYLIB_PATH`, else beside the binary, else the export dir |
+A device run is [step 2 above](#2-hf2mobileinfer--run-it) with a different binary in front of it — same flags, plus one:
 
-The same flags as [2.](#2-hf2mobileinfer--run-it) on the host — a device run is the host command with a different binary in front of it — plus `--ort-dylib`. Its fallback chain is why the push above needs nothing set in the environment. How to decode is not a flag on either side: the sampling policy and stop tokens are baked into the graph.
+| Argument      | Description                               | Default |
+| ------------- | ----------------------------------------- | ------- |
+| `--ort-dylib` | Where to dlopen `libonnxruntime.so` from. | `$ORT_DYLIB_PATH`, else beside the binary, else the export dir |
 
 - **`/data/local/tmp`, not `/sdcard`** — the latter is mounted `noexec`.
-- **Sweep `--intra-threads`.** On big.LITTLE the default (one thread per core) puts work on little cores that then hold the fast ones up; matching the big cluster is often quicker.
-- **Compare a second run against the first.** Thermal throttling shows up as tok/s falling across a run, so one number on a warm phone is not a measurement.
+- **Sweep `--intra-threads`.** The default (one per core) puts work on little cores that then hold the big ones up.
+- **Compare a second run against the first.** Falling tok/s within a run is thermal throttling, so one number on a warm phone is not a measurement.
 
 </details>
 
@@ -280,36 +242,41 @@ The same flags as [2.](#2-hf2mobileinfer--run-it) on the host — a device run i
 
 ## 🧭 Roadmap
 
-Grouped by the axis each item unblocks. Checked items ship in the current export path; the rest are ordered roughly by priority within each group.
+<details>
+<summary><b>Click to expand</b> — what ships today, and what is next per axis</summary>
+
+Checked items are in the current export path; the rest are ordered by priority within each group.
 
 ### 📱 QNN target (Qualcomm HTP)
 
-- [ ] **ONNX → DLC conversion & compilation.** CLI to lower the exported ONNX to a Qualcomm DLC and compile per HTP target (v79, v81, …), fetching the resulting `EPContext` `.so`. This is what makes a QNN export actually loadable on-device.
-- [ ] **QNN-scheme quantization.** Quantize following the QNN quantization scheme (HTP prefers `u16` activations over `u8` — see the Quantization group below).
+- [ ] **ONNX → DLC.** Lower and compile per HTP target (v79, v81, …), fetching the `EPContext` `.so` — what makes a QNN export loadable on-device.
+- [ ] **QNN-scheme quantization.** HTP prefers `u16` activations over `u8`.
 
 ### 🧠 ORT target (ONNXRuntime)
 
-- [ ] **More contrib-op fusions.** Extend beyond RMSNorm/GQA to the remaining layer-norm family (`SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`, `SimplifiedLayerNormalization`) so the graph maps onto ORT's optimized kernels.
-- [ ] **MoE and LoRA plugins.** Add module exporters for data-dependent expert routing (MoE) and adapter weights (LoRA) — two of the module types the current static per-case export does not yet cover.
-- [ ] **Per-token control flow.** Module exporters for Mixture-of-Depths and early-exit decoders, where whether a block runs at all is decided per token — the one axis in the [motivation](docs/motivation.md) with no de facto answer in any runtime today.
-- [ ] **NPU/CPU EP partition.** Assign the fused attention node to the CPU EP and the statically-shaped blocks (QKV projections, MLP) to the NPU EP within a single session, so one graph covers both backends.
-- [ ] **Multimodal support.** Extend beyond text-only causal LMs to vision-language models (`Qwen2.5-VL`, `Phi-4-multimodal`, …): a separately traced vision encoder feeding a decoder whose sequence length is set by the input image.
-- [ ] **ORT-scheme quantization.** Quantize following the ORT quantization scheme.
+- [ ] **More contrib-op fusions.** The rest of the layer-norm family beyond RMSNorm/GQA.
+- [ ] **MoE and LoRA plugins.** Module exporters for expert routing and adapter weights.
+- [ ] **Per-token control flow.** Mixture-of-Depths and early-exit decoders — the [motivation](docs/motivation.md)'s one axis with no answer in any runtime today.
+- [ ] **NPU/CPU EP partition.** Fused attention on the CPU EP, statically-shaped blocks on the NPU EP, one session.
+- [ ] **Multimodal support.** Vision-language models: a separately traced vision encoder feeding the decoder.
+- [ ] **ORT-scheme quantization.**
 
 ### 🎚 Quantization
 
 Targeting `u16` activations for QNN instead of `u8`, to preserve accuracy on HTP.
 
-- [ ] **SmoothQuant (`u8s8`).** Migrate activation outliers into weights (fold diagonal matrix) so both sides quantize cleanly.
-- [ ] **SpinQuant / QuaRot (`f16s8`).** Rotation-based outlier suppression (hadamard matrix), starting with the `R1` rotation only(WoQ) before adding the rest.
-- [ ] **AWQ / GPTQ (`f16s8`).** Weight-only PTQ methods for the weight-quantized path.
+- [ ] **SmoothQuant (`u8s8`).** Migrate activation outliers into the weights so both sides quantize cleanly.
+- [ ] **SpinQuant / QuaRot (`f16s8`).** Rotation-based outlier suppression, `R1` only (WoQ) first.
+- [ ] **AWQ / GPTQ (`f16s8`).** Weight-only PTQ.
 
 ### ⏱ Runtime & benchmarking
 
-- [x] **Host-CPU runtime.** Rust ONNXRuntime engine (`hf2mobile._ortrs_binding`) with a zero-copy KV cache and an in-graph `SampleLogits` operator; reports TTFT and TPS per run.
-- [x] **Loadable custom-op library.** `libhf2mobile_plugins.so` — the same operator, as a `.so` any ONNXRuntime binding can register.
-- [x] **Android CLI.** `hf2mobile-infer` — the engine as a standalone `aarch64-linux-android` executable (no Python, no app), which renders the model's chat template itself and finds ONNX Runtime beside itself. `adb push` binary + `libonnxruntime.so` + export directory, and an exported model decodes on the device it was exported for.
-- [ ] **Android CI / device verification.** The cross build and the produced ELF are checked; running it against a physical device is still manual. Also cross-compile `src/onnx_plugins` for `aarch64-linux-android`, which an app driving ORT through its Java API needs.
-- [ ] **Benchmark harness.** Extend the per-run TTFT/TPS numbers into peak memory and a comparison across targets.
-- [ ] **More logits dtypes.** `SampleLogits` has an fp32 kernel only; fp16 needs one registration each side.
-- [ ] **Regression testing (pytest).** Extend the per-architecture suite under `tests/`, including numerical parity of the exported graph against the `transformers` baseline it was traced from.
+- [x] **Host-CPU runtime.** Rust ORT engine (`_ortrs_binding`): zero-copy KV cache, in-graph `SampleLogits`, TTFT/TPS per run.
+- [x] **Loadable custom-op library.** `libhf2mobile_plugins.so` — the same operator for any other ORT binding.
+- [x] **Android CLI.** `hf2mobile-infer` — standalone `aarch64-linux-android`, no Python, renders the chat template itself.
+- [ ] **Android CI / device verification.** The cross build is checked; a physical-device run, and the plugin `.so` an app would load, are still manual.
+- [ ] **Benchmark harness.** Peak memory and a cross-target comparison, beyond TTFT/TPS.
+- [ ] **More logits dtypes.** `SampleLogits` is fp32-only; fp16 needs one registration each side.
+- [ ] **Regression testing (pytest).** Extend `tests/`, including numerical parity against the `transformers` baseline.
+
+</details>
