@@ -2,5 +2,11 @@ __pycache__/
 .venv/
 .uv_cache/
 .hf_cache/
-.cargo/
+.cargo/*
+!.cargo/config.toml
 target/
+*__ORT__*/
+*__QNN__*/
+
+# maturin drops the compiled extension next to the Python package
+*.abi3.so

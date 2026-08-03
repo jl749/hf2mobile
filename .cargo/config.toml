@@ -1,0 +1,23 @@
+# Cross-compiling `hf2mobile-infer` for a phone (`nix develop .#android` puts the NDK on $PATH).
+#
+# Rust needs to be told which C compiler links an Android binary, and the `cc` crate needs the
+# same one to build oniguruma (the regex engine inside `tokenizers`). The NDK names its
+# compilers after the *API level* — `aarch64-linux-android24-clang`, not the bare triple cargo
+# would guess — so both have to be spelled out here. Put the NDK toolchain on $PATH first:
+#
+#     export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/<version>"
+#     export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+#     cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
+#
+# API 24 (Android 7.0) is the floor ONNX Runtime's own Android builds target, so a binary that
+# runs anywhere ORT does needs nothing older.
+#
+# Nothing here affects a host build: cargo reads a `[target.<triple>]` section only when
+# building for that triple, and the `CC_*`/`AR_*` variables are per-target by name.
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+
+[env]
+CC_aarch64_linux_android = "aarch64-linux-android24-clang"
+AR_aarch64_linux_android = "llvm-ar"

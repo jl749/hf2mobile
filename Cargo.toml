@@ -6,10 +6,31 @@ publish = false
 
 # Built by maturin into `hf2mobile._ortrs_binding` (see [tool.maturin] in pyproject.toml).
 # Sources live under src/onnx_inferencer/ so they sit next to the Python package.
+#
+# `rlib` is here as well as `cdylib` so the `hf2mobile-infer` binary below can link the same
+# code Python imports — a cdylib alone is only loadable by a host process (`import`, `dlopen`).
 [lib]
 name       = "_ortrs_binding"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 path       = "src/onnx_inferencer/lib.rs"
+
+# The standalone CLI: the same engine as `python -m hf2mobile.infer`, with no interpreter in the
+# picture, so it can be cross-compiled and pushed to a phone. `required-features` is what keeps
+# `cargo build --no-default-features` (what maturin runs) from trying to link an executable.
+[[bin]]
+name              = "hf2mobile-infer"
+path              = "src/onnx_inferencer/main.rs"
+required-features = ["cli"]
+
+[features]
+# `cargo build` gives you the CLI; the Python extension asks for `python` explicitly.
+default = ["cli"]
+# The standalone binary: argument parsing and the chat template, neither of which the
+# Python path needs — `hf2mobile.infer` parses its own flags and `transformers` owns the template.
+cli     = ["dep:clap", "dep:minijinja", "dep:minijinja-contrib", "dep:serde_json"]
+# The `hf2mobile._ortrs_binding` extension module. Built by maturin together with
+# `pyo3/extension-module`; on its own it would link against libpython.
+python  = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
 # `load-dynamic` dlopens libonnxruntime at runtime (path via ORT_DYLIB_PATH), so we
@@ -26,11 +47,25 @@ anyhow  = "1"
 # Used by the `SampleLogits` kernel this crate registers (`src/onnx_plugins/sample_logits.rs`)
 # for the temperature/top-k/top-p draw; a graph baked greedy never touches it.
 rand    = "0.9"
-pyo3    = { version = "0.22", features = ["extension-module", "abi3-py312", "anyhow"] }
-numpy   = { version = "0.22", features = ["half"] }
+pyo3    = { version = "0.22", features = ["extension-module", "abi3-py312", "anyhow"], optional = true }
+numpy   = { version = "0.22", features = ["half"], optional = true }
 # HuggingFace tokenizers — the performant (Rust) tokenizer. Inference only, so we drop
 # the training-only extras (esaxx_fast, progressbar) and keep the onig regex backend.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# ── `cli` only ──────────────────────────────────────────────────────────────────────────
+# Argument parsing. `default-features = false` drops the colours/suggestions machinery, which
+# is dead weight in `adb shell`.
+clap    = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"], optional = true }
+# Renders the model's own Jinja `chat_template`, which is what `transformers` does in
+# `hf2mobile.infer`. Pure Rust, so it cross-compiles to Android with everything else.
+minijinja  = { version = "2", default-features = false, features = ["builtins", "loop_controls", "serde", "std_collections", "macros", "multi_template", "adjacent_loop_items"], optional = true }
+# `pycompat`: HF templates are written against Jinja2-on-Python and freely call Python's own
+# string/dict methods (`.startswith`, `.items()`, `.strip()`), which Jinja itself does not
+# define. This crate implements them; without it Qwen3's template fails on its 20th line.
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"], optional = true }
+# Reads `tokenizer_config.json` for that template. Already in the tree via `tokenizers`.
+serde_json = { version = "1", optional = true }
 
 [profile.release]
 lto       = "thin"

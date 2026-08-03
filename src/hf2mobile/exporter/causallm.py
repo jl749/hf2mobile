@@ -130,7 +130,7 @@ class CausalLMExporter(
             if case_idx == 0:
                 if logger.isEnabledFor(logging.DEBUG):
                     self.make_dynamic_onnx(model_ir, allowzero=1)
-                    attach_sliding_window_mask_onnx(model_ir, self._name2module)
+                    # attach_sliding_window_mask_onnx(model_ir, self._name2module)  # TODO: will fail fix bug
                     _n = fuse_rms_norm(model_ir)
                     save_onnx_ir(model_ir, f"debug__{onnx_path}")
                     Path(f"debug__{onnx_path}.data").unlink(missing_ok=True)

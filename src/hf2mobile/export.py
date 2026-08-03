@@ -7,6 +7,7 @@ TODO: ...
 import argparse
 import logging
 import os
+from pathlib import Path
 from typing import Literal
 
 import torch
@@ -19,6 +20,7 @@ from .exporter import (
     Qwen2ForCausalLMExporter,
     Qwen3ForCausalLMExporter,
 )
+from .postprocess import postprocess, sampling_kwargs, sampling_parser
 from .utils.logger import logger
 
 EXPORT_DTYPES = {
@@ -33,7 +35,7 @@ def export(
     target: Literal["ORT", "QNN"],
     export_dtype: str | None = None,
     debug: bool = False,
-):
+) -> Path:
     assert (
         target in SUPPORTED_TARGETS
     ), f"Unsupported `{target=}`. Currently supported targets are: `{SUPPORTED_TARGETS}`."
@@ -83,12 +85,17 @@ def export(
         f"export: done — `{model_id}` → ONNX "
         f"(target={target}, export_dtype={export_dtype}); exported_onnx_paths={relative_onnx_paths}"
     )
+    return Path(exported_onnx_paths[0]).parent
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="python -m hf2mobile.export",
-        description="Export a Hugging Face causal LM to a hardware-targeted ONNX model.",
+        prog="hf2mobile-export",
+        description=(
+            "Export a Hugging Face causal LM to a hardware-targeted ONNX model, then bake the "
+            "decode policy into it (`hf2mobile.export` followed by `hf2mobile.postprocess`)."
+        ),
+        parents=[sampling_parser()],
     )
     parser.add_argument(
         "repo_id",
@@ -112,9 +119,19 @@ def main():
         action="store_true",
         help="Force a tiny random-init model (num_hidden_layers=2) and DEBUG logging for quick debugging.",
     )
+    parser.add_argument(
+        "--skip_postprocess",
+        action="store_true",
+        help="Stop after the ONNX export; do not attach the sampling plugin (see `hf2mobile.postprocess`).",
+    )
     args = parser.parse_args()
 
-    export(args.repo_id, args.target, export_dtype=args.export_dtype, debug=args.debug)
+    export_dir = export(args.repo_id, args.target, export_dtype=args.export_dtype, debug=args.debug)
+    if args.skip_postprocess:
+        logger.info(f"export: --skip_postprocess — run `python -m hf2mobile.postprocess {export_dir}` to finish")
+        return
+
+    postprocess(export_dir, **sampling_kwargs(args))
 
 
 if __name__ == "__main__":

@@ -13,13 +13,14 @@ It takes an *export directory* — `hf2mobile.export` wrote and `hf2mobile.postp
 Nothing about *how* to decode is passed in here.
 The sampling strategy as well as the EOS markers live under the postprocessed graph.
 
-    >>> python -m hf2mobile.export {hf repo id} --target ORT --export_dtype {bf16/fp16/fp32}
+    >>> hf2mobile-export {hf repo id} --target ORT --export_dtype {bf16/fp16/fp32}
+    ... which is `hf2mobile.export` followed by `hf2mobile.postprocess`, the latter also runnable on its own:
     >>> python -m hf2mobile.postprocess {export dir} {... optional flags ...}
 
 KV cache management as well as token encoding/decoding are handled within the rust runtime.
 
 Usage:
-    python -m hf2mobile.infer {export dir} --prompt "Where is Paris?"
+    hf2mobile-inference {export dir} --prompt "Where is Paris?"
 """
 
 import argparse
@@ -50,7 +51,7 @@ def apply_chat_template(tokenizer, prompt: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        prog="python -m hf2mobile.infer",
+        prog="hf2mobile-inference",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
