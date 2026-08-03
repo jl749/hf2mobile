@@ -80,7 +80,9 @@ Attention has correspondingly shifted from the operator view toward a **module /
 
 The incompatibility is not naming, it is **who owns what**: who allocates the cache, who advances the position, who tracks sequence length. A converter cannot mechanically rewrite one into another, because what it would be rewriting is not the same node; it is a different answer to where the runtime ends and the graph begins.
 
-So the module level is where the performance lives, and — being plugin-centric — where portability stops. A graph containing `GroupQueryAttention` is an *ONNXRuntime* graph, not an ONNX one. Decompose it back to `MatMul`/`Softmax`/`Concat` and the file translates again, at the price of the concatenate-and-copy KV growth, the fused kernel, and often the accelerator partition with it.
+> **So the module level is where the performance lives, and — being plugin-centric — where portability stops.**
+
+A graph containing `GroupQueryAttention` is an *ONNXRuntime* graph, not an ONNX one. Decompose it back to `MatMul`/`Softmax`/`Concat` and the file translates again, at the price of the concatenate-and-copy KV growth, the fused kernel, and often the accelerator partition with it.
 
 With no standard at that level, model publishers, agent frameworks, and distribution hubs each re-implement the same per-target conversion glue. Every converter below reads standard ONNX and nothing else, so an export falls off this table the moment it uses the plugin that made the model fast:
 
@@ -91,9 +93,6 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 | ONNX → OpenVINO | [ONNX2OVIR](https://docs.openvino.ai/2026/openvino-workflow/model-preparation/convert-model-onnx.html)  |
 | ONNX → IREE     | [ONNX2MLIR](https://iree.dev/guides/ml-frameworks/onnx/)                                                |
 
-> **The choice as it stands:** a **fast** export bound to one runtime, or a **portable** export that gave up the reason you exported at all.
-> `hf2mobile` targets exactly that middle ground.
-
 </details>
 
 ---
@@ -103,51 +102,47 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 <details>
 <summary><b>Click to expand</b> — the module boundary as the unit of export</summary>
 
-`hf2mobile` is a framework built **on top of the HuggingFace `transformers` library**. The motivation ends on a choice between a fast export bound to one runtime and a portable export that gave up the reason you exported at all. The way out has a concrete location — the **module boundary** — and everything below follows from keeping it. Instead of lowering a model to a flat operator graph and hoping each backend copes, it works one level up:
+`hf2mobile` is built **on top of HuggingFace `transformers`**. The motivation leaves a choice between a fast export bound to one runtime and a portable export that gave up the reason you exported at all. The way out is to work one level up from the flat operator graph — at the **module boundary**:
 
-1. **Trace at the *module* level, not the operator level.** The model is traced as its semantic building blocks — attention, RoPE, RMSNorm, the causal LM head — rather than as an undifferentiated soup of `MatMul` / `Mul` / `Softmax`. `transformers` is what makes that practical: every architecture is defined against the same template — `Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding` — so the semantic boundaries are already drawn, consistently, by the library the models are published with. An `Attention` `torch.nn.Module` leaves the trace as **one node**, keeping its full identity (`Qwen3Attention`, `model.layers.0.self_attn`) all the way into the graph.
-2. **Expand the module level nodes — per target, and per strategy.** A traced module knows how to emit the right subgraph for its `--target`: a fused GQA/attention plugin for a runtime that supports it, a sliding-window mask template for another, or a single-head decomposition for an NPU that lacks fused attention. Same node, different expansions, decided at export time.
-3. **Generalize by extending the existing exporter api, not by rewriting the graph lazily.** A plugin is selected by class-name *suffix*, so one `Attention` exporter covers every architecture that follows the convention instead of one exporter per model. Supporting a new architecture or a new hardware/runtime target means contributing a small, self-contained exporter — the framework handles the rest.
+1. **Trace at the *module* level.** The model is recorded as its semantic building blocks — attention, RoPE, RMSNorm, the LM head — rather than a soup of `MatMul` / `Mul` / `Softmax`. `transformers` makes this practical: every architecture follows the same template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`), so the boundaries are already drawn by the library the models ship with. An `Attention` module leaves the trace as **one node**, identity intact (`Qwen3Attention`, `model.layers.0.self_attn`).
+2. **Expand those nodes per target, per strategy.** The same node emits a fused GQA plugin for one runtime, a sliding-window mask template for another, or a single-head decomposition for an NPU with no fused attention — decided at export time.
+3. **Extend the exporter API, don't pattern-match the graph.** Plugins are selected by class-name *suffix*, so one `Attention` exporter covers every architecture that follows the convention. New architecture or new target = one small, self-contained exporter.
 
-The rest is extension rather than replacement:
-
-- **Reused** — `transformers` module definitions as the semantic baseline; ORT contrib ops (`GroupQueryAttention`, RMSNorm / RoPE fusions); ORT execution providers and `EPContext` for placement.
-- **Added** — the module-level tracer and plugin registry, the per-target expanders, `SampleLogits` and the in-graph EOS constant, and the Rust runtime that drives them.
+**Reused** — `transformers` module definitions, ORT contrib ops (`GroupQueryAttention`, RMSNorm/RoPE fusions), ORT execution providers and `EPContext`.
+**Added** — the module-level tracer and plugin registry, the per-target expanders, `SampleLogits` and the in-graph EOS constant, and the Rust runtime.
 
 ### The plugin node is the unit of control
 
-Holding `Attention` as a single node until the last step is what makes the divergence *yours*. The HuggingFace module is the baseline, and every expansion is a deliberate, legible departure from it — chosen per target and per strategy, rather than being whatever a converter's pattern matcher happened to recognize in a graph that had already been flattened. The user decides how far the ported graph moves from the baseline, and where.
+Holding `Attention` as a single node until the last step is what makes the divergence *yours*: the HuggingFace module is the baseline, and every expansion is a deliberate departure from it — not whatever a converter's pattern matcher recognized in an already-flattened graph.
 
-It is also what survives the trade the motivation ends on:
+> The portable artifact is **not the exported file**. A graph carrying `GroupQueryAttention` is an ONNXRuntime graph, and nothing changes that — what stays portable is the **module-level description one step upstream**, which every target's file is generated *from*.
 
-> The portable artifact is **not the exported file**. A graph carrying `GroupQueryAttention` is an ONNXRuntime graph, and no amount of care changes that — what stays portable is the **module-level description one step upstream of it**, which every target's file is generated *from*.
-
-Being plugin-centric stops being a property you are stuck with, because what you keep is the description rather than any one expansion of it.
+Being plugin-centric stops being a trap once what you keep is the description rather than any one expansion of it.
 
 ### Placing the seam: one graph, more than one backend
 
-The goal is not merely to emit a graph a mobile runtime will accept — it is to emit one that lands on the right silicon. A phone has both an NPU and a CPU, so the interesting question is never which of the two to pick; it is **where to put the seam between them**:
+A phone has both an NPU and a CPU, so the question is never which to pick — it is **where to put the seam**:
 
 | Side | Takes | Because |
 | ---- | ----- | ------- |
 | **NPU** | compute-heavy, statically-shaped blocks — the MLP stack, the projections | that is where the TOPS are |
-| **CPU** | control flow, sampling, dynamic-shaped glue, the KV cache and the attention that reads it, and any operator the accelerator has no kernel for | that is where the flexibility is |
+| **CPU** | control flow, sampling, dynamic-shaped glue, the KV cache and the attention that reads it, and any op the accelerator lacks a kernel for | that is where the flexibility is |
 
-Left alone, that boundary is drawn by whatever the converter happens to claim, and a single unsupported op in the wrong place can strand an entire block off the accelerator. `hf2mobile` treats the split as an **export-time** decision instead: shape the graph so the NPU can take the parts that pay for themselves, and let the CPU take the rest by design rather than by accident.
+Left alone that boundary is drawn by whatever the converter happens to claim, and one unsupported op can strand a whole block off the accelerator. `hf2mobile` makes the split an **export-time** decision instead.
 
-The decision that sets everything else is what to do about the KV cache — the hardest piece, and the axis every decoder hits on every token. The choice here is to **take an ORT-executable graph as the baseline** and let ORT own the cache, rather than adopt whichever cache mechanism a given backend prefers. The attention node expands into `GroupQueryAttention`, whose `past_key` / `present_key` buffers are ordinary graph tensors: the state stays visible in the IR instead of disappearing into a side-car library, and the same handling holds whether the node runs on the CPU EP or the GPU EP. We start with the **CPU EP**, being the more generic of the two.
+The KV cache sets everything else. The choice is to **take an ORT-executable graph as the baseline** and let ORT own the cache: attention expands into `GroupQueryAttention`, whose `past_key` / `present_key` buffers are ordinary graph tensors, so the state stays visible in the IR instead of vanishing into a side-car library. We start with the **CPU EP**, the more generic one.
 
-There is a second reason attention has to sit on that side of the seam: the cache is what makes its shapes move. `total_sequence_length` grows by one on every decode step, so the tensors attention reads are a different size each time it runs. An NPU gets its efficiency from compiling a partition **ahead of time** against fixed shapes — a dimension that only becomes known per step is exactly what it cannot plan for. CPU and GPU execution providers resolve shapes at run time and simply absorb the growth. So the dynamic half of the model belongs where dynamism is free, and it belongs there for the same reason it belongs to ORT: it is the same half.
+Shapes force the same placement. `total_sequence_length` grows by one per decode step, and an NPU earns its efficiency by compiling **ahead of time** against fixed shapes — a per-step dimension is exactly what it cannot plan for, while CPU/GPU EPs resolve shapes at run time. The dynamic half of the model belongs where dynamism is free, and that is the same half ORT already owns.
 
-The line is drawn between *kinds* of attention, not across attention as a whole. Encoder and vision attention carry no KV cache and run at a sequence length fixed by the input, so they are statically shaped like the projections around them and belong on the NPU — expanded there into whatever form the accelerator has kernels for, a single-head decomposition included. It is **decoder** attention, the one threading a growing cache from step to step, that stays CPU-side. Same traced node, two expansions, chosen by what the module actually does.
+The line falls between *kinds* of attention, not across attention as a whole. Encoder and vision attention carry no cache and run at a fixed sequence length, so they are as statically shaped as the projections around them and belong on the NPU — decomposed there into whatever the accelerator has kernels for. Only **decoder** attention, threading a growing cache, stays CPU-side. Same traced node, two expansions, chosen by what the module does.
 
-Everything else follows from that. With the baseline runtime holding the cache, what is left is statically shaped — the QKV projections, the MLP stack, whose dimensions come from the config and do not move as the cache grows — which is precisely what an ahead-of-time compiling accelerator is built for. And ORT can carry both in one file: an `EPContext` node embeds an ahead-of-time compiled partition for another backend inside the same ONNX graph, so a single `.onnx` covers multi-device deployment. One graph, one session, mixed execution — the shape a mobile platform actually needs.
+The rest follows: with ORT holding the cache, what remains — QKV projections, the MLP stack — is statically shaped, which is what an AOT-compiling accelerator wants. And ORT carries both in one file, since an `EPContext` node embeds a compiled partition for another backend inside the same ONNX graph. One graph, one session, mixed execution.
 
 ### A descriptive graph, and a generic runtime to read it
 
-The exporter and the runtime are one deliverable, designed against each other. The graph carries the **description** — module identity survives the trace, cache slots are named, the sampling policy and the EOS ids are [baked in](#2-hf2mobilepostprocess--bake-in-the-decode-policy) — and the Rust runtime beside it ([CausalLM inferencer](#example-causallm-inferencer)) stays small and model-agnostic precisely because it can read all of that out of the file. The model's semantics stay in **one artifact, in the IR**, where the next tool can see them — instead of spread across a contrib op, a side-car config and a session API, each holding a piece of the model on its own terms.
+The exporter and the runtime are one deliverable, designed against each other. The graph carries the **description** — module identity survives the trace, cache slots are named, the sampling policy and EOS ids are [baked in](#2-hf2mobilepostprocess--bake-in-the-decode-policy) — so the Rust runtime beside it ([CausalLM inferencer](#example-causallm-inferencer)) stays small and model-agnostic by reading it out of the file. The semantics live in **one artifact, in the IR**, instead of spread across a contrib op, a side-car config and a session API.
 
-Attention shows the division. `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work by nature, and the runtime owns that. Driving it takes no per-model knowledge, because everything the loop needs is already stated in the graph. One loop runs every exported model, and it is small enough to cross-compile for a phone.
+Attention shows the division: `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work, and the runtime owns that. One loop runs every exported model, small enough to cross-compile for a phone.
 
 </details>
 
