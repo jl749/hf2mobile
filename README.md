@@ -63,11 +63,11 @@ Seven stages: trace module I/O → export the subgraphs → register the plugin 
 Everything above comes from `flake.nix`; nothing needs to be installed globally:
 
 ```bash
-# for development
+# for development on host
 nix develop
 
-# for android deployment (installs additional dep)
-nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
+# for android deployment (installs additional few GB - NDK, adb, ...)
+nix develop .#android
 ```
 
 > Pre-built ONNXRuntime so for `arm64-v8a` can be downloaded from [onnxruntime-android AAR](https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/) (Find `jni/arm64-v8a/libonnxruntime.so`).
@@ -78,34 +78,38 @@ nix develop .#android -c cargo build --release --target aarch64-linux-android --
 
 ### HostPC
 
-```bash
-uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl   # a built wheel: no Rust toolchain needed
-```
-
-From source, for development:
+For development:
 
 ```bash
+nix develop
 uv sync                     # Python dependencies
-maturin develop --release   # compile the Rust extension into the venv  (~45s cold, ~15s warm)
+maturin develop --release   # compile the Rust extension into the venv
 ```
 
 Re-run `maturin develop --release` after any change under `src/onnx_inferencer/` — Python imports the *installed* `.so`, so a bare `cargo build` will not be picked up.
 
-To build the artifacts themselves:
+For testing:
 
 ```bash
-maturin build --release -o dist/                                    # the wheel (abi3-py312, one per OS/arch)
+nix develop
+
+# 1. Build the whl and so
+maturin build --release -o dist/                                    # build the wheel
+
+# 2. Install
+uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
+
+# 3. Run Inference
+## METHOD1 (use hf2mobild.infer module)
+hf2mobile-inference {export dir} --prompt "Where is Paris?"
+## METHOD2 (rewrite inference loop with python api)
 cargo build --release --manifest-path src/onnx_plugins/Cargo.toml   # libhf2mobile_plugins.so
-```
-
-The plugin `.so` is only needed to load an `hf2mobile` graph from a runtime *other* than `hf2mobile.infer`, which registers the operator in-process:
-
-```python
+python3 << 'EOF'
 import onnxruntime as ort
-
 opts = ort.SessionOptions()
 opts.register_custom_ops_library("src/onnx_plugins/target/release/libhf2mobile_plugins.so")
-session = ort.InferenceSession("inference.onnx", opts)
+session = ort.InferenceSession("{export dir}/inference.onnx", opts)
+EOF
 ```
 
 ### Android
@@ -113,31 +117,106 @@ session = ort.InferenceSession("inference.onnx", opts)
 Nothing is *installed* on the device — one binary is cross-compiled and pushed (see [Usage](#-usage-cli)):
 
 ```bash
-nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
+nix develop .#android
 
-file target/aarch64-linux-android/release/hf2mobile-infer
-# ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64, for Android 24
+# 1. Build the android so
+cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
+file target/aarch64-linux-android/release/hf2mobile-infer # ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64, for Android 24
+
+# 2. Install
+ORT=1.27.0  # match the host: python -c 'import onnxruntime; print(onnxruntime.__version__)'
+curl -sLO https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/$ORT/onnxruntime-android-$ORT.aar
+unzip -j onnxruntime-android-$ORT.aar 'jni/arm64-v8a/libonnxruntime.so' -d .
+file libonnxruntime.so # ELF 64-bit LSB shared object, ARM aarch64, for Android 24, stripped
+
+# 3. Run Inference
+D=/data/local/tmp/hf2mobile
+adb shell mkdir -p $D
+adb push target/aarch64-linux-android/release/hf2mobile-infer libonnxruntime.so $D/
+adb shell chmod +x $D/hf2mobile-infer
 ```
 
-`.cargo/config.toml` points cargo and the `cc` crate at the NDK's API-24 clang — API 24 (Android 7.0) is the floor ONNX Runtime's own Android builds target. `llvm-strip` roughly halves the 9 MB if the push is slow. The same source built for the host is just `cargo build --release`.
+`.cargo/config.toml` points cargo and the `cc` crate at the NDK's API-24 clang — API 24 (Android 7.0) is the floor ONNXRuntime's own Android builds target. `llvm-strip` roughly halves the 9 MB if the push is slow. The same source built for the host is just `cargo build --release`.
 
 ---
 
 ## 🚀 Usage (CLI)
 
+Supported architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Gemma3ForCausalLM`.
+
 <details>
-<summary><b>Click to expand</b> — export, postprocess, infer, run on device</summary>
-
-Two entry points: `hf2mobile-export` builds the shippable graph (export **and** postprocess), `hf2mobile-inference` runs it. The two stages are also runnable on their own — `python3 -m hf2mobile.export --skip_postprocess` then `python3 -m hf2mobile.postprocess {export dir}` — which is what you want when re-baking the decode policy without re-exporting.
-
-### HostPC
+<summary><b>💻 HostPC</b> — export, then run it in the venv</summary>
 
 #### 1. `hf2mobile.export` — HF → ONNX
 
 ```bash
+nix develop .#default
+
 hf2mobile-export {HF repo id} --target {ORT|QNN}
-# OR, as a module:
-python3 -m hf2mobile.export {HF repo id} --target {ORT|QNN}
+```
+
+| Argument         | Description                                                              | Default |
+| ---------------- | ----------------------------------------------------------------------- | ------- |
+| `repo_id`        | Hugging Face repo id of the model to export.                            | —       |
+| `-t`, `--target` | Export target: `ORT` or `QNN`. Graph topology may change based on it.   | `ORT`   |
+| `--export_dtype` | `float32` / `float16` / `bfloat16`. Casts the weights before tracing, fixing the exported graph's dtype. | the model's own dtype |
+| `--debug`        | Force a tiny random-init model (2 layers) + DEBUG logging for a fast smoke test. Also keeps the intermediate graphs. | off |
+| `--skip_postprocess` | Stop after the ONNX export, leaving `inference.onnx` to a separate `hf2mobile.postprocess` run. | off |
+| *(postprocess flags)* | `--top_k`, `--top_p`, `--temp`, `--eos_tokens`, `--keep_logits`, `-o` — the same parser as [2.](#2-hf2mobilepostprocess--bake-in-the-decode-policy), reused here. | from `generation_config.json` |
+
+Output lands in a timestamped directory named `{date}__{target}__{model}`:
+
+```
+2026-08-01__ORT__Qwen-Qwen3-0.6B/
+├── case2.onnx + case2.onnx.data           the dynamic-L generation graph (serves prefill and decode both)
+├── inference.onnx + inference.onnx.data   case2 + the baked-in decode policy — what you ship (see 2.)
+├── tokenizer.json                         handed to the runtime, which does all the tokenizing
+├── tokenizer_config.json                  the chat template
+└── generation_config.json                 the sampling policy + EOS ids that `postprocess` reads
+```
+
+Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot as well as `case1.onnx`, plus the standalone module subgraphs.
+
+#### 2. `hf2mobile.infer` — run it
+
+```bash
+nix develop .#default
+
+hf2mobile-inference {export dir} --prompt "Where is Paris?"
+```
+
+| Argument           | Description                                                                  | Default |
+| ------------------ | ---------------------------------------------------------------------------- | ------- |
+| `export_dir`       | A **postprocessed** export directory (must hold `inference.onnx`).           | —       |
+| `--prompt`         | User prompt.                                                                  | required |
+| `--skip_template`  | Feed `--prompt` verbatim instead of through the tokenizer's chat template.    | off |
+| `--num-generation` | Maximum tokens to generate.                                                   | `512` |
+| `--intra-threads`  | ORT intra-op thread count.                                                    | one per core |
+
+Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s. No sampling flags — the policy is in the graph.
+
+#### Examples
+
+```bash
+# Gemma 3 (270M), end to end
+hf2mobile-export google/gemma-3-270m-it --target ORT --export_dtype float32
+hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
+
+# Force greedy decoding regardless of what the model's config says
+hf2mobile-export google/gemma-3-270m-it --target ORT --temp 0
+hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
+```
+
+</details>
+
+<details>
+<summary><b>📱 Android</b> — export on the host, run it over <code>adb</code></summary>
+
+#### 1. `hf2mobile.export` — HF → ONNX
+```bash
+nix develop .#android
+
+hf2mobile-export {HF repo id} --target {ORT|QNN}
 ```
 
 Supported architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Gemma3ForCausalLM`.
@@ -162,88 +241,34 @@ Output lands in a timestamped directory named `{date}__{target}__{model}`:
 └── generation_config.json                 the sampling policy + EOS ids that `postprocess` reads
 ```
 
-Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot of each, plus the standalone module subgraphs.
+Two cases are traced — prefill (`case1`) and generation (`case2`) — but the ORT deliverable is the single dynamic-`L` generation graph that serves both, so `case1.onnx` is deleted at the end of the export. `--debug` keeps a `debug__case1.onnx` / `debug__case2.onnx` snapshot as well as `case1.onnx`, plus the standalone module subgraphs.
 
-#### 2. `hf2mobile.postprocess` — bake in the decode policy
+#### 2. `hf2mobile-infer` - run it
 
-Run for you by `hf2mobile-export` unless `--skip_postprocess` is passed; run it directly to re-bake the policy of an existing export without re-exporting.
-
-```bash
-python3 -m hf2mobile.postprocess {export dir}
-python3 -m hf2mobile.postprocess {export dir} --top_k 64 --top_p 0.95 --temp 1.0
-```
-
-| Argument        | Description                                                                       | Default |
-| --------------- | --------------------------------------------------------------------------------- | ------- |
-| `export_dir`    | An export directory produced by `hf2mobile.export`.                               | —       |
-| `--top_k`       | Keep only the k highest-scoring tokens (`0` = off).                               | from `generation_config.json` |
-| `--top_p`       | Nucleus sampling threshold (`1.0` = off).                                         | from `generation_config.json` |
-| `--temp`        | Logit temperature; `0` bakes in greedy and ignores `--top_k`/`--top_p`.           | from `generation_config.json` |
-| `--eos_tokens`  | Stop token id to write into `hf2mobile_EOS_tokens`; repeatable.                    | from `generation_config.json` / `tokenizer_config.json` |
-| `--keep_logits` | Also keep `logits` as a graph output, for checking a sampled token against its row. | off |
-| `-o`, `--output`| Write the patched graph somewhere other than `<export dir>/inference.onnx`.        | — |
-
-Writes `inference.onnx` beside `case2.onnx`. Anything omitted is resolved from the export's own configs, so the plain form reproduces what `model.generate` would have done.
-
-#### 3. `hf2mobile.infer` — run it
+The three files this needs — the cross-compiled binary, `libonnxruntime.so` and the export directory from step 1 — are pushed to `$D` in [Install → Android](#android).
 
 ```bash
-hf2mobile-inference {export dir} --prompt "Where is Paris?"
-# OR, as a module:
-python3 -m hf2mobile.infer {export dir} --prompt "Where is Paris?"
+nix develop .#android
+
+D=/data/local/tmp/hf2mobile
+adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/   # step 1's output, if not already there
+adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
+           --prompt 'Where is Paris?' --num-generation 64"
+# [hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
+# Paris is a French city, which is known for its iconic landmarks and rich history.
+# [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
 
 | Argument           | Description                                                                  | Default |
 | ------------------ | ---------------------------------------------------------------------------- | ------- |
 | `export_dir`       | A **postprocessed** export directory (must hold `inference.onnx`).           | —       |
 | `--prompt`         | User prompt.                                                                  | required |
-| `--skip_template`  | Feed `--prompt` verbatim instead of through the tokenizer's chat template.    | off |
+| `--skip_template`  | Feed `--prompt` verbatim instead of through the tokenizer's chat template. `--skip-template` is accepted too. | off |
 | `--num-generation` | Maximum tokens to generate.                                                   | `512` |
 | `--intra-threads`  | ORT intra-op thread count.                                                    | one per core |
+| `--ort-dylib`      | Where to dlopen `libonnxruntime.so` from.                                     | `$ORT_DYLIB_PATH`, else beside the binary, else the export dir |
 
-Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s. No sampling flags — the policy is in the graph.
-
-#### Examples
-
-```bash
-# Gemma 3 (270M), end to end
-hf2mobile-export google/gemma-3-270m-it --target ORT --export_dtype float32
-hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
-
-# Force greedy decoding regardless of what the model's config says
-hf2mobile-export google/gemma-3-270m-it --target ORT --temp 0
-# ... or re-bake an export you already have
-python3 -m hf2mobile.postprocess 2026-08-01__ORT__google-gemma-3-270m-it --temp 0
-
-# Fast smoke test with a tiny random-init model (no real weights downloaded)
-hf2mobile-export meta-llama/Llama-3.2-1B-Instruct --target ORT --debug
-```
-
-### Android
-
-Step 3 without the interpreter: one executable, the same flags, the same output. Build it as shown in [Install](#-install), then push three files and run:
-
-```bash
-D=/data/local/tmp/hf2mobile
-adb shell mkdir -p $D
-adb push target/aarch64-linux-android/release/hf2mobile-infer $D/
-adb push libonnxruntime.so $D/                            # jni/arm64-v8a/ out of the AAR
-adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/      # the whole export directory
-adb shell chmod +x $D/hf2mobile-infer
-
-adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
-           --prompt 'Where is Paris?' --num-generation 64"
-```
-
-```text
-[hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
-Paris is a French city, which is known for its iconic landmarks and rich history.
-[hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
-```
-
-*(above is the host build of the same binary; a phone's numbers will differ)*
-
-Flags are step 3's, plus `--ort-dylib` — where to dlopen ONNX Runtime from. It defaults to `$ORT_DYLIB_PATH`, then next to the binary, then the export directory, which is why the push above needs nothing set in the environment.
+The same flags as [2.](#2-hf2mobileinfer--run-it) on the host — a device run is the host command with a different binary in front of it — plus `--ort-dylib`. Its fallback chain is why the push above needs nothing set in the environment. How to decode is not a flag on either side: the sampling policy and stop tokens are baked into the graph.
 
 - **`/data/local/tmp`, not `/sdcard`** — the latter is mounted `noexec`.
 - **Sweep `--intra-threads`.** On big.LITTLE the default (one thread per core) puts work on little cores that then hold the fast ones up; matching the big cluster is often quicker.
