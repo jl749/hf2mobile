@@ -17,7 +17,7 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 ## 📖 Table of Contents
 
 - [🎯 Motivation](#-motivation) — why operator-level ONNX stopped being enough
-- [🧩 How hf2mobile tackles it](#-how-hf2mobile-tackles-it) — the module boundary as the unit of export
+- [🧩 Approach](#-approach) — the module boundary as the unit of export
 - [🔧 How it works](#-how-it-works) — the export stages, and the Rust runtime that runs the result on a phone
 - [📋 Requirements](#-requirements)
 - [📦 Install](#-install)
@@ -113,18 +113,16 @@ Placing the seam is also how the trade above stops being one. It only bites when
 
 ---
 
-## 🧩 How hf2mobile tackles it
+## 🧩 Approach
 
 <details>
 <summary><b>Click to expand</b> — the module boundary as the unit of export</summary>
 
-`hf2mobile` is a framework built **on top of the HuggingFace `transformers` library**. The middle ground the motivation ends on has a concrete location — the **module boundary** — and everything below follows from keeping it. Instead of lowering a model to a flat operator graph and hoping each backend copes, it works one level up:
+`hf2mobile` is a framework built **on top of the HuggingFace `transformers` library**. The motivation ends on a choice between a fast export bound to one runtime and a portable export that gave up the reason you exported at all. The way out has a concrete location — the **module boundary** — and everything below follows from keeping it. Instead of lowering a model to a flat operator graph and hoping each backend copes, it works one level up:
 
-1. **Trace at the *module* level, not the operator level.** The model is traced as its semantic building blocks — attention, RoPE, RMSNorm, the causal LM head — rather than as an undifferentiated soup of `MatMul` / `Mul` / `Softmax`. An `Attention` `torch.nn.Module` leaves the trace as **one node**, with the module boundary still intact.
+1. **Trace at the *module* level, not the operator level.** The model is traced as its semantic building blocks — attention, RoPE, RMSNorm, the causal LM head — rather than as an undifferentiated soup of `MatMul` / `Mul` / `Softmax`. `transformers` is what makes that practical: every architecture is defined against the same template — `Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding` — so the semantic boundaries are already drawn, consistently, by the library the models are published with. An `Attention` `torch.nn.Module` leaves the trace as **one node**, keeping its full identity (`Qwen3Attention`, `model.layers.0.self_attn`) all the way into the graph.
 2. **Expand the module level nodes — per target, and per strategy.** A traced module knows how to emit the right subgraph for its `--target`: a fused GQA/attention plugin for a runtime that supports it, a sliding-window mask template for another, or a single-head decomposition for an NPU that lacks fused attention. Same node, different expansions, decided at export time.
-3. **Generalize by extending the existing exporter api, not by rewriting the graph lazily.** Supporting a new architecture or a new hardware/runtime target means contributing a small, self-contained exporter — the framework handles the rest.
-
-`transformers` is what makes that practical. Every architecture is defined against the same template — `Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding` — so the semantic boundaries are already drawn, consistently, by the library the models are published with. `hf2mobile` keys on exactly that: a plugin is selected by class-name *suffix*, so one `Attention` exporter covers every architecture that follows the convention instead of one exporter per model, and the traced node keeps the module's full identity (`Qwen3Attention`, `model.layers.0.self_attn`) all the way into the graph.
+3. **Generalize by extending the existing exporter api, not by rewriting the graph lazily.** A plugin is selected by class-name *suffix*, so one `Attention` exporter covers every architecture that follows the convention instead of one exporter per model. Supporting a new architecture or a new hardware/runtime target means contributing a small, self-contained exporter — the framework handles the rest.
 
 The rest is extension rather than replacement:
 
@@ -153,7 +151,7 @@ Everything else follows from that. With the baseline runtime holding the cache, 
 
 The exporter and the runtime are one deliverable, designed against each other. The graph carries the **description** — module identity survives the trace, cache slots are named, the sampling policy and the EOS ids are baked in — and the Rust runtime beside it ([CausalLM inference](#example-causallm-inference)) stays small and model-agnostic precisely because it can read all of that out of the file.
 
-Attention shows the division. `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work by nature, and the runtime owns that. Driving it takes no per-model knowledge: cache slots are discovered by convention (`x` / `x_out`), stop tokens are read straight from the graph, and `SampleLogits` returns a token id rather than a megabyte-wide logits row. One loop runs every exported model, and it is small enough to cross-compile for a phone.
+Attention shows the division. `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work by nature, and the runtime owns that. Driving it takes no per-model knowledge, because everything the loop needs is already stated in the graph. One loop runs every exported model, and it is small enough to cross-compile for a phone.
 
 That is what keeping the description in the file buys. The model's semantics stay in one artifact, in the IR, where the next tool can see them — instead of spread across a contrib op, a side-car config and a session API, each holding a piece of the model on its own terms.
 
