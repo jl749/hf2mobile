@@ -68,8 +68,6 @@ Four axes make this bite. Each varies at runtime along a dimension the graph has
 
 `If` does not close rows 2 and 3: its predicate is one decision per graph execution, and routing needs one per token. Row 3 is the sharpest — no plugin, so no portability cost, and no capability either: the graph translates cleanly precisely *because* the thing worth exporting did not survive the export.
 
-**Row 1 is the one everything below turns on.** It is the axis every decoder hits on every token, and the one `hf2mobile` has to take a position on.
-
 ### EXAMPLE: attention plugin
 
 Attention has correspondingly shifted from the operator view toward a **module / plugin** view (fused attention, KV-cache blocks, MoE routers). This is the **plugin-centric** turn in its clearest form: every runtime ships and maintains its *own* fused-attention module rather than sharing one, and while everyone agrees on the mathematics, no two agree on the boundary — specifically, on where the KV cache lives relative to the op.
@@ -137,7 +135,7 @@ The goal is not merely to emit a graph a mobile runtime will accept — it is to
 
 Left alone, that boundary is drawn by whatever the converter happens to claim, and a single unsupported op in the wrong place can strand an entire block off the accelerator. `hf2mobile` treats the split as an **export-time** decision instead: shape the graph so the NPU can take the parts that pay for themselves, and let the CPU take the rest by design rather than by accident.
 
-The decision that sets everything else is what to do about the KV cache — the hardest piece, and the axis the motivation's first row turns on. The choice here is to **take an ORT-executable graph as the baseline** and let ORT own the cache, rather than adopt whichever cache mechanism a given backend prefers. The attention node expands into `GroupQueryAttention`, whose `past_key` / `present_key` buffers are ordinary graph tensors: the state stays visible in the IR instead of disappearing into a side-car library, and the same handling holds whether the node runs on the CPU EP or the GPU EP. We start with the **CPU EP**, being the more generic of the two.
+The decision that sets everything else is what to do about the KV cache — the hardest piece, and the axis every decoder hits on every token. The choice here is to **take an ORT-executable graph as the baseline** and let ORT own the cache, rather than adopt whichever cache mechanism a given backend prefers. The attention node expands into `GroupQueryAttention`, whose `past_key` / `present_key` buffers are ordinary graph tensors: the state stays visible in the IR instead of disappearing into a side-car library, and the same handling holds whether the node runs on the CPU EP or the GPU EP. We start with the **CPU EP**, being the more generic of the two.
 
 There is a second reason attention has to sit on that side of the seam: the cache is what makes its shapes move. `total_sequence_length` grows by one on every decode step, so the tensors attention reads are a different size each time it runs. An NPU gets its efficiency from compiling a partition **ahead of time** against fixed shapes — a dimension that only becomes known per step is exactly what it cannot plan for. CPU and GPU execution providers resolve shapes at run time and simply absorb the growth. So the dynamic half of the model belongs where dynamism is free, and it belongs there for the same reason it belongs to ORT: it is the same half.
 
