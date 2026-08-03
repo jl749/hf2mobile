@@ -16,9 +16,9 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 
 ## 📖 Table of Contents
 
-- [🎯 Motivation](#-motivation) — why operator-level ONNX stopped being enough
-- [🧩 Approach](#-approach) — the module boundary as the unit of export
-- [🔧 How it works](#-how-it-works) — the export stages, and the Rust runtime that runs the result on a phone
+- [🎯 Motivation](docs/motivation.md) — why operator-level ONNX stopped being enough
+- [🧩 Approach](docs/approach.md) — the module boundary as the unit of export
+- [🔧 How it works](docs/how-it-works.md) — the export stages, and the Rust runtime that runs the result on a phone
 - [📋 Requirements](#-requirements)
 - [📦 Install](#-install)
 - [🚀 Usage (CLI)](#-usage-cli) — export → postprocess → infer, on the host or over `adb`
@@ -28,227 +28,25 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 
 ## 🎯 Motivation
 
-<details>
-<summary><b>Click to expand</b> — why operator-level ONNX stopped being enough</summary>
+**[docs/motivation.md](docs/motivation.md)** — why operator-level ONNX stopped being enough.
 
-### ONNX standardized the *operator* level tracing
-
-ONNX defined a portable vocabulary of computation primitives — `MatMul`, `Conv`, `ReLU`, `Attention`.
-For classical ML graphs, the operator level tracing was enough to cover majority of the model porting cases.
-
-It worked because the vocabulary was **small and universal**. A ResNet is a fixed sequence of convolutions: recording the operators that one execution touched described the model *completely*, and any backend implementing the same standard operator set could run any graph anyone exported. Portability was a consequence of the contract being narrow — nothing in the file required knowledge that lived outside the standard.
-
-### The operator level tracing is too low to be the unit of portability today
-
-A single ONNX graph now has to generalize across 2 independent axes at once:
-
-- **Hardware** — NPU / CPU / GPU, each with different quantization schemes, memory layouts, and ops support.
-- **Runtimes** — TRT-LLM, vLLM, llama.cpp, ORT — each expecting different graph topology, KV-cache handling, and optimization metadata.
-
-Covering every *(hardware × runtime)* cell at the operator level is manual, per-combination work, and subtle mismatches could silently break correctness or performance.
-
-In practice nobody covers that matrix cell by cell. The ecosystem went **plugin-centric** instead: each runtime grows its **own** extensions — fused kernels, side-car configs, session-level switches — to express the parts of a modern model the standard vocabulary cannot. A plugin is the escape hatch from a fixed operator set, and every runtime reached for it independently. That buys back performance and expressiveness on that one runtime, but it costs precisely the property ONNX existed to provide: **a universal IR that any runtime can interpret.**
-
-### The DAG assumption, and where modern LLMs break it
-
-ONNX is an **interchange format**, and every mobile and edge target consumes it — directly (ONNXRuntime) or through a converter (QNN, TensorRT, OpenVINO, IREE). What it assumes in exchange is a **sequential DAG**: a static, acyclic graph you feed *once*, execute in topological order, and read outputs from — a pure function of its inputs. `If` / `Loop` / `Scan` do exist, but as second-class citizens: their bodies are *attributes* rather than values, so a branch cannot be split across backends the way a straight-line graph can, and an accelerator that compiles its partition ahead of time cannot claim a region whose trip count is unknown.
-
-Modern LLMs and multimodal pipelines are *stateful* and autoregressive — far more involved than the traditional CV graphs the **DAG** assumption was shaped around.
-
-That makes them hard to *export*, not merely hard to represent. `torch.onnx.export` works by **tracing**: it runs the model once on example inputs and records the operators that actually executed. Python-level control flow is evaluated during that run and then disappears — an `if` on a tensor value leaves behind only the branch it happened to take, a `for` leaves its body unrolled to the trip count it happened to see, and every shape observed becomes a constant unless explicitly marked dynamic. The export therefore captures *what the model did that one time*, and it does so without complaining: the resulting graph is perfectly valid, it just describes a narrower model than the one you started with.
-
-Four axes make this bite. Each varies at runtime along a dimension the graph has no way to vary over, and each is resolved the same way: by moving the decision out of the graph and into the runtime. We cite **ONNXRuntime**'s answer for each — as the reference implementation of ONNX, maintained by the organization that authored the format, it is the project best positioned to have solved these *within* the graph.
-
-| Axis | What varies, and per what | ONNXRuntime's answer | In the graph? |
-| ---- | ------------------------- | -------------------- | ------------- |
-| **Persistent state** | The KV cache, threaded from one decode step into the next — per **step**. A "turn" is not a single DAG pass but a *sequence* of passes sharing memory. | `com.microsoft.GroupQueryAttention` hides the cache append in-kernel, past and present sharing one preallocated buffer so it grows in place instead of being concatenated and copied. The loop *around* it moves out to a separate library, `onnxruntime-genai`, with its own `genai_config.json`. | ❌ a contrib op no converter reads, plus host code every non-ORT runtime rewrites |
-| **Data-dependent routing** | An MoE router picks k of n experts — per **token**. A static graph must either evaluate every expert and mask (dense cost for sparse compute) or gather into a compact batch (data-dependent shapes). | `com.microsoft.MoE` takes `router_probs` as an ordinary input and does top-k selection inside the kernel, so the node stays static while the data-dependence happens where ONNX cannot see it. | ❌ contrib op — one opaque node with a fixed idea of what an expert is |
-| **Data-dependent control flow** | Mixture-of-Depths skips a block entirely; an early-exit LM stops descending the stack — per **token**. | None. Neither a contrib op nor a runtime mechanism (`onnxruntime-genai` stops early per *sequence*, not per token), so these architectures export dense. | ❌ the saving does not survive the export at all |
-| **Config-dependent weights** | Which LoRA adapter applies — per **request**, by config rather than by data. Merging (`W' = W + BA`) collapses to a static graph at the cost of a full weight set per adapter. | Adapters demoted from initializers to graph *inputs* — giving up constant folding and weight pre-packing — selected via `RunOptions.add_active_adapter` from a separate `.onnx_adapter` file. | ❌ not even an op, a session API |
-
-`If` does not close rows 2 and 3: its predicate is one decision per graph execution, and routing needs one per token. Row 3 is the sharpest — no plugin, so no portability cost, and no capability either: the graph translates cleanly precisely *because* the thing worth exporting did not survive the export.
-
-### EXAMPLE: attention plugin
-
-Attention has correspondingly shifted from the operator view toward a **module / plugin** view (fused attention, KV-cache blocks, MoE routers). This is the **plugin-centric** turn in its clearest form: every runtime ships and maintains its *own* fused-attention module rather than sharing one, and while everyone agrees on the mathematics, no two agree on the boundary — specifically, on where the KV cache lives relative to the op.
-
-| Runtime | Fused attention | Where the KV cache lives |
-| ------- | --------------- | ------------------------ |
-| **ONNXRuntime** | `Attention` / `MultiHeadAttention` / `GroupQueryAttention` contrib ops — [`contrib_ops/cpu/bert`](https://github.com/microsoft/onnxruntime/tree/v1.27.1/onnxruntime/contrib_ops/cpu/bert) | **Inside the op.** Graph tensors — `past_key`/`past_value` in, `present_key`/`present_value` out — but when past and present are *the same* tensor it is sized to `max_sequence_length` and the kernel appends in place. With `seqlens_k`, `total_sequence_length` and `do_rotary` it applies RoPE in the same kernel. The host allocates the buffer; the op decides what happens to it, and how far into it "now" is. |
-| **TensorRT-LLM** | [`gptAttentionPlugin`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1/cpp/tensorrt_llm/plugins/gptAttentionPlugin), over [`cpp/tensorrt_llm/kernels`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1/cpp/tensorrt_llm/kernels) | **Beside the op.** No KV tensors in that sense: with paged KV the cache is a pool of blocks handed out per request by a cache manager, and the plugin is passed the block offsets and host-side metadata needed to find them. Shape and behaviour are fixed in plugin *fields* at build time rather than expressed in a portable signature. |
-| **OpenVINO** | [`ScaledDotProductAttention`](https://docs.openvino.ai/2026/documentation/openvino-ir-format/operation-sets/operation-specs/sequence/scaled-dot-product-attention.html) | **Outside the graph's I/O.** The mathematics alone — `query`/`key`/`value`, optional mask and scale, a `causal` flag. The cache is *state*: `ReadValue`/`Assign` pairs on a `Variable`, carried between `infer()` calls, reachable only through `query_state()`. Serving stacks then rewrite that again — `ov::pass::SDPAToPagedAttention` trades the state for a 28-input `PagedAttentionExtension` and block tables. One vendor, two incompatible KV contracts. |
-
-The incompatibility is not naming, it is **who owns what**: who allocates the cache, who advances the position, who tracks sequence length. A converter cannot mechanically rewrite one into another, because what it would be rewriting is not the same node; it is a different answer to where the runtime ends and the graph begins.
-
-> **So the module level is where the performance lives, and — being plugin-centric — where portability stops.**
-
-A graph containing `GroupQueryAttention` is an *ONNXRuntime* graph, not an ONNX one. Decompose it back to `MatMul`/`Softmax`/`Concat` and the file translates again, at the price of the concatenate-and-copy KV growth, the fused kernel, and often the accelerator partition with it.
-
-With no standard at that level, model publishers, agent frameworks, and distribution hubs each re-implement the same per-target conversion glue. Every converter below reads standard ONNX and nothing else, so an export falls off this table the moment it uses the plugin that made the model fast:
-
-| Path            | Converter                                                                                               |
-| --------------- | ------------------------------------------------------------------------------------------------------- |
-| ONNX → QNN      | [ONNX2DLC](https://docs.qualcomm.com/doc/80-63442-10/topic/converters.html#onnx-conversion)             |
-| ONNX → TensorRT | [ONNX2TRT](https://github.com/onnx/onnx-tensorrt)                                                       |
-| ONNX → OpenVINO | [ONNX2OVIR](https://docs.openvino.ai/2026/openvino-workflow/model-preparation/convert-model-onnx.html)  |
-| ONNX → IREE     | [ONNX2MLIR](https://iree.dev/guides/ml-frameworks/onnx/)                                                |
-
-</details>
+ONNX standardized the *operator* level, and that was enough while the vocabulary stayed small and universal. Modern LLMs are stateful and autoregressive, so the ecosystem went **plugin-centric** instead: every runtime grew its **own** extensions — fused attention, side-car configs, session APIs — to express what the standard vocabulary cannot. The module level is where the performance lives, and — being plugin-centric — where portability stops.
 
 ---
 
 ## 🧩 Approach
 
-<details>
-<summary><b>Click to expand</b> — the module boundary as the unit of export</summary>
+**[docs/approach.md](docs/approach.md)** — the module boundary as the unit of export.
 
-`hf2mobile` is built **on top of HuggingFace `transformers`**. The motivation leaves a choice between a fast export bound to one runtime and a portable export that gave up the reason you exported at all. The way out is to work one level up from the flat operator graph — at the **module boundary**:
-
-1. **Trace at the *module* level.** The model is recorded as its semantic building blocks — attention, RoPE, RMSNorm, the LM head — rather than a soup of `MatMul` / `Mul` / `Softmax`. `transformers` makes this practical: every architecture follows the same template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`), so the boundaries are already drawn by the library the models ship with. An `Attention` module leaves the trace as **one node**, identity intact (`Qwen3Attention`, `model.layers.0.self_attn`).
-2. **Expand those nodes per target, per strategy.** The same node emits a fused GQA plugin for one runtime, a sliding-window mask template for another, or a single-head decomposition for an NPU with no fused attention — decided at export time.
-3. **Extend the exporter API, don't pattern-match the graph.** Plugins are selected by class-name *suffix*, so one `Attention` exporter covers every architecture that follows the convention. New architecture or new target = one small, self-contained exporter.
-
-**Reused** — `transformers` module definitions, ORT contrib ops (`GroupQueryAttention`, RMSNorm/RoPE fusions), ORT execution providers and `EPContext`.
-**Added** — the module-level tracer and plugin registry, the per-target expanders, `SampleLogits` and the in-graph EOS constant, and the Rust runtime.
-
-### The plugin node is the unit of control
-
-Holding plugins such as `Attention` and `RotaryEmbedding` as a single node until the last step is what makes the divergence *yours*: the HuggingFace module is the baseline, and every expansion is a deliberate departure from it — not whatever a converter's pattern matcher recognized in an already-flattened graph.
-
-> The portable artifact is the module-level trace, not any file it produces. A graph carrying a runtime-specific plugin or fusion pattern is bound to that runtime — but every target's file can be translated from the same module-level expansion.
-
-Being plugin-centric stops being a trap once what you keep is the description rather than any one expansion of it.
-
-### EXAMPLE: placing the seam - one graph, more than one backend
-
-A phone has both an NPU and a CPU, so the question is never which to pick — it is **where to put the seam**. **Shape decides**: an NPU earns its efficiency by compiling **ahead of time**, so every dimension must be known at build time, while a CPU EP resolves shapes at run time.
-
-| Side | Takes | Because |
-| ---- | ----- | ------- |
-| **NPU** | statically-shaped compute — QKV projections, the MLP stack, **encoder / vision attention** | fixed shapes are what an AOT compiler can plan for, and that is where the TOPS are |
-| **CPU** | everything shape-dependent — **decoder attention** and the KV cache it reads, sampling, control flow, and any op the accelerator lacks a kernel for | shapes resolve at run time, so dynamism is free |
-
-The line therefore falls between *kinds* of attention, not across attention as a whole:
-
-- **Encoder / vision attention** carries no cache and runs at a fixed sequence length, so it is as statically shaped as the projections around it → **NPU**, decomposed into whatever kernels the accelerator has.
-- **Decoder attention** threads a KV cache whose `total_sequence_length` grows by one per step — a shape that changes with the input data, exactly what an AOT compiler cannot plan for → **CPU**, expanded into `GroupQueryAttention` so ORT owns the in-kernel cache append and the state stays visible in the IR as ordinary `past_key` / `present_key` tensors.
-
-Same traced node, two expansions, chosen by what the module does. Left alone that boundary is drawn by whatever the converter happens to claim, and one unsupported op can strand a whole block off the accelerator; `hf2mobile` makes the split an **export-time** decision instead. Today's exports target the **CPU EP** alone, the more generic side.
-
-Both halves still ship as one file: an `EPContext` node embeds the compiled NPU partition inside the same ONNX graph. One graph, one session, mixed execution.
-
-### A descriptive graph, and a generic runtime to read it
-
-The exporter and the runtime are one deliverable, designed against each other. The graph carries the **description** — module identity survives the trace, cache slots are named, the sampling policy and EOS ids are [baked in](#2-hf2mobilepostprocess--bake-in-the-decode-policy) — so the Rust runtime beside it ([CausalLM inferencer](#example-causallm-inferencer)) stays small and model-agnostic by reading it out of the file. The semantics live in **one artifact, in the IR**, instead of spread across a contrib op, a side-car config and a session API.
-
-Attention shows the division: `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work, and the runtime owns that. One loop runs every exported model, small enough to cross-compile for a phone.
-
-</details>
+Trace the model as its semantic **modules** (attention, RoPE, RMSNorm, the LM head) rather than a flat operator soup, hold each as a single node, and expand it per target at export time. The portable artifact is the module-level trace, not any one file it produces — which is also what makes the NPU/CPU seam an export-time decision instead of whatever a converter happens to claim.
 
 ---
 
 ## 🔧 How it works
 
-<details>
-<summary><b>Click to expand</b> — export stages, the graph at each step, and the Rust runtime</summary>
+**[docs/how-it-works.md](docs/how-it-works.md)** — the export stages, and the Rust runtime that runs the result on a phone.
 
-### EXAMPLE: CausalLM exporter
-
-Every supported model inherits `CausalLMExporter` (`src/hf2mobile/exporter/causallm.py`), which drives a five-stage export. A single run traces **two cases** — **prefill** (the full prompt) and **generation** (single-token decode with KV cache in/out) — because those are the two distinct shapes a decoder actually runs at inference time. For `ORT` the deliverable is the generation graph alone, whose dynamic `L` covers both.
-
-| Stage | What happens | Where it lives |
-| ----- | ------------ | -------------- |
-| **1. Trace module I/O** | Run `model.generate(...)` once and record the inputs/outputs of each semantic module (the "plugin" boundaries). | `src/hf2mobile/tracing/` |
-| **2. Export subgraphs** | Emit each traced module as a standalone ONNX subgraph, specialized for the target. | `src/hf2mobile/exporter/submodules/` |
-| **3. Register plugin ops** | Register the custom ops so the main-graph export can reference them by name instead of inlining operators. | `src/hf2mobile/tracing/register.py` |
-| **4. Export model cases** | `torch.onnx.export` the model for each unique case (prefill + generation), with a KV-cache-aware forward so the cache I/O survives dead-code elimination. | `src/hf2mobile/exporter/causallm.py` |
-| **5. Merge + postprocess** | Inline the subgraphs into each main graph, then run target-specific fusions and postprocessing. | `src/hf2mobile/exporter/onnx/` |
-
-Stage 5 is where the target specialization becomes concrete — e.g. for `ORT`:
-
-- **Fusion** (`onnx/fusion/`): fuse RMSNorm, RoPE and Group-Query-Attention into ORT contrib ops (`fuse_rms_norm`, `fuse_rope`, `fuse_group_query_attention`).
-- **Postprocess** (`onnx/postprocess/`): make I/O shapes dynamic and attach the sliding-window mask (`attach_sliding_window_mask_onnx`).
-
-Adding a new architecture is usually a thin subclass of `CausalLMExporter` (see `llama.py`, `qwen2.py`, `qwen3.py`, `gemma3.py`); adding a new target is mostly new branches under `onnx/fusion` and `onnx/postprocess`.
-
-> **On memory.** Stages 4–5 hold the graph as a single `onnx_ir.Model` from load to save. `ir.load` mmaps external tensors — the weights are page cache the kernel can evict, not heap — and every fusion and postprocess mutates that one live model in place, so there is no save/reload round-trip between stages. Exporting a multi-GB model no longer means materializing its weights once per stage.
-
-Then, past the exporter:
-
-| Stage | What happens | Where it lives |
-| ----- | ------------ | -------------- |
-| **6. Bake the decode policy** | Append a `SampleLogits` node so the graph returns a token id, and park the EOS ids in the graph as a `Constant`. | `src/hf2mobile/postprocess.py` |
-| **7. Run it** | Tokenize, prefill, decode, detokenize — in Rust, over the postprocessed graph. | `src/onnx_inferencer/` |
-
-The graph progresses through the export like this:
-
-| <img src="docs/1_module_level_graph.svg" width="200"> | <img src="docs/2_module_level_postprocessed_graph.svg" width="200"> | <img src="docs/3_final_graph.svg" width="200"> | <img src="docs/4_final_graph_postprocessed.svg" width="200"> |
-| :---: | :---: | :---: | :---: |
-| Initial module-level graph | Postprocessed module-level graph | Flattened operator-level graph (ORT: CPU-EP target) | Decode policy baked in (`SampleLogits` + EOS ids) |
-
----
-
-### EXAMPLE: CausalLM inferencer
-
-The exported graph is only half the deliverable; a runtime has to load it. `hf2mobile` ships two Rust crates that share one source file:
-
-| Crate | Artifact | Role |
-| ----- | -------- | ---- |
-| `src/onnx_inferencer/` | `hf2mobile._ortrs_binding` (a Python extension module, built by maturin) | *Drives* ONNXRuntime — session setup, KV cache, prefill/decode loop, tokenizer, timing. Backs `python -m hf2mobile.infer`. |
-| `src/onnx_inferencer/` | `hf2mobile-infer` (a standalone executable, built by cargo) | The same engine with no interpreter, so it cross-compiles: `adb push` it to a phone with an export directory and run the graph on the device it was built for. |
-| `src/onnx_plugins/` | `libhf2mobile_plugins.so` | *Driven by* ONNXRuntime — a custom-op library exporting the C `RegisterCustomOps` entry point, loadable from Python, C++ or an Android app. |
-
-They are separate crates (and separate cargo workspaces) because they need opposite `ort` configurations: the runtime dlopens onnxruntime, the plugin is already running inside it. But `sample_logits.rs` is compiled into **both**, so the token a mobile runtime picks and the token the dev runtime picks come from one definition.
-
-Nothing tells the engine *how* to decode. The policy is a `SampleLogits` node and the stop ids are a `hf2mobile_EOS_tokens` constant, both baked into the graph by postprocess:
-
-```text
-logits [1, L, vocab]  --SampleLogits(top_k, top_p, temperature)-->  sampled_token [1, 1] int32
-```
-
-A 262k-wide fp32 logits row is 1 MB per token, so reducing it to one integer *inside* the graph is the copy the decode loop most wants back. What the engine adds around that: a zero-copy KV cache (tensors stay ORT-side between steps), one dynamic-`L` graph serving both prefill and decode, and TTFT/tok-s per run. `DEBUG=1` also dumps the Level3-optimized graph and a `chrome://tracing` profile.
-
-Two front ends, one engine — a cargo feature picks which is compiled:
-
-#### HostPC
-
-```bash
-hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?"
-```
-
-```python
-from hf2mobile.inference import CausalLMInferencer
-
-lm = CausalLMInferencer("inference.onnx", "tokenizer.json")
-text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
-```
-
-#### Android
-
-`hf2mobile-infer` is the same engine with the pyo3 layer swapped for a CLI, so it cross-compiles — no interpreter, no app, no JNI, and no `libhf2mobile_plugins.so` (the operator is compiled in). Three files go to the phone: the binary, an `arm64-v8a` `libonnxruntime.so` (dlopened, so it is found beside the binary at runtime), and the export directory.
-
-```bash
-nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
-
-D=/data/local/tmp/hf2mobile && adb shell mkdir -p $D
-adb push target/aarch64-linux-android/release/hf2mobile-infer libonnxruntime.so $D/
-adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/
-adb shell chmod +x $D/hf2mobile-infer
-
-adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it --prompt 'Where is Paris?'"
-```
-
-```text
-[hf2mobile] INFO     | loaded 39 inputs / 37 outputs (36 KV cache slots) | eos: [1, 106]
-Paris is a French city, which is known for its iconic landmarks and rich history.
-[hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
-```
-
-*(that run is the same binary on the host — a device's numbers will differ, the point is that the two are directly comparable)*
-
-The binary applies the model's chat template itself — the job `transformers` does on the host — rendering the export's own Jinja, so the prompt reaching the model is token-for-token what the Python path produces.
-
-</details>
+Seven stages: trace module I/O → export the subgraphs → register the plugin ops → export the prefill/generation cases → merge, fuse and postprocess → bake the decode policy into the graph → run it. The runtime is two Rust crates over one engine: a Python extension module for the host, and a standalone `aarch64-linux-android` binary for the phone.
 
 ---
 
@@ -467,7 +265,7 @@ Grouped by the axis each item unblocks. Checked items ship in the current export
 
 - [ ] **More contrib-op fusions.** Extend beyond RMSNorm/GQA to the remaining layer-norm family (`SkipLayerNormalization`, `SkipSimplifiedLayerNormalization`, `SimplifiedLayerNormalization`) so the graph maps onto ORT's optimized kernels.
 - [ ] **MoE and LoRA plugins.** Add module exporters for data-dependent expert routing (MoE) and adapter weights (LoRA) — two of the module types the current static per-case export does not yet cover.
-- [ ] **Per-token control flow.** Module exporters for Mixture-of-Depths and early-exit decoders, where whether a block runs at all is decided per token — the one axis in the motivation with no de facto answer in any runtime today.
+- [ ] **Per-token control flow.** Module exporters for Mixture-of-Depths and early-exit decoders, where whether a block runs at all is decided per token — the one axis in the [motivation](docs/motivation.md) with no de facto answer in any runtime today.
 - [ ] **NPU/CPU EP partition.** Assign the fused attention node to the CPU EP and the statically-shaped blocks (QKV projections, MLP) to the NPU EP within a single session, so one graph covers both backends.
 - [ ] **Multimodal support.** Extend beyond text-only causal LMs to vision-language models (`Qwen2.5-VL`, `Phi-4-multimodal`, …): a separately traced vision encoder feeding a decoder whose sequence length is set by the input image.
 - [ ] **ORT-scheme quantization.** Quantize following the ORT quantization scheme.
