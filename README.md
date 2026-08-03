@@ -195,7 +195,7 @@ hf2mobile-export google/gemma-3-270m-it --target ORT --temp 0
 hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is Paris?"
 ```
 
-<video src="https://github.com/jl749/hf2hw/raw/main/docs/hostpc_inference_example.webm" controls muted width="600">
+<video src="https://github.com/user-attachments/assets/b255c43b-6fc2-492e-9c11-580863fb1897" controls muted width="600">
   <a href="docs/hostpc_inference_example.webm">hostpc_inference_example.webm</a> — decoding in the venv on the host.
 </video>
 
@@ -215,7 +215,7 @@ adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
            --prompt 'Where is Paris?' --num-generation 64"
 ```
 
-<video src="https://github.com/jl749/hf2hw/raw/main/docs/android_inference_example.webm" controls muted width="600">
+<video src="https://github.com/user-attachments/assets/09c56d25-e712-47cf-9b71-379b1f004073" controls muted width="600">
   <a href="docs/android_inference_example.webm">android_inference_example.webm</a> — decoding on-device over <code>adb</code>.
 </video>
 
