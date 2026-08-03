@@ -144,13 +144,12 @@ adb shell chmod +x $D/hf2mobile-infer
 
 Supported architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Gemma3ForCausalLM`.
 
-<details>
-<summary><b>💻 HostPC</b> — export, then run it in the venv</summary>
+### `hf2mobile.export` — HF → ONNX
 
-#### 1. `hf2mobile.export` — HF → ONNX
+Host work in both cases: a phone runs the graph, it does not produce one.
 
 ```bash
-nix develop .#default
+nix develop
 
 hf2mobile-export {HF repo id} --target {ORT|QNN}
 ```
@@ -177,13 +176,9 @@ Output lands in a timestamped `{date}__{target}__{model}/`:
 
 Prefill and generation are traced separately, but the ORT deliverable is the one dynamic-`L` graph that serves both, so `case1.onnx` is deleted at the end. `--debug` keeps it, plus the module subgraphs.
 
-#### 2. `hf2mobile.infer` — run it
+### `hf2mobile.infer` — run it
 
-```bash
-nix develop .#default
-
-hf2mobile-inference {export dir} --prompt "Where is Paris?"
-```
+Same engine either way; the flags below are shared, and only the Android fold adds one.
 
 | Argument           | Description                                                                  | Default |
 | ------------------ | ---------------------------------------------------------------------------- | ------- |
@@ -193,9 +188,16 @@ hf2mobile-inference {export dir} --prompt "Where is Paris?"
 | `--num-generation` | Maximum tokens to generate.                                                   | `512` |
 | `--intra-threads`  | ORT intra-op thread count.                                                    | one per core |
 
-Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s. No sampling flags — the policy is in the graph.
+No sampling flags — the policy is baked into the graph. Streams to stdout, then reports prompt length, tokens generated, TTFT and tok/s.
 
-#### Examples
+<details>
+<summary><b>💻 HostPC</b> — run it in the venv</summary>
+
+```bash
+nix develop
+
+hf2mobile-inference {export dir} --prompt "Where is Paris?"
+```
 
 ```bash
 # Gemma 3 (270M), end to end
@@ -210,9 +212,9 @@ hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is P
 </details>
 
 <details>
-<summary><b>📱 Android</b> — export on the host, run it over <code>adb</code></summary>
+<summary><b>📱 Android</b> — run it over <code>adb</code></summary>
 
-Exporting is host work — [step 1 above](#1-hf2mobileexport--hf--onnx), unchanged. What differs is the run: the binary and `libonnxruntime.so` are already on the device from [Install → Android](#android), so only the export directory still has to go over.
+The binary and `libonnxruntime.so` are already on the device from [Install → Android](#android), so only the export directory still has to go over:
 
 ```bash
 nix develop .#android
@@ -226,7 +228,7 @@ adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
 # [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
 
-A device run is [step 2 above](#2-hf2mobileinfer--run-it) with a different binary in front of it — same flags, plus one:
+The host command with a different binary in front of it — same flags, plus one:
 
 | Argument      | Description                               | Default |
 | ------------- | ----------------------------------------- | ------- |
