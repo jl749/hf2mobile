@@ -113,30 +113,29 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 
 ### The plugin node is the unit of control
 
-Holding `Attention` as a single node until the last step is what makes the divergence *yours*: the HuggingFace module is the baseline, and every expansion is a deliberate departure from it — not whatever a converter's pattern matcher recognized in an already-flattened graph.
+Holding plugins such as `Attention` and `RotaryEmbedding` as a single node until the last step is what makes the divergence *yours*: the HuggingFace module is the baseline, and every expansion is a deliberate departure from it — not whatever a converter's pattern matcher recognized in an already-flattened graph.
 
-> The portable artifact is **not the exported file**. A graph carrying `GroupQueryAttention` is an ONNXRuntime graph, and nothing changes that — what stays portable is the **module-level description one step upstream**, which every target's file is generated *from*.
+> The portable artifact is the module-level trace, not any file it produces. A graph carrying a runtime-specific plugin or fusion pattern is bound to that runtime — but every target's file can be translated from the same module-level expansion.
 
 Being plugin-centric stops being a trap once what you keep is the description rather than any one expansion of it.
 
-### Placing the seam: one graph, more than one backend
+### EXAMPLE: placing the seam - one graph, more than one backend
 
-A phone has both an NPU and a CPU, so the question is never which to pick — it is **where to put the seam**:
+A phone has both an NPU and a CPU, so the question is never which to pick — it is **where to put the seam**. **Shape decides**: an NPU earns its efficiency by compiling **ahead of time**, so every dimension must be known at build time, while a CPU EP resolves shapes at run time.
 
 | Side | Takes | Because |
 | ---- | ----- | ------- |
-| **NPU** | compute-heavy, statically-shaped blocks — the MLP stack, the projections | that is where the TOPS are |
-| **CPU** | control flow, sampling, dynamic-shaped glue, the KV cache and the attention that reads it, and any op the accelerator lacks a kernel for | that is where the flexibility is |
+| **NPU** | statically-shaped compute — QKV projections, the MLP stack, **encoder / vision attention** | fixed shapes are what an AOT compiler can plan for, and that is where the TOPS are |
+| **CPU** | everything shape-dependent — **decoder attention** and the KV cache it reads, sampling, control flow, and any op the accelerator lacks a kernel for | shapes resolve at run time, so dynamism is free |
 
-Left alone that boundary is drawn by whatever the converter happens to claim, and one unsupported op can strand a whole block off the accelerator. `hf2mobile` makes the split an **export-time** decision instead.
+The line therefore falls between *kinds* of attention, not across attention as a whole:
 
-The KV cache sets everything else. The choice is to **take an ORT-executable graph as the baseline** and let ORT own the cache: attention expands into `GroupQueryAttention`, whose `past_key` / `present_key` buffers are ordinary graph tensors, so the state stays visible in the IR instead of vanishing into a side-car library. We start with the **CPU EP**, the more generic one.
+- **Encoder / vision attention** carries no cache and runs at a fixed sequence length, so it is as statically shaped as the projections around it → **NPU**, decomposed into whatever kernels the accelerator has.
+- **Decoder attention** threads a KV cache whose `total_sequence_length` grows by one per step — a shape that changes with the input data, exactly what an AOT compiler cannot plan for → **CPU**, expanded into `GroupQueryAttention` so ORT owns the in-kernel cache append and the state stays visible in the IR as ordinary `past_key` / `present_key` tensors.
 
-Shapes force the same placement. `total_sequence_length` grows by one per decode step, and an NPU earns its efficiency by compiling **ahead of time** against fixed shapes — a per-step dimension is exactly what it cannot plan for, while CPU/GPU EPs resolve shapes at run time. The dynamic half of the model belongs where dynamism is free, and that is the same half ORT already owns.
+Same traced node, two expansions, chosen by what the module does. Left alone that boundary is drawn by whatever the converter happens to claim, and one unsupported op can strand a whole block off the accelerator; `hf2mobile` makes the split an **export-time** decision instead. Today's exports target the **CPU EP** alone, the more generic side.
 
-The line falls between *kinds* of attention, not across attention as a whole. Encoder and vision attention carry no cache and run at a fixed sequence length, so they are as statically shaped as the projections around them and belong on the NPU — decomposed there into whatever the accelerator has kernels for. Only **decoder** attention, threading a growing cache, stays CPU-side. Same traced node, two expansions, chosen by what the module does.
-
-The rest follows: with ORT holding the cache, what remains — QKV projections, the MLP stack — is statically shaped, which is what an AOT-compiling accelerator wants. And ORT carries both in one file, since an `EPContext` node embeds a compiled partition for another backend inside the same ONNX graph. One graph, one session, mixed execution.
+Both halves still ship as one file: an `EPContext` node embeds the compiled NPU partition inside the same ONNX graph. One graph, one session, mixed execution.
 
 ### A descriptive graph, and a generic runtime to read it
 
