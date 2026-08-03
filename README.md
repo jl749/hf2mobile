@@ -48,6 +48,12 @@ Trace the model as its semantic **modules** (attention, RoPE, RMSNorm, the LM he
 
 Seven stages: trace module I/O → export the subgraphs → register the plugin ops → export the prefill/generation cases → merge, fuse and postprocess → bake the decode policy into the graph → run it. The runtime is two Rust crates over one engine: a Python extension module for the host, and a standalone `aarch64-linux-android` binary for the phone.
 
+The graph progresses through the export like this — the module-level trace on the left, the shippable ORT graph on the right:
+
+| <img src="docs/1_module_level_graph.svg" width="200"> | <img src="docs/2_module_level_postprocessed_graph.svg" width="200"> | <img src="docs/3_final_graph.svg" width="200"> | <img src="docs/4_final_graph_postprocessed.svg" width="200"> |
+| :---: | :---: | :---: | :---: |
+| Initial module-level graph | Postprocessed module-level graph | Flattened operator-level graph (ORT: CPU-EP target) | Decode policy baked in (`SampleLogits` + EOS ids) |
+
 ---
 
 ## 📋 Requirements
