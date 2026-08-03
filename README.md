@@ -63,17 +63,14 @@ Seven stages: trace module I/O → export the subgraphs → register the plugin 
 Everything above comes from `flake.nix`; nothing needs to be installed globally:
 
 ```bash
-nix develop      # rustc, cargo, rustfmt, rust-analyzer, maturin, python312, uv — and activates .venv
+# for development
+nix develop
+
+# for android deployment (installs additional dep)
+nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
 ```
 
-**To run on an Android device**, additionally:
-
-- The **Android NDK** (its clang links the binary and builds the C sources inside `tokenizers`) and **`adb`** — both in a second shell, `nix develop .#android`, so the multi-GB NDK stays out of the day-to-day one. The `aarch64-linux-android` standard library is already on the toolchain in both shells.
-- An **ONNX Runtime built for `arm64-v8a`** — `jni/arm64-v8a/libonnxruntime.so` out of the [`onnxruntime-android` AAR](https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/). The copy in your `.venv` is an x86-64 host build and will not load on a phone.
-- A device with USB debugging on. Nothing needs root: `/data/local/tmp` is writable *and* executable by `adb shell`.
-
-The package pins CPU-only PyTorch wheels by default (see the `[tool.uv.index]`
-block in `pyproject.toml`). To use CUDA wheels instead, remove that block.
+> Pre-built ONNXRuntime so for `arm64-v8a` can be downloaded from [onnxruntime-android AAR](https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/) (Find `jni/arm64-v8a/libonnxruntime.so`).
 
 ---
 
