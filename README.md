@@ -30,7 +30,7 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 
 **[docs/motivation.md](docs/motivation.md)** — why operator-level ONNX stopped being enough.
 
-ONNX standardized the *operator* level, and that was enough while the vocabulary stayed small and universal. Modern LLMs are stateful and autoregressive, so the ecosystem went **plugin-centric** instead: every runtime grew its **own** extensions — fused attention, side-car configs, session APIs — to express what the standard vocabulary cannot. The module level is where the performance lives, and — being plugin-centric — where portability stops.
+ONNX standardized the *operator* level, and that was enough while the vocabulary stayed small and universal. Modern LLMs are stateful and autoregressive, so the ecosystem went **plugin-centric** instead: every runtime grew its own extensions — fused attention, runtime configs, session APIs — for the parts the standard vocabulary cannot express. That is where the performance lives, and where portability stops. Export for speed and the file belongs to one runtime; flatten it back to standard ONNX and the speed goes with it.
 
 ---
 
