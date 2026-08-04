@@ -65,8 +65,9 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 | ONNX → OpenVINO | [ONNX2OVIR](https://docs.openvino.ai/2026/openvino-workflow/model-preparation/convert-model-onnx.html)  |
 | ONNX → IREE     | [ONNX2MLIR](https://iree.dev/guides/ml-frameworks/onnx/)                                                |
 
-> **A static DAG is insufficient to express modern LLMs. Every runtime worked around that outside the IR, and each did it in its own way — a fix that has to be rewritten for every new target does not scale. That cost the portability ONNX was initially designed to provide. Generic LLM tracing for multiple targets (NPU / CPU / GPU) is the gap worth closing.**
 
 ---
+
+> **A static DAG is insufficient to express modern LLMs. Every runtime worked around that outside the IR, and each did it in its own way — a fix that has to be rewritten for every new target does not scale. That cost the portability ONNX was initially designed to provide. Generic LLM tracing for multiple targets (NPU / CPU / GPU) is the gap worth closing.**
 
 **Next:** [🧩 Approach](approach.md) — the module boundary as the unit of export.
