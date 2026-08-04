@@ -1,6 +1,6 @@
-# 🎯 Motivation
+# Motivation
 
-*Why operator-level ONNX stopped being enough.* — [back to README](../README.md)
+*Why the operator level is no longer a sufficient unit of portability.* — [back to README](../README.md)
 
 ---
 
@@ -13,16 +13,16 @@ It worked because the vocabulary was **small and universal**. For instance, a Re
 
 ## The operator level is too low to be the unit of portability today
 
-A single ONNX graph now has to generalize across two independent axes at once:
+A single exported graph is expected to generalize along two independent axes:
 
-- **Hardware** — NPU / CPU / GPU, each with different quantization schemes, memory layouts, and operator coverage.
-- **Runtimes** — TRT-LLM, vLLM, llama.cpp, ORT — each expecting different graph topology, KV-cache handling, and optimization metadata.
+- **Hardware.** NPU, CPU and GPU targets differ in quantization scheme, memory layout, and operator coverage.
+- **Runtimes.** TensorRT-LLM, vLLM, llama.cpp and ONNXRuntime expect different graph topologies, different KV-cache conventions, and different optimization metadata.
 
-Covering every *(hardware × runtime)* cell at the operator level is manual, per-combination work, and subtle mismatches can silently break correctness or performance.
+Covering the *(hardware × runtime)* product at the operator level is per-cell manual work, and a mismatch in any one cell degrades correctness or performance without a diagnostic. In practice the product is not covered cell by cell. Each runtime instead extends the standard with its own fused kernels, side-car configuration files, and session-level switches, expressing the parts of a modern model that the standard vocabulary cannot. Every runtime arrived at this design independently. We refer to the result as **plugin-centric**: it recovers performance and expressiveness on one runtime at the cost of the property the format existed to provide, namely a single IR that any runtime can interpret.
 
 In practice nobody covers that matrix cell by cell. The ecosystem went **plugin-centric** instead: each runtime grew its **own** extensions — fused kernels, runtime configs, session-level switches — to express the parts of a modern model the standard vocabulary cannot. Every runtime arrived at that answer independently, by lazy tracing, pattern matching, and metadata reading.
 
-## The DAG assumption, and where modern LLMs break it
+ONNX is an interchange format, and every mobile and edge target consumes it, either directly (ONNXRuntime) or through a converter (QNN, TensorRT, OpenVINO, IREE). What the format assumes in return is a **sequential DAG**: a static acyclic graph that is fed once, executed in topological order, and read from, behaving as a pure function of its inputs. `If`, `Loop` and `Scan` exist, but as second-class constructs. Their bodies are attributes rather than values, so a branch cannot be partitioned across backends the way straight-line regions can, and an accelerator that compiles its partition ahead of time cannot claim a region whose trip count is unknown.
 
 ONNX is an **interchange format**, and every mobile and edge target consumes it either directly (ONNXRuntime) or through an IR converter (QNN, TensorRT, OpenVINO, IREE). What it assumes in exchange is a **sequential DAG**: a static, acyclic graph you feed *once*, execute in topological order. For dynamic control flow, `If` / `Loop` / `Scan` ops do exist, but as second-class citizens: Qualcomm's ONNX → DLC converter carries no control-flow operators in its supported set, and other converters such as TensorRT and OpenVINO do accept them, but with limited support that makes them impractical — incomplete subgraph fusion, subgraph shape and dtype constraints on the `then` / `else` branches.
 
@@ -32,12 +32,7 @@ A PyTorch model is a *program* executed in eager mode, whereas ONNX is a *graph*
 
 Four axes are where the DAG assumption hurts on modern LLMs. We cite **ONNXRuntime**'s answer for each:
 
-| Axis | What varies, and per what | ONNXRuntime's answer | Where it actually lives |
-| ---- | ------------------------- | -------------------- | ----------------------- |
-| **Persistent state** | The KV cache, threaded from one decode step into the next — per **step**. A "turn" is not a single DAG pass but a *sequence* of passes sharing memory. | `com.microsoft.GroupQueryAttention` hides the cache append in-kernel, past and present sharing one preallocated buffer so it grows in place instead of being concatenated and copied. The loop *around* it moves out to a separate library, `onnxruntime-genai`, with its own `genai_config.json`. | ❌ a contrib op no converter reads, plus host code every non-ORT runtime rewrites |
-| **Data-dependent routing** | An MoE router picks k of n experts — per **token**. A static graph must either evaluate every expert and mask (dense cost for sparse compute) or gather into a compact batch (data-dependent shapes). | `com.microsoft.MoE` takes `router_probs` as an ordinary input and does top-k selection inside the kernel, so the node stays static while the data-dependence happens where ONNX cannot see it. | ❌ contrib op — one opaque node with a fixed idea of what an expert is |
-| **Data-dependent control flow** | Mixture-of-Depths skips a block entirely; an early-exit LM stops descending the stack — per **token**. | None. Neither a contrib op nor a runtime mechanism (`onnxruntime-genai` stops early per *sequence*, not per token), so these architectures export dense. | ❌ the saving does not survive the export at all |
-| **Config-dependent weights** | Which LoRA adapter applies — per **request**, by config rather than by data. Merging (`W' = W + BA`) collapses to a static graph at the cost of a full weight set per adapter. | Adapters demoted from initializers to graph *inputs* — giving up constant folding and weight pre-packing — selected via `RunOptions.add_active_adapter` from a separate `.onnx_adapter` file. | ❌ not even an op, a session API |
+`If` does not close rows 2 and 3, since its predicate expresses one decision per graph execution while routing requires one per token. Row 3 is the sharpest case: there is no plugin, hence no portability cost and no capability either. The graph translates cleanly precisely because the property worth exporting did not survive the export.
 
 **ONNXRuntime** was best positioned to solve these limitations within the graph, since the organization that authored the standard maintains it — but it could not: each axis varies at runtime along a dimension the graph IR has no way to vary over.
 The common workaround, then, is to extend the ecosystem around the IR rather than the IR itself — contrib ops, runtime configs, session-level APIs.
@@ -48,9 +43,9 @@ Attention is where that workaround is easiest to see, because every runtime perf
 
 | Runtime | Fused attention | Where the KV cache lives |
 | ------- | --------------- | ------------------------ |
-| **ONNXRuntime** | `Attention` / `MultiHeadAttention` / `GroupQueryAttention` contrib ops — [`contrib_ops/cpu/bert`](https://github.com/microsoft/onnxruntime/tree/v1.27.1/onnxruntime/contrib_ops/cpu/bert) | **Inside the op.** Graph tensors — `past_key`/`past_value` in, `present_key`/`present_value` out — but when past and present are *the same* tensor it is sized to `max_sequence_length` and the kernel appends in place. With `seqlens_k`, `total_sequence_length` and `do_rotary` it applies RoPE in the same kernel. The host allocates the buffer; the op decides what happens to it, and how far into it "now" is. |
-| **TensorRT-LLM** | [`gptAttentionPlugin`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1/cpp/tensorrt_llm/plugins/gptAttentionPlugin), over [`cpp/tensorrt_llm/kernels`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1/cpp/tensorrt_llm/kernels) | **Beside the op.** No KV tensors in that sense: with paged KV the cache is a pool of blocks handed out per request by a cache manager, and the plugin is passed the block offsets and host-side metadata needed to find them. Shape and behavior are fixed in plugin *fields* at build time rather than expressed in a portable signature. |
-| **OpenVINO** | [`ScaledDotProductAttention`](https://docs.openvino.ai/2026/documentation/openvino-ir-format/operation-sets/operation-specs/sequence/scaled-dot-product-attention.html) | **Outside the graph's I/O.** The mathematics alone — `query`/`key`/`value`, optional mask and scale, a `causal` flag. The cache is *state*: `ReadValue`/`Assign` pairs on a `Variable`, carried between `infer()` calls, reachable only through `query_state()`. Serving stacks then rewrite that again — `ov::pass::SDPAToPagedAttention` trades the state for a 28-input `PagedAttentionExtension` and block tables. One vendor, two incompatible KV contracts. |
+| **ONNXRuntime** | `Attention` / `MultiHeadAttention` / `GroupQueryAttention` contrib ops, in [`contrib_ops/cpu/bert`](https://github.com/microsoft/onnxruntime/tree/v1.27.1/onnxruntime/contrib_ops/cpu/bert) | **Inside the operator.** The cache appears as graph tensors (`past_key`/`past_value` in, `present_key`/`present_value` out), but when past and present are the *same* tensor it is sized to `max_sequence_length` and the kernel appends in place. Given `seqlens_k`, `total_sequence_length` and `do_rotary`, the same kernel also applies RoPE. The host allocates the buffer; the operator determines what happens to it and how far into it the current position lies. |
+| **TensorRT-LLM** | [`gptAttentionPlugin`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1/cpp/tensorrt_llm/plugins/gptAttentionPlugin), over [`cpp/tensorrt_llm/kernels`](https://github.com/NVIDIA/TensorRT-LLM/tree/v1.2.1/cpp/tensorrt_llm/kernels) | **Beside the operator.** There are no KV tensors in that sense: with paged KV the cache is a pool of blocks issued per request by a cache manager, and the plugin receives the block offsets and the host-side metadata needed to locate them. Shape and behavior are fixed in plugin *fields* at build time rather than expressed in a portable signature. |
+| **OpenVINO** | [`ScaledDotProductAttention`](https://docs.openvino.ai/2026/documentation/openvino-ir-format/operation-sets/operation-specs/sequence/scaled-dot-product-attention.html) | **Outside the graph's I/O.** The operator carries the mathematics alone: `query`/`key`/`value`, an optional mask and scale, and a `causal` flag. The cache is *state*, expressed as `ReadValue`/`Assign` pairs on a `Variable`, carried between `infer()` calls and reachable only through `query_state()`. Serving stacks then rewrite that again: `ov::pass::SDPAToPagedAttention` exchanges the state for a 28-input `PagedAttentionExtension` and block tables. One vendor, two incompatible KV contracts. |
 
 The incompatibility is not about naming but about **who owns what**: who allocates the cache, who advances the position, who tracks sequence length. That is why a converter cannot mechanically rewrite one runtime's attention into another's — the two are not variants of the same node, but different answers to where the runtime ends and the graph begins.
 
@@ -69,4 +64,4 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 
 ---
 
-**Next:** [🧩 Approach](approach.md) — the module boundary as the unit of export.
+**Next:** [Approach](approach.md) — the module boundary as the unit of export.
