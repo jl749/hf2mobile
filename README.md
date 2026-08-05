@@ -30,7 +30,7 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 
 **[docs/motivation.md](docs/motivation.md)** — why operator-level ONNX stopped being enough.
 
-ONNX standardized the *operator* level, and that was enough while the vocabulary stayed small and universal. Modern LLMs are stateful and autoregressive, so the ecosystem went **plugin-centric** instead: every runtime grew its own extensions — fused attention, runtime configs, session APIs — for the parts the standard vocabulary cannot express. That is where the performance lives, and where portability stops. Export for speed and the file belongs to one runtime; flatten it back to standard ONNX and the speed goes with it.
+ONNX standardized the *operator* level, and that was enough while the vocabulary stayed small and universal. Modern LLMs break the **static DAG** it assumes — persistent KV state, data-dependent routing and control flow, config-dependent weights — and every runtime answered outside the IR instead: fused attention, runtime configs, session APIs. That is where the performance lives, and where portability stops. Export for speed and the file belongs to one runtime; flatten it back to standard ONNX and the speed goes with it.
 
 ---
 
@@ -38,7 +38,7 @@ ONNX standardized the *operator* level, and that was enough while the vocabulary
 
 **[docs/approach.md](docs/approach.md)** — the module boundary as the unit of export.
 
-Trace the model as its semantic **modules** (attention, RoPE, RMSNorm, the LM head) rather than a flat operator soup, hold each as a single node, and expand it per target at export time. The portable artifact is the module-level trace, not any one file it produces — which is also what makes the NPU/CPU seam an export-time decision instead of whatever a converter happens to claim.
+Trace the model as its semantic **modules** (attention, RoPE, RMSNorm, the LM head) rather than a flat operator soup, hold each as a single node, and expand it per target at export time — `-t ORT`, `-t QNN`, or one small exporter for something new. The portable artifact is the module-level trace, not any one file it produces, because the module boundary is the last place a model is still *described* rather than committed. That is also what makes the NPU/CPU seam an export-time decision, placed where you choose — even inside a module — instead of wherever a converter's pattern matcher happens to stop.
 
 ---
 

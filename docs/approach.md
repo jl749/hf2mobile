@@ -8,9 +8,9 @@ The [motivation](motivation.md) ends on a dilemma: the module level is where the
 
 Existing porting pipelines (Optimum, Olive, Qualcomm AI Hub) answer that fragmentation by deciding the expansion for you. Being community-driven, each settles on a strategy broad enough for the common cases. But a menu only covers what its authors anticipated, and extending it beyond that is difficult. How a module becomes a graph is fixed by the pipeline, precisely where a mobile target needs more flexibility:
 
-- **KV caching strategy** — dynamic or padded, and in what tensor layout
-- **dtype management** — where mixed precision is allowed and where it is not
-- **execution-provider partitioning** — which subgraphs run on which backend
+- **KV caching strategy** — dynamic or padded, and in what tensor layout.
+- **dtype management** — where mixed precision is allowed and where it is not.
+- **execution-provider partitioning** — which subgraphs run on which backend.
 
 `hf2mobile` hands those decisions back to you. Expansion becomes something you write rather than something you select, and that is what resolves the dilemma the motivation left open: performance and portability stop competing once the fast, target-specific export is no longer what you keep. What you keep is the module-level trace described below, and every target's file is generated from it. No one of those files becomes the artifact you are stuck with.
 
@@ -30,7 +30,7 @@ Here is what that looks like on a two-layer Gemma 3 export:
 
 At this stage, nothing about *how* attention runs has been decided. What each node carries is a name, a signature, and its metadata — named I/Os, `head_size`, `hidden_dim`. These are the info later exporter reads when expanding.
 
-## EXAMPLE: placing the seam — one graph, more than one backend
+## Example: placing the seam — one graph, more than one backend
 
 A mobile SoC ships an NPU and a CPU on the same die, and the best performance comes from utilizing both at full capability. So the question is never which one to pick — it is **where to put the seam** between them.
 
@@ -80,11 +80,9 @@ The exporter and the runtime are one deliverable, designed against each other. M
 
 Attention shows the division: `GroupQueryAttention` owns the in-kernel cache append, so the export targets it directly; the loop around it — prefill, decode, stop — is host work, and the runtime owns that. One loop runs every exported model, small enough to cross-compile for a phone.
 
-## What is reused, what is added
-
-**Reused** — `transformers` module definitions, ORT contrib ops (`GroupQueryAttention`, RMSNorm/RoPE fusions), ORT execution providers and `EPContext`.
-**Added** — the module-level tracer and plugin registry, the per-target expanders, `SampleLogits` and the in-graph EOS constant, and the Rust runtime.
-
 ---
+
+> [!IMPORTANT]
+> **The module boundary is the unit of export because it is the last place where a model is still described rather than committed.** Above it, `transformers` has already drawn the boundaries. Below it, every choice — which kernel, which cache layout, which processor — has been made and can no longer be revisited. Holding the model at that boundary until the last step is what lets one trace serve targets that share no vocabulary, and what turns each new *(hardware × runtime)* cell into one exporter rather than one rewrite.
 
 **Next:** [🔧 How it works](how-it-works.md) — the export stages, and the Rust runtime that runs the result on a phone.
