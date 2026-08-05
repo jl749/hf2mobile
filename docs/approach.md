@@ -4,19 +4,27 @@
 
 ---
 
-`hf2mobile` is built **on top of HuggingFace `transformers`**. The [motivation](motivation.md) ends in a dilemma: a fast export bound to one runtime, or a portable export that gave up the reason you exported at all. The way out is to work one level up from the flat operator graph — at the **module boundary**:
+`hf2mobile` is built **on top of HuggingFace `transformers`**. The [motivation](motivation.md) ends on a dilemma: the module level is where the performance lives, and — because it is plugin-centric — where portability stops. The way out is to work one level up from the flat operator graph — at the **module boundary**:
+Existing porting pipelines — Optimum, Olive, Qualcomm AI Hub — are community driven (design by committee), and they handle the common cases well. What they do not give you is control over the decisions that actually matter on mobile platforms:
 
-1. **Trace at the *module* level.** The model is recorded as its semantic building blocks — attention, RoPE, RMSNorm, the LM head — rather than a soup of `MatMul` / `Mul` / `Softmax`. `transformers` makes this practical: every architecture follows the same template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`), so the boundaries are already drawn by the library the models ship with. An `Attention` module enters the trace as **one node**, identity intact (`Qwen3Attention`, `model.layers.0.self_attn`). A module held whole this way — one node in the graph — is what this documentation calls a **plugin**: the same object [motivation](motivation.md) called a trap, under a different owner.
+- **KV caching strategy** — dynamic or padded, and in what tensor layout
+- **dtype management** — where mixed precision is allowed and where it is not
+- **execution-provider partitioning** — which subgraphs run on which backend
+
+`hf2mobile` aims to do both: ship a working mobile deployment pipeline, and expose a baseline language you can extend to custom models and backends of your own.
+
+1. **Trace at the *module* level.** Rather than the conventional operator level trace, the model is recorded as its semantic building blocks — Attention, RoPE, RMSNorm, the LM head. For example, an `Attention` module enters the trace as a **single node**, with its identity intact (type: `Qwen3Attention`, name: `model.layers.0.self_attn`). `transformers` is what makes this high level encapsulation possible: every architecture follows the same prebuilt template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`), so the clear module level boundaries are already drawn by the library.
 2. **Expand those nodes per target, per strategy.** The same node emits a fused GQA plugin for one runtime, a sliding-window mask template for another, or a single-head decomposition for an NPU with no fused attention — decided at export time.
 3. **Extend the exporter API, don't pattern-match the graph.** Plugins are selected by class-name *suffix*, so one `Attention` exporter covers every architecture following the convention. New architecture or target = one small exporter in `src/hf2mobile/exporter/`.
 
-Here is what that trace actually is, on a two-layer Gemma 3 export:
+Here is a two-layer Gemma 3 export example to help understanding:
+Each decoder layer keeps one `Gemma3Attention` node and one `Gemma3RotaryEmbedding` node, and each node carries its class name into the graph. The KV cache is threaded through named graph I/O (`past_keys_0` in, `past_keys_0_out` out) instead of being hidden inside a kernel.
 
 <p align="center">
   <img src="2_module_level_postprocessed_graph.svg" width="280" alt="Module-level trace of a two-layer Gemma 3 decoder: Gemma3Attention and Gemma3RotaryEmbedding survive as single nodes, KV cache exposed as named graph I/O">
 </p>
 
-One `Gemma3Attention` and one `Gemma3RotaryEmbedding` node per layer — class name carried into the graph — with the KV cache exposed as named I/O (`past_keys_0` in, `past_keys_0_out` out) rather than hidden inside a kernel. Nothing about *how* attention runs is decided yet: the node is a name and a signature, and that is the baseline every target's file expands from. `SlidingWindowMask` is the exception — the HuggingFace model computes it, so it belongs to step 1, but its shape depends on `Lq` and `Lkv` at decode time, so it is emitted with the step 2 expansions rather than frozen into the trace.
+At this stage, nothing about *how* attention runs has been decided yet. Each node still holds a name, a signature, and enough metadata (named I/Os, `head_size`, `hidden_dim`, and so on) for an exporter to later expand it into whatever the target's plugin ecosystem provides.
 
 ## EXAMPLE: placing the seam — one graph, more than one backend
 
@@ -32,6 +40,12 @@ A phone has both an NPU and a CPU, so the question is never which to pick — it
 Two nodes of the same kind, expanded differently because of what each one does. The decoder row is this target's call, not a law — pad the cache to a fixed length and it compiles AOT too (what Qualcomm's GENIE SDK does), buying static shape with wasted compute and a capped context. Either way the decision is made in the exporter, against a node you can name.
 
 Both halves still ship as one file: an `EPContext` node embeds the compiled NPU partition inside the same ONNX graph. One graph, one session, mixed execution.
+
+<p align="center">
+  <img src="epcontext_partitioning_example.svg" width="280" alt="The same two-layer Gemma 3 graph with each layer's MLP block collapsed into a single EPContext node, while the Gemma3Attention nodes and their KV cache I/O stay visible in the graph">
+  <br>
+  <sub>the same export, with each layer's statically-shaped MLP block collapsed into one <code>EPContext</code> node — attention keeps its <code>past_keys_0</code> / <code>past_keys_0_out</code> I/O on the CPU side</sub>
+</p>
 
 ## The plugin node is the unit of control
 
