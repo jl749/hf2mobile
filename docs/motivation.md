@@ -9,7 +9,7 @@
 ONNX defined a portable vocabulary of computation primitives — `MatMul`, `Conv`, `ReLU`, `Softmax`.
 For classical ML graphs, operator-level tracing was enough to cover most model-porting cases.
 
-It worked because the vocabulary was **small and universal**. For instance, a ResNet was a fixed sequence of convolutions: recording the operators that one forward execution touched described the model *completely*; therefore, any backend implementing the same standard operator set could run the exports. Portability was a consequence of the contract being narrow — nothing in the file required knowledge that lived outside the standard.
+It worked because the vocabulary was **small and universal**. For instance, a ResNet was a fixed sequence of convolutions: recording the operators that one forward execution touched described the model *entirely*. Portability was a consequence of the contract being narrow — nothing in the file required knowledge that lived outside the standard.
 
 ## The operator level is too low to be the unit of portability today
 
@@ -18,9 +18,9 @@ A single ONNX graph now has to generalize across two independent axes at once:
 - **Hardware** — NPU / CPU / GPU, each with different quantization schemes, memory layouts, and operator coverage.
 - **Runtimes** — TRT-LLM, vLLM, llama.cpp, ORT — each expecting different graph topology, KV-cache handling, and optimization metadata.
 
-Covering every *(hardware × runtime)* cell at the operator level is manual, per-combination work, and subtle mismatches can silently break correctness or performance.
+Covering every *(hardware × runtime)* cell at the operator level is manual, per-combination work, and subtle mismatches can silently break sanity or performance.
 
-In practice nobody covers that matrix cell by cell. The ecosystem went **plugin-centric** instead: each runtime grew its **own** extensions — fused kernels, runtime configs, session-level switches — to express the parts of a modern model the standard vocabulary cannot. Every runtime arrived at that answer independently, by lazy tracing, pattern matching, and metadata reading.
+In practice nobody covers that matrix cell by cell. The ecosystem went **plugin-centric** instead: each runtime grew its **own** extensions — fused kernels, runtime configs, session-level switches — to express the parts of a modern model the standard vocabulary cannot, recognizing what to replace in its own way, by lazily tracing the graph, matching patterns, or reading metadata.
 
 ## The DAG assumption, and where modern LLMs break it
 
