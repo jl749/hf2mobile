@@ -4,47 +4,58 @@
 
 ---
 
-`hf2mobile` is built **on top of HuggingFace `transformers`**. The [motivation](motivation.md) ends on a dilemma: the module level is where the performance lives, and — because it is plugin-centric — where portability stops. The way out is to work one level up from the flat operator graph — at the **module boundary**:
-Existing porting pipelines — Optimum, Olive, Qualcomm AI Hub — are community driven (design by committee), and they handle the common cases well. What they do not give you is control over the decisions that actually matter on mobile platforms:
+The [motivation](motivation.md) ends on a dilemma: the module level is where the performance lives, and — because it is plugin-centric — where portability stops.
+
+Existing porting pipelines (Optimum, Olive, Qualcomm AI Hub) resolve it by deciding for you. They handle the common cases well, but, being community-driven, they fall into the design-by-committee trap: the decisions that actually matter on mobile are not exposed.
 
 - **KV caching strategy** — dynamic or padded, and in what tensor layout
 - **dtype management** — where mixed precision is allowed and where it is not
 - **execution-provider partitioning** — which subgraphs run on which backend
 
-`hf2mobile` aims to do both: ship a working mobile deployment pipeline, and expose a baseline language you can extend to custom models and backends of your own.
+`hf2mobile` keeps those decisions yours. That is also its answer to the dilemma: a choice left explicit can be made differently for the next target, while one baked into a file cannot.
 
-1. **Trace at the *module* level.** Rather than the conventional operator level trace, the model is recorded as its semantic building blocks — Attention, RoPE, RMSNorm, the LM head. For example, an `Attention` module enters the trace as a **single node**, with its identity intact (type: `Qwen3Attention`, name: `model.layers.0.self_attn`). `transformers` is what makes this high level encapsulation possible: every architecture follows the same prebuilt template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`), so the clear module level boundaries are already drawn by the library.
+Built **on top of HuggingFace `transformers`**, it works one level up from the flat operator graph — at the **module boundary** — to supply both a working mobile deployment pipeline and a baseline language for extending support to custom models and backends:
+
+1. **Trace at the *module* level.** Rather than the conventional operator-level trace, the model is recorded as its semantic building blocks — Attention, RoPE, RMSNorm, the LM head. For example, an `Attention` module enters the trace as a **single node**, with its identity intact (type: `Qwen3Attention`, name: `model.layers.0.self_attn`). `transformers` is what makes this high-level encapsulation possible: every architecture follows the same prebuilt template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`), so the module-level boundaries are already drawn by the library.
 2. **Expand those nodes per target, per strategy.** The same node emits a fused GQA plugin for one runtime, a sliding-window mask template for another, or a single-head decomposition for an NPU with no fused attention — decided at export time.
 3. **Extend the exporter API, don't pattern-match the graph.** Plugins are selected by class-name *suffix*, so one `Attention` exporter covers every architecture following the convention. New architecture or target = one small exporter in `src/hf2mobile/exporter/`.
 
-Here is a two-layer Gemma 3 export example to help understanding:
-Each decoder layer keeps one `Gemma3Attention` node and one `Gemma3RotaryEmbedding` node, and each node carries its class name into the graph. The KV cache is threaded through named graph I/O (`past_keys_0` in, `past_keys_0_out` out) instead of being hidden inside a kernel.
+Here is what that looks like on a two-layer Gemma 3 export:
 
 <p align="center">
   <img src="2_module_level_postprocessed_graph.svg" width="280" alt="Module-level trace of a two-layer Gemma 3 decoder: Gemma3Attention and Gemma3RotaryEmbedding survive as single nodes, KV cache exposed as named graph I/O">
 </p>
 
+Each decoder layer keeps one `Gemma3Attention` node and one `Gemma3RotaryEmbedding` node, each carrying its class name into the graph. The KV cache is threaded through named graph I/O (`past_keys_0` in, `past_keys_0_out` out) instead of being hidden inside a kernel.
+
 At this stage, nothing about *how* attention runs has been decided yet. Each node still holds a name, a signature, and enough metadata (named I/Os, `head_size`, `hidden_dim`, and so on) for an exporter to later expand it into whatever the target's plugin ecosystem provides.
 
 ## EXAMPLE: placing the seam — one graph, more than one backend
 
-A phone has both an NPU and a CPU, so the question is never which to pick — it is **where to put the seam**. Left to the converter — onnx2trt, onnx2dlc, and the rest — the boundary lands wherever the pattern matcher happens to claim, and one unsupported op can strand a whole block off the accelerator. Held as plugin nodes, the split falls on boundaries you named, at **export time**.
+A mobile SoC ships an NPU and a CPU on the same die, and the best performance comes from utilizing both at full capability. So the question is never which one to pick — it is **where to put the seam** between them.
 
-**Shape decides where it falls.** An NPU EP earns its efficiency by compiling **ahead of time**, so every dimension must be known at build time; a CPU EP resolves shapes at runtime. Statically-shaped compute goes to the NPU — QKV projections, the MLP stack, where the TOPS are. Everything shape-dependent stays on the CPU, along with sampling, control flow, and any op the accelerator has no kernel for. That puts the line between *kinds* of attention, not across attention as a whole:
+Leave it to the runtime and the seam gets chosen for you. Hand an ONNX file to the [QNN execution provider](https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html) and it partitions the graph on its own: whatever the pattern matcher can claim is fused into `EPContext` nodes, and the rest falls back to CPU (`disable_cpu_ep_fallback = 0`, by default). Either way the seam is not yours: one unsupported op in the middle of a block can push the whole block off the accelerator, and tweaking the details of the IR is an unreliable way to steer it.
+
+Held as *module-level* nodes at **export time**, the seam falls where you put it instead. The module boundary is the coarsest place to cut, not the only one: you decide how each node expands, so the seam can just as well run *inside* a module — QKV projections compiled onto the NPU while the cache append that follows them stays on the CPU. The node is the unit of control, not a wall.
+
+**Shape is what you pick on.** An NPU EP earns its efficiency by compiling **ahead of time**, so every dimension must be known at build time; a CPU EP resolves shapes at runtime. Statically-shaped compute goes to the NPU — QKV projections, the MLP stack, where the TOPS are. Everything shape-dependent stays on the CPU, along with sampling, control flow, and any op the accelerator has no kernel for.
+
+For example, Attention itself does not land on one side or the other. Encoder attention is static, decoder attention is not, so the two go to different processors:
 
 | Attention | Shape | Goes to | Expanded into |
 | --------- | ----- | ------- | ------------- |
-| **Encoder / vision** | no cache, fixed sequence length — as static as the projections around it | **NPU** | whatever kernels the accelerator has |
-| **Decoder** | threads a KV cache whose `total_sequence_length` grows by one per step | **CPU** | `GroupQueryAttention`, so ORT owns the in-kernel cache append and the state stays visible in the IR as ordinary `past_key` / `present_key` tensors |
+| **Encoder / vision** | no cache, fixed sequence length — as static as the projections around it | **NPU** | split head topology as NPU lacks 5d support |
+| **Decoder** | threads a KV cache whose `total_sequence_length` grows by one per step | **CPU** | `GroupQueryAttention`, so ORT owns the in-kernel cache append and the state stays visible in the IR as ordinary `past_key` / `present_key` IO buffers |
 
-Two nodes of the same kind, expanded differently because of what each one does. The decoder row is this target's call, not a law — pad the cache to a fixed length and it compiles AOT too (what Qualcomm's GENIE SDK does), buying static shape with wasted compute and a capped context. Either way the decision is made in the exporter, against a node you can name.
+Two nodes of the same kind, expanded differently because of what each one does.
+The decoder row is this target's call, not a law — pad the cache to a fixed length and it compiles AOT too (what Qualcomm's AIHUB SDK does), buying static shape with wasted compute and a capped context. Either way the expansion is decided in the exporter.
 
-Both halves still ship as one file: an `EPContext` node embeds the compiled NPU partition inside the same ONNX graph. One graph, one session, mixed execution.
+This is the same graph from earlier, one step later. `Gemma3Attention` has expanded into `GroupQueryAttention` on the CPU side. Both halves still ship as one file: an `EPContext` node embeds the compiled NPU partition inside the same ONNX graph. One graph, one session, mixed execution.
 
 <p align="center">
-  <img src="epcontext_partitioning_example.svg" width="280" alt="The same two-layer Gemma 3 graph with each layer's MLP block collapsed into a single EPContext node, while the Gemma3Attention nodes and their KV cache I/O stay visible in the graph">
+  <img src="epcontext_partitioning_example.svg" width="280" alt="The same two-layer Gemma 3 graph reduced to nine nodes: three EPContext partitions alternating with the two GroupQueryAttention nodes, which keep their past_keys and past_values I/O on the CPU side">
   <br>
-  <sub>the same export, with each layer's statically-shaped MLP block collapsed into one <code>EPContext</code> node — attention keeps its <code>past_keys_0</code> / <code>past_keys_0_out</code> I/O on the CPU side</sub>
+  <sub>the same export, with every statically-shaped run collapsed into an <code>EPContext</code> node — 79 nodes become 9, and the two <code>GroupQueryAttention</code> nodes stay on the CPU side with their <code>past_keys_0</code> / <code>past_keys_0_out</code> I/O intact. Note where the seams fall: the QKV projections are compiled into the partition <em>before</em> each attention node, so the cut runs through the middle of the attention module, not around it.</sub>
 </p>
 
 ## The plugin node is the unit of control
