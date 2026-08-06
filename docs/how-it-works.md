@@ -81,13 +81,7 @@ text, (ttft_s, tps) = lm.generate("Where is Paris?", num_generation=64)
 `hf2mobile-infer` is the same engine with the pyo3 layer swapped for a CLI, so it cross-compiles — no interpreter, no app, no JNI, and no `libhf2mobile_plugins.so` (the operator is compiled in). Three files go to the phone: the binary, an `arm64-v8a` `libonnxruntime.so` (dlopened, so it is found beside the binary at runtime), and the export directory.
 
 ```bash
-nix develop .#android -c cargo build --release --target aarch64-linux-android --bin hf2mobile-infer
-
-D=/data/local/tmp/hf2mobile && adb shell mkdir -p $D
-adb push target/aarch64-linux-android/release/hf2mobile-infer libonnxruntime.so $D/
-adb push 2026-08-01__ORT__google-gemma-3-270m-it $D/
-adb shell chmod +x $D/hf2mobile-infer
-
+D=/data/local/tmp/hf2mobile
 adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it --prompt 'Where is Paris?'"
 ```
 
