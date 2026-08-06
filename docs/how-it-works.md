@@ -33,7 +33,7 @@ Then, past the exporter:
 | **6. Bake the decode policy** | Append a `SampleLogits` node so the graph returns a token id, and park the EOS ids in the graph as a `Constant`. | `src/hf2mobile/postprocess.py` |
 | **7. Run it** | Tokenize, prefill, decode, detokenize — in Rust, over the postprocessed graph. | `src/onnx_inferencer/` |
 
-The graph progresses through the export like this:
+The graph progresses through all seven stages like this:
 
 | <img src="1_module_level_graph.svg" width="200"> | <img src="2_module_level_postprocessed_graph.svg" width="200"> | <img src="3_final_graph.svg" width="200"> | <img src="4_final_graph_postprocessed.svg" width="200"> |
 | :---: | :---: | :---: | :---: |
@@ -45,13 +45,13 @@ The graph progresses through the export like this:
 
 The exported graph is only half the deliverable; a runtime has to load it. `hf2mobile` ships two Rust crates that share one source file:
 
-| Crate | Artifact | Role |
-| ----- | -------- | ---- |
+| Source | Artifact | Role |
+| ------ | -------- | ---- |
 | `src/onnx_inferencer/` | `hf2mobile._ortrs_binding` (a Python extension module, built by maturin) | *Drives* ONNXRuntime — session setup, KV cache, prefill/decode loop, tokenizer, timing. Backs `python -m hf2mobile.infer`. |
 | `src/onnx_inferencer/` | `hf2mobile-infer` (a standalone executable, built by cargo) | The same engine with no interpreter, so it cross-compiles: `adb push` it to a phone with an export directory and run the graph on the device it was built for. |
 | `src/onnx_plugins/` | `libhf2mobile_plugins.so` | *Driven by* ONNXRuntime — a custom-op library exporting the C `RegisterCustomOps` entry point, loadable from Python, C++ or an Android app. |
 
-They are separate crates (and separate cargo workspaces) because they need opposite `ort` configurations: the runtime dlopens onnxruntime, the plugin is already running inside it. But `sample_logits.rs` is compiled into **both**, so the token a mobile runtime picks and the token the dev runtime picks come from one definition.
+They are separate crates (and separate cargo workspaces) because they need opposite `ort` configurations: the runtime dlopens onnxruntime, while the plugin is already running inside it. But `sample_logits.rs` is compiled into **both**, so the token a mobile runtime picks and the token the dev runtime picks come from one definition.
 
 Nothing tells the engine *how* to decode. The policy is a `SampleLogits` node and the stop ids are a `hf2mobile_EOS_tokens` constant, both baked into the graph by postprocess:
 
@@ -59,7 +59,7 @@ Nothing tells the engine *how* to decode. The policy is a `SampleLogits` node an
 logits [1, L, vocab]  --SampleLogits(top_k, top_p, temperature)-->  sampled_token [1, 1] int32
 ```
 
-A 262k-wide fp32 logits row is 1 MB per token, so reducing it to one integer *inside* the graph is the copy the decode loop most wants back. What the engine adds around that: a zero-copy KV cache (tensors stay ORT-side between steps), one dynamic-`L` graph serving both prefill and decode, and TTFT/tok-s per run. `DEBUG=1` also dumps the Level3-optimized graph and a `chrome://tracing` profile.
+A 262k-wide fp32 logits row is 1 MB per token, so reducing it to one integer *inside* the graph is the copy the decode loop most wants back. What the engine adds around that: a zero-copy KV cache (tensors stay ORT-side between steps), one session driving both prefill and decode over the exporter's dynamic-`L` graph, and TTFT/tok-s per run. `DEBUG=1` also dumps the Level3-optimized graph and a `chrome://tracing` profile.
 
 Two front ends, one engine — a cargo feature picks which is compiled:
 

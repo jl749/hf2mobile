@@ -48,7 +48,7 @@ For example, Attention itself does not land on one side or the other. Encoder at
 | **Decoder** | threads a KV cache whose `total_sequence_length` grows by one per step | **CPU** | `GroupQueryAttention`, so ORT owns the in-kernel cache append and the state stays visible in the IR as ordinary `past_key` / `present_key` IO buffers |
 
 > [!NOTE]
-> The decoder row is this target's call, not a law. Pad the cache to a fixed length and it compiles AOT too (what Qualcomm's AIHUB SDK does), buying static shape with wasted compute and a capped context.
+> The decoder row is this target's call, not a law. Pad the cache to a fixed length and it compiles AOT too (what Qualcomm's AI Hub does), buying static shape with wasted compute and a capped context.
 
 Either way the expansion is decided in the exporter.
 
@@ -66,7 +66,7 @@ Nothing above required a new file format — both expansions came out of the sam
 
 Attention is one of the four axes [motivation](motivation.md) opened; the same lever reaches the others. An MoE block held whole is one node that expands into `com.microsoft.MoE`. A LoRA adapter attaches at a module boundary by definition: merged into the weights for one target, left as a graph input for another. Mixture-of-Depths is the honest limit. A trace only records the execution it saw, so per-token skipping does not survive an export at any boundary. What the node still does is name the block a custom kernel would have to claim — which a flattened graph cannot do.
 
-> [!NOTE]
+> [!IMPORTANT]
 > The portable artifact is the module-level trace, not any file it produces. A graph carrying a runtime-specific plugin or fusion pattern is bound to that runtime — but every target's file can be generated from the same module-level trace.
 
 That resolves the opening dilemma — not by making the fast export portable, but by keeping speed and portability in separate artifacts. In practice this means you version the trace, and regenerate every runtime-bound file from it rather than maintaining any of them. The cost: that trace is `hf2mobile`'s own representation, which no other tool reads, so the per-*(hardware × runtime)* work is collapsed into one place rather than standardized away.
@@ -75,7 +75,7 @@ Being plugin-centric stops being a trap once what you keep is the trace, not any
 
 ## A descriptive graph, and a generic runtime to read it
 
-The exporter and the runtime are designed against each other. The **exporter** works off module identity — which `transformers` class a node came from. The **runtime** never sees that and does not need to; what it needs is a much shorter list, stated plainly enough in the graph that the [Rust runtime](how-it-works.md#2-case-study-the-causallm-runtime) can read it straight out of the file. The semantics live in **one artifact, in the IR**, instead of spread across a contrib op, a runtime config and a session API.
+The exporter and the runtime are designed against each other. The **exporter** works off module identity — which `transformers` class a node came from. The **runtime** never sees that and does not need to; what it needs is a much shorter list, stated plainly enough in the graph that the [Rust runtime](how-it-works.md#example-causallm-inferencer) can read it straight out of the file. The semantics live in **one artifact, in the IR**, instead of spread across a contrib op, a runtime config and a session API.
 
 Attention is a good place to see where the line falls. Growing the KV cache happens inside the graph, since `GroupQueryAttention` appends in-kernel — the exporter's job is to emit that node. What wraps around it is plain host code: feed the prompt, call the session once per token, stop on an EOS id.
 
