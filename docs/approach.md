@@ -12,7 +12,7 @@ Existing porting pipelines (Optimum, Olive, Qualcomm AI Hub) answer that fragmen
 - **dtype management** — where mixed precision is allowed and where it is not.
 - **execution-provider partitioning** — which subgraphs run on which backend.
 
-`hf2mobile` hands those decisions back to you. Expansion becomes something you write rather than something you select, which changes what the dilemma applies to: performance and portability stop competing once the fast, target-specific export is no longer what you keep. What you keep instead is the module-level trace described below, and every target's file is generated from it — hence, none of them is the artifact you are stuck with.
+`hf2mobile` hands those decisions back to you. Expansion becomes something you write rather than something you select, which changes what the dilemma applies to: performance and portability stop competing once the fast, target-specific export is no longer what you keep. What you keep instead is the module-level trace described below, and every target's file is generated from it.
 
 This is possible because `hf2mobile` is built **on top of HuggingFace `transformers`**, where every architecture follows the same prebuilt template (`Qwen3RMSNorm`, `LlamaAttention`, `Gemma3RotaryEmbedding`) — the module-level boundaries are already drawn by the library. Working one level up from the flat operator graph, at the **module boundary**, it supplies both a working mobile deployment pipeline and a baseline language for extending support to custom models and backends:
 
@@ -46,8 +46,6 @@ For example, Attention itself does not land on one side or the other. Encoder at
 | --------- | ----- | ------- | ------------- |
 | **Encoder / vision** | no cache, fixed sequence length — as static as the projections around it | **NPU** | split head subgraph as NPU lacks 5d support |
 | **Decoder** | threads a KV cache whose `total_sequence_length` grows by one per step | **CPU** | `GroupQueryAttention`, so ORT owns the in-kernel cache append and the state stays visible in the IR as ordinary `past_key` / `present_key` IO buffers |
-
-Two nodes of the same kind, expanded differently due to the dynamic properties of each subgraph.
 
 > [!NOTE]
 > The decoder row is this target's call, not a law. Pad the cache to a fixed length and it compiles AOT too (what Qualcomm's AIHUB SDK does), buying static shape with wasted compute and a capped context.
