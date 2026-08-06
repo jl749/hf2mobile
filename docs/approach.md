@@ -25,7 +25,7 @@ Here is what that looks like on a two-layer Gemma 3 export:
 <p align="center">
   <img src="2_module_level_postprocessed_graph.svg" width="280" alt="Module-level trace of a two-layer Gemma 3 decoder: Gemma3Attention and Gemma3RotaryEmbedding survive as single nodes, KV cache exposed as named graph I/O">
   <br>
-  <sub>every decoder layer exposes one <code>Gemma3Attention</code> node and one <code>Gemma3RotaryEmbedding</code> node, each carrying its class name and metadata into the graph — and the KV cache is threaded through named graph I/O (<code>past_keys_0</code> in, <code>past_keys_0_out</code> out)</sub>
+  <sub>every decoder layer exposes one <code>Gemma3Attention</code> node and one <code>Gemma3RotaryEmbedding</code> node, each carrying its class name and metadata into the graph — and the KV cache is threaded through named graph I/O (<code>past_keys_0</code> in, <code>past_keys_0_out</code> out). <code>SlidingWindowMask</code> appears only on the layers whose metadata — module attributes and <code>config.json</code> — calls for it.</sub>
 </p>
 
 At this stage, nothing about *how* attention runs has been decided. What each node carries is a name, a signature, and its metadata — named I/Os, `head_size`, `hidden_dim`. These are the info later exporter reads when expanding.
@@ -66,6 +66,7 @@ Nothing above required a new file format — both expansions came out of the sam
 
 Attention is one of the four axes [motivation](motivation.md) opened; the same lever reaches the others. An MoE block held whole is one node that expands into `com.microsoft.MoE`. A LoRA adapter attaches at a module boundary by definition: merged into the weights for one target, left as a graph input for another. Mixture-of-Depths is the honest limit. A trace only records the execution it saw, so per-token skipping does not survive an export at any boundary. What the node still does is name the block a custom kernel would have to claim — which a flattened graph cannot do.
 
+> [!NOTE]
 > The portable artifact is the module-level trace, not any file it produces. A graph carrying a runtime-specific plugin or fusion pattern is bound to that runtime — but every target's file can be generated from the same module-level trace.
 
 That resolves the opening dilemma — not by making the fast export portable, but by keeping speed and portability in separate artifacts. In practice this means you version the trace, and regenerate every runtime-bound file from it rather than maintaining any of them. The cost: that trace is `hf2mobile`'s own representation, which no other tool reads, so the per-*(hardware × runtime)* work is collapsed into one place rather than standardized away.
@@ -78,9 +79,9 @@ The exporter and the runtime are designed against each other. The **exporter** w
 
 Attention is a good place to see where the line falls. Growing the KV cache happens inside the graph, since `GroupQueryAttention` appends in-kernel — the exporter's job is to emit that node. What wraps around it is plain host code: feed the prompt, call the session once per token, stop on an EOS id.
 
-That host code can stay generic because the graph already answers everything it would otherwise have to be told. Cache slots are discovered by convention — any input `x` with a matching `x_out` output — so no layer names are hardcoded and the loop survives a change in layer count. The EOS ids are a `Constant` in the graph and sampling is a node in it. Nothing is read from a side-car config, so there is no per-model branch anywhere in the runtime.
+That host code can stay generic because the graph already answers everything it would otherwise have to be told. Cache slots are discovered by convention — any input `x` with a matching `x_out` output — so no layer names are hardcoded and the loop survives a change in layer count. The EOS ids are a `Constant` in the graph, and the sampling strategy is a custom node. Nothing is read from a runtime config, so there is no per-model branch anywhere in the runtime.
 
-That is also why the runtime ships *with* the exporter. An export free to choose its own seams and its own cache layout is not the artifact AI Hub or Olive expects to be handed back, so a matching runtime is part of the deliverable rather than something you hope to find. It is a small thing to own: the decode loop never copies the cache, because ORT hands tensors out as reference-counted handles — feeding last step's keys back in is a pointer write and a refcount bump, not a `memcpy` of tens of megabytes per token. What is left in a decode step is the matrix multiplies, which is the point.
+That is also why the runtime ships *with* the exporter. An export that picks its own seams and its own cache layout is not what AI Hub or Olive expects to receive, so a matching runtime is part of the deliverable rather than something you hope to find. There is not much to implement: the whole inference path — reading the graph, the session, the KV cache, prefill and decode — is under 900 lines of Rust. And it never copies the cache: ORT hands tensors out as reference-counted handles, so feeding the last step's keys back in is a pointer write and a refcount bump, not a `memcpy` of tens of megabytes per token.
 
 ---
 

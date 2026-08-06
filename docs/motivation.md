@@ -68,6 +68,6 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 ---
 
 > [!IMPORTANT]
-> **A static DAG is insufficient to express modern LLMs. Every runtime worked around that outside the IR, and each did it in its own way — a fix that has to be rewritten for every new target does not scale. That cost the portability ONNX was initially designed to provide. Generic LLM tracing for multiple targets (NPU / CPU / GPU) is the gap worth closing.**
+> **Modern LLMs no longer fit in a static DAG. Every runtime worked around that outside the standard IR, and each did it in its own way — which does not scale, and loses the portability ONNX was initially designed to provide. Generic LLM tracing for multiple targets (NPU / CPU / GPU) is the gap worth closing.**
 
 **Next:** [🧩 Approach](approach.md) — the module boundary as the unit of export.
