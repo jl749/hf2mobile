@@ -9,7 +9,7 @@
 ONNX defined a portable vocabulary of computation primitives — `MatMul`, `Conv`, `ReLU`, `Softmax`.
 For classical ML graphs, operator-level tracing was enough to cover most model-porting cases.
 
-It worked because the vocabulary was **small and universal**. For instance, a ResNet was a fixed sequence of convolutions: recording the operators that one forward execution touched described the model *completely*; therefore, any backend implementing the same standard operator set could run the exports. Portability was a consequence of the contract being narrow — nothing in the file required knowledge that lived outside the standard.
+It worked because the vocabulary was **small and universal**. For instance, a ResNet was a fixed sequence of convolutions: recording the operators that one forward execution touched described the model *entirely*. Portability was a consequence of the contract being narrow — nothing in the file required knowledge that lived outside the standard.
 
 ## The operator level is too low to be the unit of portability today
 
@@ -18,9 +18,9 @@ A single ONNX graph now has to generalize across two independent axes at once:
 - **Hardware** — NPU / CPU / GPU, each with different quantization schemes, memory layouts, and operator coverage.
 - **Runtimes** — TRT-LLM, vLLM, llama.cpp, ORT — each expecting different graph topology, KV-cache handling, and optimization metadata.
 
-Covering every *(hardware × runtime)* cell at the operator level is manual, per-combination work, and subtle mismatches can silently break correctness or performance.
+Covering every *(hardware × runtime)* cell at the operator level is manual, per-combination work, and subtle mismatches can silently break sanity or performance.
 
-In practice nobody covers that matrix cell by cell. The ecosystem went **plugin-centric** instead: each runtime grew its **own** extensions — fused kernels, runtime configs, session-level switches — to express the parts of a modern model the standard vocabulary cannot. Every runtime arrived at that answer independently, by lazy tracing, pattern matching, and metadata reading.
+In practice nobody covers that matrix cell by cell. The ecosystem went **plugin-centric** instead: each runtime grew its **own** extensions — fused kernels, runtime configs, session-level switches — to express the parts of a modern model the standard vocabulary cannot, recognizing what to replace in its own way, by lazily tracing the graph, matching patterns, or reading metadata.
 
 ## The DAG assumption, and where modern LLMs break it
 
@@ -30,7 +30,7 @@ Modern LLMs and multimodal pipelines are *stateful* and autoregressive — far m
 
 A PyTorch model is a *program* executed in eager mode, whereas ONNX is a *graph* with a predefined execution path. `torch.onnx.export` traces that program into a static graph, and control flow survives only where it was written as `torch.cond` or `torch.while_loop` — which almost nobody does: neither appears anywhere in `transformers`' or `diffusers`' modeling code. So a Python `if` still specializes to the branch it took, `for` unrolls, shapes stay dynamic only where declared, and a data-dependent shape fails the export.
 
-Four axes are where the DAG assumption hurts on modern LLMs. We cite **ONNXRuntime**'s answer for each:
+Four axes are where the DAG assumption hurts most on modern LLMs. We cite **ONNXRuntime**'s answer for each:
 
 | Axis | What varies, and per what | ONNXRuntime's answer | Where it actually lives |
 | ---- | ------------------------- | -------------------- | ----------------------- |
@@ -65,9 +65,9 @@ With no standard at that level, model publishers, agent frameworks, and distribu
 | ONNX → OpenVINO | [ONNX2OVIR](https://docs.openvino.ai/2026/openvino-workflow/model-preparation/convert-model-onnx.html)  |
 | ONNX → IREE     | [ONNX2MLIR](https://iree.dev/guides/ml-frameworks/onnx/)                                                |
 
-
 ---
 
-> **A static DAG is insufficient to express modern LLMs. Every runtime worked around that outside the IR, and each did it in its own way — a fix that has to be rewritten for every new target does not scale. That cost the portability ONNX was initially designed to provide. Generic LLM tracing for multiple targets (NPU / CPU / GPU) is the gap worth closing.**
+> [!IMPORTANT]
+> **Modern LLMs no longer fit in a static DAG. Every runtime worked around that outside the standard IR, and each did it in its own way — which does not scale, and loses the portability ONNX was initially designed to provide. Generic LLM tracing for multiple targets (NPU / CPU / GPU) is the gap worth closing.**
 
 **Next:** [🧩 Approach](approach.md) — the module boundary as the unit of export.
