@@ -4,7 +4,7 @@
 
 ---
 
-## EXAMPLE: CausalLM exporter
+## Example: CausalLM exporter
 
 Every supported model inherits `CausalLMExporter` (`src/hf2mobile/exporter/causallm.py`), which drives a five-stage export. A single run traces **two cases** — **prefill** (the full prompt) and **generation** (single-token decode with KV cache in/out) — because those are the two distinct shapes a decoder actually runs at inference time. For `ORT` the deliverable is the generation graph alone, whose dynamic `L` covers both.
 
@@ -23,7 +23,8 @@ Stage 5 is where the target specialization becomes concrete — e.g. for `ORT`:
 
 Adding a new architecture is usually a thin subclass of `CausalLMExporter` (see `llama.py`, `qwen2.py`, `qwen3.py`, `gemma3.py`); adding a new target is mostly new branches under `onnx/fusion` and `onnx/postprocess`.
 
-> **On memory.** Stages 4–5 hold the graph as a single `onnx_ir.Model` from load to save. `ir.load` mmaps external tensors — the weights are page cache the kernel can evict, not heap — and every fusion and postprocess mutates that one live model in place, so there is no save/reload round-trip between stages. Exporting a multi-GB model no longer means materializing its weights once per stage.
+> [!NOTE]
+> **On memory.** Stages 4–5 hold the graph as a single `onnx_ir.Model` from load to save. `ir.load` mmaps external tensors — the weights are page cache the OS can evict, not heap — and every fusion and postprocess mutates that one live model in place, so there is no save/reload round-trip between stages.
 
 Then, past the exporter:
 
@@ -40,7 +41,7 @@ The graph progresses through the export like this:
 
 ---
 
-## EXAMPLE: CausalLM inferencer
+## Example: CausalLM inferencer
 
 The exported graph is only half the deliverable; a runtime has to load it. `hf2mobile` ships two Rust crates that share one source file:
 
@@ -95,8 +96,6 @@ adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it --promp
 Paris is a French city, which is known for its iconic landmarks and rich history.
 [hf2mobile] INFO     | 14 prompt tokens, 18 generated (EOS) | TTFT 113.9 ms | 13.38 tok/s
 ```
-
-*(that run is the same binary on the host — a device's numbers will differ, the point is that the two are directly comparable)*
 
 The binary applies the model's chat template itself — the job `transformers` does on the host — rendering the export's own Jinja, so the prompt reaching the model is token-for-token what the Python path produces.
 
