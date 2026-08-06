@@ -47,6 +47,10 @@ const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
 /// (`libonnxruntime.so`, `libonnxruntime.so.1.22.0`, `libonnxruntime.dylib`).
 const ORT_DYLIB_PREFIX: &str = "libonnxruntime.";
 
+/// `#[derive(Parser)]` is clap generating the argument parser *from this struct*: one field is
+/// one flag, the field's type decides whether it is required (`String`) or optional
+/// (`Option<usize>`) or a switch (`bool`), and the doc comment on each field is its `--help`
+/// line. There is no separate list of arguments to keep in step with the struct.
 #[derive(Parser)]
 #[command(
     name = "hf2mobile-infer",
@@ -202,13 +206,20 @@ fn resolve_ort_dylib(args: &Args) -> Result<PathBuf> {
         }
         return Ok(path.clone());
     }
+    // `var_os` rather than `var` because a path is not required to be UTF-8; `filter` then
+    // treats `ORT_DYLIB_PATH=` (set but empty) as not set, which is what a shell leaves behind
+    // after `export ORT_DYLIB_PATH=""`.
     if let Some(path) = std::env::var_os(ORT_DYLIB_ENV).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
 
+    // `ok()` throws away the reason `current_exe` failed, since there is a fallback either way,
+    // and `and_then` runs the next step only if there was a path — leaving `Option<PathBuf>`.
     let beside_exe = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    // An `Option` iterates as either one item or none, so `into_iter().chain(..)` is how the
+    // maybe-there directory and the always-there one become a single list, in priority order.
     let searched: Vec<PathBuf> = beside_exe.into_iter().chain([args.export_dir.clone()]).collect();
     for dir in &searched {
         if let Some(found) = find_ort_dylib(dir) {
@@ -234,10 +245,16 @@ fn resolve_ort_dylib(args: &Args) -> Result<PathBuf> {
 /// and `dlopen` is happy to be handed any of those spellings.
 fn find_ort_dylib(dir: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        // `?` on an `Option` in a function returning `Option`: an unreadable directory means
+        // "nothing found here", and the caller moves on to the next one.
         .ok()?
+        // `read_dir` yields `Result<DirEntry>` per entry — a file can vanish mid-walk.
+        // `flatten` keeps the `Ok`s and silently drops the rest.
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
+            // Three fallible steps, ending in `is_some_and`: false unless there *was* a
+            // filename, it *was* UTF-8, and it starts with the prefix.
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(ORT_DYLIB_PREFIX))

@@ -110,6 +110,9 @@ struct StreamState {
 }
 
 impl Turn {
+    /// `Self` is shorthand for the type this `impl` block is about — `Turn`, here. Rust has no
+    /// constructors, so a plain function returning `Self` is the convention, and `new` is the
+    /// name given to the one obvious way of building a value.
     fn new(prefill_len: usize, pending: i64, ttft: Duration) -> Self {
         Self {
             kv_len: prefill_len as i64,
@@ -217,6 +220,9 @@ impl CausalLm {
 
         // Whatever the cache does not supply is ours to fill in.
         let (cache, other_inputs) = KvCache::discover(&session)?;
+        // `into_iter` consumes `other_inputs` rather than borrowing it, which is what lets the
+        // closure below take each `name` by value. The closure turns each name into a
+        // `Result<StepInput>` — recognised, or an error naming the input we did not recognise.
         let step_inputs = other_inputs
             .into_iter()
             .map(|name| {
@@ -332,6 +338,9 @@ impl CausalLm {
             turn,
         } = self;
 
+        // Reads as "if there is a turn, and it has finished, call it `closed`". `as_ref` looks
+        // inside the `Option` without taking the turn out of it, and `filter` drops it back to
+        // `None` when the test fails — so the `if let` runs only for a turn that is over.
         if let Some(closed) = turn.as_ref().filter(|t| t.finished) {
             eprintln!(
                 "[hf2mobile] WARNING: generate() did nothing. This turn already reached an \
@@ -346,6 +355,8 @@ impl CausalLm {
         if turn.is_none() {
             let encoding = tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?;
             // `as i64` widens each id: the tokenizer counts in u32, the graph wants int64.
+            // The `&id` in the closure's argument is a pattern, not a reference: iterating a
+            // slice yields `&u32`, and `&id` unwraps that on the spot so `id` is a plain `u32`.
             let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
             if prompt_ids.is_empty() {
                 // A causal LM predicts token n+1 from tokens 0..n, so it needs at least one
@@ -414,6 +425,9 @@ fn stream_token(tokenizer: &Tokenizer, turn: &mut Turn) {
         &mut turn.stream.prefix,
         &mut turn.stream.prefix_index,
     );
+    // Two layers unwrapped by one pattern: `Ok` (the decoder did not fail) around `Some` (it
+    // had a complete character to hand back). Every other combination — an error, or a piece
+    // held back mid-character — matches nothing and is skipped, which is the intent here.
     if let Ok(Some(piece)) = piece {
         print!("{piece}");
         // stdout is line-buffered, and tokens rarely end in a newline, so without this the
@@ -451,10 +465,14 @@ fn forward(
     let seqlens_k = [(total - 1) as i32];
     let total_length = [total as i32];
 
+    // `with_capacity` asks for room for every input up front, so pushing below never has to
+    // grow the list and copy what is already in it. The exact count is known: the graph's
+    // non-cache inputs plus one per cache slot.
     let mut inputs: Vec<(&str, SessionInputValue)> = Vec::with_capacity(step_inputs.len() + cache.slot_count());
     for &step in step_inputs {
         // `from_array_view` wraps a slice we already have rather than copying it; the
-        // borrow ends when `run` below consumes `inputs`.
+        // borrow ends when `run` below consumes `inputs`. Its argument is a `(shape, data)`
+        // pair — `vec![1, len]` is the shape `[1, L]`, and the slice is the elements.
         let value = match step {
             StepInput::InputIds => TensorRef::from_array_view((vec![1, len], tokens))?.into_dyn(),
             StepInput::PositionIds => TensorRef::from_array_view((vec![1, len], positions.as_slice()))?.into_dyn(),
@@ -489,11 +507,17 @@ fn sampled_token(outputs: &ort::session::SessionOutputs<'_>) -> Result<i64> {
     })?;
     // `try_extract_tensor` borrows ORT's buffer and checks the element type while doing so;
     // the shape (the discarded first half of the pair) is `[1, 1]` and tells us nothing.
+    // The `::<i32>` is a *turbofish*: it names the type parameter the compiler cannot work out
+    // on its own, which here is the element type ORT is being asked to check against.
     let (_, data) = value
         .try_extract_tensor::<i32>()
         .with_context(|| format!("`{SAMPLED_TOKEN}` is not an int32 tensor"))?;
+    // `first` gives `Option<&i32>`; the leading `*` reads the `i32` out of that borrow, since
+    // the slice belongs to ORT and only the number is wanted.
     let token = *data
         .first()
         .with_context(|| format!("`{SAMPLED_TOKEN}` came back empty; it should hold one id"))?;
+    // `from` rather than `as`: this widening cannot lose anything, and saying so with the
+    // conversion that only exists for lossless cases is how that is written down.
     Ok(i64::from(token))
 }

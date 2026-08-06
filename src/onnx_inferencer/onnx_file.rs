@@ -155,7 +155,11 @@ impl Onnx {
     /// failing to read them is not something to paper over with a default.
     fn node_constant(&mut self, node: Region, node_name: &str) -> Result<Option<Vec<i64>>> {
         self.goto(node.start)?;
+        // `mut` because both are filled in by the loop below. `None` and `false` are the "we
+        // have not seen that field yet" states — protobuf makes no promise that a field is
+        // present at all, so every one of them has to have an answer for "absent".
         let mut op_type = None;
+        let mut named = false;
         let mut attributes: Vec<Region> = Vec::new();
 
         while self.pos < node.end {
@@ -168,6 +172,7 @@ impl Onnx {
                     if self.text()? != node_name {
                         return Ok(None);
                     }
+                    named = true;
                 }
                 (NODE_OP_TYPE, LENGTH_DELIMITED) => op_type = Some(self.text()?),
                 (NODE_ATTRIBUTE, LENGTH_DELIMITED) => {
@@ -177,8 +182,18 @@ impl Onnx {
                     attributes.push(attribute);
                     self.goto(attribute.end)?;
                 }
+                // Every other field — inputs, outputs, the domain — is stepped over using its
+                // wire type alone, which is the whole reason this file needs no schema.
                 _ => self.skip(wire)?,
             }
+        }
+
+        // `NodeProto.name` is optional, and protobuf 3 does not write a field holding the
+        // default value — so a node named `""` arrives here with no name field at all and the
+        // match above never runs. Without this, such a node would fall into the `op_type`
+        // check below and fail the whole read with "expected a `Constant` node, found `Add`".
+        if !named {
+            return Ok(None);
         }
 
         if op_type.as_deref() != Some(CONSTANT) {
@@ -433,9 +448,19 @@ mod tests {
     }
 
     /// A `ModelProto` holding one `Constant` node per `(name, ids)` pair.
+    ///
+    /// An empty name is the exception: it stands for an *unnamed* node, which on disk means
+    /// no `NodeProto.name` field at all (protobuf 3 does not write a default value), and is
+    /// what `onnx.helper.make_node(...)` produces when the caller passes no `name=`.
     fn model(nodes: &[(&str, &[i32])]) -> Vec<u8> {
         let mut graph = Vec::new();
         for (name, ids) in nodes {
+            if name.is_empty() {
+                let mut node = text(2, "unnamed_output"); // NodeProto.output
+                node.extend(text(NODE_OP_TYPE, "Add"));
+                graph.extend(field(GRAPH_NODE, LENGTH_DELIMITED, &node));
+                continue;
+            }
             let raw: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
             let mut tensor = field(1, VARINT, &varint(ids.len() as u64)); // dims
             tensor.extend(field(TENSOR_DATA_TYPE, VARINT, &varint(INT32)));
@@ -503,6 +528,15 @@ mod tests {
     fn a_missing_node_is_none() {
         let file = model(&[("something_else", &[1])]);
         assert_eq!(read(&file, "hf2mobile_EOS_tokens").unwrap(), None);
+    }
+
+    /// A node carrying no name at all is another node, not a broken `Constant`. Reading it as
+    /// one used to fail the whole walk, which would have taken the model down with it.
+    #[test]
+    fn an_unnamed_node_is_skipped_rather_than_failing_the_walk() {
+        let file = model(&[("", &[]), ("hf2mobile_EOS_tokens", &[151645])]);
+        assert_eq!(read(&file, "hf2mobile_EOS_tokens").unwrap(), Some(vec![151645]));
+        assert_eq!(read(&model(&[("", &[])]), "hf2mobile_EOS_tokens").unwrap(), None);
     }
 
     #[test]

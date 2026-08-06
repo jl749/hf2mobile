@@ -6,10 +6,10 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use ort::execution_providers::CPUExecutionProvider;
 use ort::operator::OperatorDomain;
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::tensor::TensorElementType;
 use ort::value::ValueType;
@@ -17,30 +17,29 @@ use ort::value::ValueType;
 use crate::precision::REEXPORT_ADVICE;
 use crate::sample_logits::{SampleLogits, DOMAIN};
 
-/// Load `path` and get it ready to run.
+/// Load ONNX from `path` and get it ready to run.
 ///
 /// `intra_threads` caps the threads ORT uses *inside* a single operator (the big MatMuls).
-/// `None` lets ORT decide, which is one thread per physical core — usually what you want,
-/// unless something else on the machine also needs the cores.
+/// `None` lets ORT decide, which is one thread per physical core (usually what you want, unless something else on the machine also needs the cores).
 ///
-/// Set `DEBUG=1` in the environment to also write the optimized graph and a profiling trace to
-/// the current directory — see [`debug_artifacts`].
+/// Set `DEBUG=1` in the environment to also write the optimized graph and a profiling trace to the current directory — see [`debug_artifacts`].
 pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
-    // A builder: each call configures one thing and hands the builder back, so they chain.
+    // Checked here rather than left to ORT. A path that is not there is the most common way
+    // this function fails, and ORT reports it with the same "could not load the model" error it
+    // uses for a graph whose kernels it cannot resolve — so without this, a typo in a path comes
+    // back wearing the dtype advice below and sends the reader off re-exporting a healthy model.
+    if !Path::new(path).is_file() {
+        bail!("`{path}` is not a file");
+    }
+
+    // A builder: each call configures one thing and hands the Result<SessionBuilder> back, so they chain.
     // Each returns a `Result`, hence the `?` after every step.
-    let mut builder = Session::builder()?
-        // `inference.onnx` ends in a `com.hf2mobile:SampleLogits` node, and ORT cannot resolve
-        // a kernel for it unless we hand it one. Registered in-process from the same source
-        // that builds `libhf2mobile_plugins.so`, rather than by loading that `.so`: the graph
-        // then runs with nothing to configure and no second artifact to keep in step. (A
-        // runtime that is not this one — an Android app — loads the `.so`.)
+    let mut builder: SessionBuilder = Session::builder()?
+        // Prevent extra `libhf2mobile_plugins.so` load by explicitly fetching the plugin impl
         .with_operators(OperatorDomain::new(DOMAIN)?.add(SampleLogits::<f32>::new())?)?
-        // Level3 turns on every graph rewrite ORT has, including layout changes that are
-        // specific to the current CPU. Costs a moment at load, pays it back on the first token.
+        // Max OPT level, including layout changes (better mem locality: NCHW -> NCHWc) that are specific to the current CPU.
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        // The CPU provider is the only one always compiled into onnxruntime. ORT walks this
-        // list in order and hands each node to the first provider that claims it, so adding an
-        // accelerator later means inserting it *before* CPU here.
+        // TODO: when adding new EP add it before CPU (e.g. prioritize QNNEP)
         .with_execution_providers([CPUExecutionProvider::default().build()])?;
 
     if let Some(n) = intra_threads {
@@ -48,14 +47,14 @@ pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
     }
 
     if let Some(artifacts) = debug_artifacts(path) {
-        // `.ort` is ONNX Runtime's own serialized format: the graph *after* Level3
-        // optimization, ready to mmap. Comparing it against the input `.onnx` is how you see
-        // which fusions actually fired.
+        // `.ort` is ONNX Runtime's own serialized format: the graph *after* Level3 optimization, ready to mmap.
+        // Comparing it against the input `.onnx` is how you see which fusions actually fired.
         builder = builder
             .with_optimized_model_path(&artifacts.optimized_model)?
+            // soptimized model saved by the session => .ort
             .with_config_entry("session.save_model_format", "ORT")?
-            // ORT appends a timestamp and `.json` to this prefix, and writes nothing until
-            // `Session::end_profiling` is called — see `CausalLMInferencer`'s `Drop`.
+            // ORT appends a timestamp and `.json` to this prefix.
+            // Writes nothing until `Session::end_profiling` is called — see `CausalLMInferencer`'s `Drop`.
             .with_profiling(&artifacts.profile_prefix)?;
         eprintln!(
             "[hf2mobile] DEBUG=1: writing `{}` and a chrome trace `{}*.json`",
@@ -63,14 +62,19 @@ pub fn open(path: &str, intra_threads: Option<usize>) -> Result<Session> {
         );
     }
 
-    // ORT reports a missing kernel as "Could not find an implementation for <node>", which
-    // names the symptom but not the cause. On the CPU provider the cause is nearly always a
-    // dtype it has no kernels for, so say that here rather than leaving the reader to work it
-    // out. (A `SampleLogits` node in the wrong domain lands here too — the message then names
-    // the node, which is enough of a clue.)
     builder
-        .commit_from_file(path)
-        .with_context(|| format!("ONNXRuntime could not load `{path}`.\n\n{REEXPORT_ADVICE}"))
+        .commit_from_file(path) // NOTE: Builds the session from ONNX
+        // `with_context` adds a line *above* whatever error came out, rather than replacing it,
+        // so the reader gets ORT's own message and this one. Phrased as a hypothesis: by this
+        // point the file exists, and an unresolvable kernel is usually a dtype the provider does
+        // not have — but ORT's message names a node, not a cause, so we cannot know from here.
+        .with_context(|| {
+            format!(
+                "ONNXRuntime could not load `{path}`.\n\n\
+                 If the failure above names a node it has no implementation for, the usual cause \
+                 is the graph's dtype:\n\n{REEXPORT_ADVICE}"
+            )
+        })
 }
 
 /// Where the `DEBUG=1` dumps go.
@@ -87,8 +91,13 @@ pub struct DebugArtifacts {
 
 /// The `DEBUG=1` artifact paths for `model_path`, or `None` when debugging is off.
 pub fn debug_artifacts(model_path: &str) -> Option<DebugArtifacts> {
+    // `var` gives a `Result<String, _>`; `as_deref` turns that into a `Result<&str, _>` so the
+    // arms below can match against a plain string literal instead of allocating one to compare.
     match std::env::var("DEBUG").as_deref() {
         Ok("1") => {
+            // `file_stem` is the name without its extension (`model.onnx` -> `model`). Both
+            // steps can fail — no filename, or one that is not UTF-8 — so `and_then` chains
+            // them and `unwrap_or` supplies a name for the case where either does.
             let stem = Path::new(model_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -97,9 +106,9 @@ pub fn debug_artifacts(model_path: &str) -> Option<DebugArtifacts> {
                 optimized_model: format!("{stem}.ort"),
                 profile_prefix: format!("{stem}_profile_"),
             })
-        },
+        }
         Ok(_) => None,
-        Err(_) => None
+        Err(_) => None,
     }
 }
 
@@ -110,6 +119,11 @@ pub fn debug_artifacts(model_path: &str) -> Option<DebugArtifacts> {
 /// (unused here) non-tensor value kinds: sequences and maps.
 pub fn tensor_type(ty: &ValueType) -> Option<(&[i64], TensorElementType)> {
     match ty {
+        // Destructuring an enum variant: this both tests that `ty` is the `Tensor` case and
+        // binds the two fields we want out of it. `..` says "and whatever else it holds,
+        // ignore it", which is what keeps this compiling when `ort` adds a field.
+        // `*ty` copies the element type out of the borrow — it is a small `Copy` enum — while
+        // `shape` stays a borrow, which is why the returned slice carries the input's lifetime.
         ValueType::Tensor { ty, shape, .. } => Some((shape, *ty)),
         _ => None,
     }

@@ -70,6 +70,10 @@ impl KvCache {
     /// it does *not* supply — `input_ids` and friends, which are the caller's to fill.
     /// One pass, one classification rule: an input is a cache slot exactly when the graph
     /// also declares `<name>_out`.
+    ///
+    /// The `&str`s handed back are not copies of those names — they point into `session`, which
+    /// Rust infers from there being only one borrow in the signature to tie them to. The caller
+    /// therefore cannot drop the session while still holding the list, and no string is cloned.
     pub fn discover(session: &Session) -> Result<(Self, Vec<&str>)> {
         // Index the output names once. `session.outputs` is a Vec, so scanning it per
         // input would make discovery quadratic in the layer count — a set makes each
@@ -79,18 +83,28 @@ impl KvCache {
         let mut slots = Vec::new();
         let mut others = Vec::new();
         for input in &session.inputs {
+            // The name we would expect the matching output to have. Built once and moved into
+            // the `Slot` below if it turns out to exist, so the allocation is not wasted.
             let output = format!("{}{OUT_SUFFIX}", input.name);
             if !outputs.contains(output.as_str()) {
                 others.push(input.name.as_str());
-                continue;
+                continue; // not a cache slot — on to the next input
             }
 
+            // `with_context` turns the `None` from a non-tensor input into an error naming it,
+            // and `?` then returns that error from `discover`. Together they are the one-line
+            // form of "if this failed, say which input it was and give up".
             let (shape, dtype) = tensor_type(&input.input_type)
                 .with_context(|| format!("cache input `{}` is not a tensor", input.name))?;
             let empty_shape = empty_shape(&input.name, shape)?;
 
             slots.push(Slot {
                 value: empty_tensor(dtype, &empty_shape)?,
+                // Owned copies, unlike the borrowed `others` above. A `Slot` outlives this
+                // function and sits next to the session in `CausalLm`, and Rust does not let a
+                // struct hold a borrow of its own neighbour — so these two names are cloned
+                // once, at load, rather than borrowed. `output`, `dtype` and `empty_shape` are
+                // written without `field:` because a local of the same name is what goes in.
                 input: input.name.clone(),
                 output,
                 dtype,
@@ -139,11 +153,22 @@ impl KvCache {
     ///
     /// `remove` hands over ORT's own output buffer rather than a copy of it, and takes
     /// it *out* of `outputs` so nothing else can claim it twice.
+    ///
+    /// Every slot is checked before any is taken. Failing half way through the taking would
+    /// leave the cache mixed — some slots holding this step's tensors, the rest holding last
+    /// step's — which is a state no error message describes and no `reset` is forced to
+    /// follow. Checking first costs one lookup per slot per token and makes the failure leave
+    /// the cache exactly as it was.
     pub fn take_update(&mut self, outputs: &mut SessionOutputs<'_>) -> Result<()> {
+        for slot in &self.slots {
+            if outputs.get(&slot.output).is_none() {
+                bail!("graph did not return `{}`", slot.output);
+            }
+        }
+        // `&mut self.slots` iterates by mutable reference, so `slot.value = ...` writes into the
+        // cache itself. Iterating `self.slots` instead would hand out copies and write to those.
         for slot in &mut self.slots {
-            slot.value = outputs
-                .remove(&slot.output)
-                .with_context(|| format!("graph did not return `{}`", slot.output))?;
+            slot.value = outputs.remove(&slot.output).expect("checked just above");
         }
         Ok(())
     }

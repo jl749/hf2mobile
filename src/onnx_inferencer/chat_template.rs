@@ -59,9 +59,16 @@ impl ChatTemplate {
         let config = read_json(&export_dir.join(TOKENIZER_CONFIG_FILE))?;
         let source = match std::fs::read_to_string(export_dir.join(CHAT_TEMPLATE_FILE)) {
             Ok(jinja) => Some(jinja),
+            // `as_ref` borrows the inside of the `Option` so `config` survives to be used again
+            // below; `and_then` then calls `template_source` on it, passed here by name rather
+            // than wrapped in a closure because its signature already lines up.
             Err(_) => config.as_ref().and_then(template_source),
         };
 
+        // `let ... else` is destructuring that is allowed to fail: it binds `source` for the
+        // rest of the function, and the `else` block runs when there was nothing to bind — so
+        // it has to leave the function. It is `if let` turned inside out, and it keeps the
+        // interesting path un-indented.
         let Some(source) = source else {
             return Ok(None);
         };
@@ -163,6 +170,9 @@ fn special_tokens(config: &Json) -> Vec<(String, String)> {
     };
     map.iter()
         .filter(|(name, _)| name.ends_with("_token"))
+        // `filter_map` is a filter and a map in one pass: returning `None` drops the entry,
+        // returning `Some(x)` keeps `x`. Used here because deciding whether to keep a key and
+        // working out its value are the same question — a `*_token` we cannot read is not one.
         .filter_map(|(name, value)| {
             let token = match value {
                 Json::String(token) => Some(token.clone()),

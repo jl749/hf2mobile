@@ -206,6 +206,10 @@ impl CausalLMInferencer {
     /// Returning anyhow's `Result` instead would silence it, but then the `?`s below would
     /// surface numpy's `ValueError` as a `RuntimeError`, so the warning is the better trade.
     /// An `#[allow]` here or on the `impl` does not reach the generated code.
+    /// `Python<'py>` is proof that this thread holds the GIL, and `Bound<'py, T>` is a Python
+    /// object whose lifetime is tied to that proof — so the compiler will not let a Python
+    /// value be touched after the GIL has been handed back. It is the same idea as a borrow
+    /// checked against the thing it borrows from, applied to the interpreter lock.
     fn run<'py>(&mut self, py: Python<'py>, inputs: &Bound<'py, PyDict>) -> PyResult<Bound<'py, PyDict>> {
         let mut ort_inputs: Vec<(String, ort::value::DynValue)> = Vec::with_capacity(inputs.len());
         for (key, value) in inputs.iter() {

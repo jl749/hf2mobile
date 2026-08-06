@@ -27,6 +27,7 @@ use crate::session::tensor_type;
 /// Appended to dtype failures, including the one ORT raises from inside `commit_from_file`
 /// when it cannot find a kernel. Phrased as the command to run next, because that is the
 /// only part the reader can act on.
+/// TODO: evaluate the backends (supported dtypes: ...)
 pub const REEXPORT_ADVICE: &str =
     "ONNXRuntime's CPU execution provider has no bfloat16 kernels, so a bf16 graph cannot be \
      loaded on this machine at all. Re-export the model in a dtype the CPU provider can run:\n\
@@ -34,28 +35,24 @@ pub const REEXPORT_ADVICE: &str =
      bf16 -> fp32 is lossless (fp32 has the same exponent range and more mantissa); the file \
      roughly doubles in size.";
 
-/// Does the provider [`crate::session::open`] builds have bf16 kernels?
-///
-/// A constant, not a probe, because it is a fact about how onnxruntime was built rather
-/// than about this machine. Wiring in an accelerator (CUDA, QNN) is the moment to revisit
-/// it.
-const PROVIDER_HAS_BF16_KERNELS: bool = false;
-
 /// Can we run a bf16 graph as-is?
 pub fn bf16_is_executable() -> bool {
-    // `&&` short-circuits, so on a CPU-only build we never even run the probe — but the
-    // probe stays, because it is the half of the answer that changes per machine.
-    PROVIDER_HAS_BF16_KERNELS && cpu_has_bf16()
+    cpu_has_bf16()
 }
 
 /// Does the CPU have native bf16 instructions?
 ///
 /// x86: the AVX-512 BF16 extension (Cooper Lake and later) adds bf16 dot products.
 /// aarch64: the `bf16` feature, from Armv8.6-A.
-/// Detection happens at runtime — the same binary gives different answers on different
-/// machines, which is the point.
+/// Detection happens at runtime — the same binary gives different answers on different machines.
+///
+/// `#[cfg(target_arch = ...)]` picks one of these three bodies at *compile* time, and the three
+/// together cover every target, so there is always exactly one `cpu_has_bf16` in the build.
 #[cfg(target_arch = "x86_64")]
 fn cpu_has_bf16() -> bool {
+    // Deliberately not also `amx-bf16` (Sapphire Rapids and later). AMX is a second, wider bf16
+    // unit, but no shipping x86 part has it without AVX512-BF16 as well — so testing for it
+    // would add a name to this line and not one machine to the answer.
     std::arch::is_x86_feature_detected!("avx512bf16")
 }
 
@@ -64,6 +61,7 @@ fn cpu_has_bf16() -> bool {
     std::arch::is_aarch64_feature_detected!("bf16")
 }
 
+// Everything else: 32-bit ARM, RISC-V, wasm. No detection macro to call, and no bf16.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn cpu_has_bf16() -> bool {
     false
@@ -81,6 +79,9 @@ pub fn ensure_executable(session: &Session) -> Result<()> {
         return Ok(());
     }
 
+    // One iterator over inputs *and* outputs, built without allocating: `map` reshapes each side
+    // into the same `(name, type)` pair, and `chain` runs the second after the first. Nothing is
+    // read until the `for` below asks for it, so this walks the two lists once between them.
     let declared = session
         .inputs
         .iter()
@@ -88,6 +89,9 @@ pub fn ensure_executable(session: &Session) -> Result<()> {
         .chain(session.outputs.iter().map(|o| (&o.name, &o.output_type)));
 
     for (name, ty) in declared {
+        // `if let` matches one shape and ignores every other: a tensor whose element type is
+        // bf16. The `_` is the shape, which does not matter here, and a non-tensor value
+        // (a sequence, a map) falls through the pattern entirely.
         if let Some((_, TensorElementType::Bfloat16)) = tensor_type(ty) {
             bail!("`{name}` is bfloat16.\n\n{REEXPORT_ADVICE}");
         }
