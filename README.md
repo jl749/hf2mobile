@@ -19,6 +19,7 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 - [🎯 Motivation](docs/motivation.md) — why operator-level ONNX stopped being enough
 - [🧩 Approach](docs/approach.md) — the module boundary as the unit of export
 - [🔧 How it works](docs/how-it-works.md) — the export stages, and the Rust runtime that runs the result on a phone
+- [📊 Evaluation](docs/evaluation.md) — NPU vs CPU decode throughput on a Galaxy S25+
 - [📋 Requirements](#-requirements)
 - [📦 Install](#-install)
 - [🚀 Usage (CLI)](#-usage-cli) — export → postprocess → infer, on the host or over `adb`
@@ -51,6 +52,13 @@ Seven stages: trace module I/O → export the subgraphs → register the plugin 
 | <img src="docs/1_module_level_graph.svg" width="200"> | <img src="docs/2_module_level_postprocessed_graph.svg" width="200"> | <img src="docs/3_final_graph.svg" width="200"> | <img src="docs/4_final_graph_postprocessed.svg" width="200"> |
 | :---: | :---: | :---: | :---: |
 | Initial module-level graph | Postprocessed module-level graph | Flattened operator-level graph (ORT: CPU-EP target) | Decode policy baked in (`SampleLogits` + EOS ids) |
+
+## 📊 Evaluation
+
+**[docs/evaluation.md](docs/evaluation.md)** — `--target QNN` vs `--target CPU` decode throughput on a Galaxy S25+.
+
+<img src="docs/s25plus_decoder_throughput_comparison.svg" width="100%" alt="On a Snapdragon 8 Elite the NPU path runs **2.4–3.4× the CPU** wherever both fit, and past 1.7B it is the only thing that runs at all.">
+
 
 ---
 
