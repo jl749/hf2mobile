@@ -1,10 +1,10 @@
 # 📊 Evaluation
 
-*What the hf2mobile's QNN path actually buys, measured on a Galaxy S25+.* — [back to README](../README.md)
+*What hf2mobile's QNN path actually buys, measured on a Galaxy S25+.* — [back to README](../README.md)
 
 ---
 
-Decode throughput for models exported through the hf2mobile's QNN path (NPU + CPU), against the same phone's CPU.
+Decode throughput for models exported through hf2mobile's QNN path (NPU + CPU), against the same phone's CPU.
 
 ## Setup
 
@@ -29,7 +29,9 @@ Decode throughput (tok/s), higher is better:
 
 The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the only thing that runs at all. **NPU W4 is the fastest configuration at every size.**
 
-- **No CPU fp16 column.** ONNXRuntime's CPU EP does not execute fp16 — it upconverts to fp32 at load, so the column would restate CPU fp32 while costing *more* memory. Note the requirement is `avx512_fp16` on x86 or `FEAT_FP16`/`asimdhp` on ARM; the 8 Elite **does not** have `FEAT_FP16`.
+On the missing cells:
+
+- **No CPU fp16 column.** ONNXRuntime's CPU EP does not execute fp16 — it upconverts to fp32 at load (the graph comes back as `Cast → MatMul → Cast`), so the column would restate CPU fp32 while costing *more* memory. This is **not** a hardware limit: the 8 Elite reports `fphp`/`asimdhp` (FEAT_FP16) and the Android ORT binary ships MLAS half-precision GEMM. (WIP: looking into the problems)
 - **NPU fp16 at 4B** — the 6.8 GB context binary set crashes and reboots the phone. All context binaries are mapped at session creation, so the whole set has to fit.
 - **CPU fp32 at 3B and 4B** — 12.4 GB and 16.1 GB against ~6.2 GB of available RAM. The 3B attempt ran for 4m11s and then rebooted the device; 4B fp32 cannot even be exported on the host (16.1 GB resident against 13 GB free, no swap).
 
@@ -38,9 +40,9 @@ The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the on
 | | weights | activations | graph I/O |
 | --- | --- | --- | --- |
 | NPU fp16 | float16 | float16 | float16 |
-| NPU W8A8 | uint8 asymmetric, **per-tensor** | uint8 asymmetric, per-tensor | float16 |
-| NPU W4A8 | int4, **per-row** | uint8 asymmetric, per-tensor | float16 |
-| NPU W4A16 | int4, **per-row** | uint16 asymmetric, per-tensor | float16 |
+| NPU W8A8 | int8 symmetric, **per-row** | uint8 asymmetric, per-tensor | float16 |
+| NPU W4A8 | int4 symmetric, **per-row** | uint8 asymmetric, per-tensor | float16 |
+| NPU W4A16 | int4 symmetric, **per-row** | uint16 asymmetric, per-tensor | float16 |
 | CPU fp32 | float32 | float32 | float32 |
 
 ### Artifact size

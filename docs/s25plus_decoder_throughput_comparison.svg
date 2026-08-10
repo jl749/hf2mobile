@@ -136,6 +136,6 @@
     <text class="ink2 t-leg" x="24" y="148" font-size="10.5">(dashed)</text>
   </g>
 
-  <text class="ink2 t-ax" x="24" y="443">W4 = int4 weights, one scale per output row · A8/A16 = uint8/uint16 activations, per-tensor · fp16 graph I/O</text>
+  <text class="ink2 t-ax" x="24" y="443">W4 / W8 = int4 / int8 weights, symmetric, per-row (one scale per output row) · A8 / A16 = uint8 / uint16 activations, asymmetric, per-tensor</text>
   <text class="ink2 t-ax" x="24" y="459">Missing points are configurations that do not fit on the device, not slow ones.</text>
 </svg>
