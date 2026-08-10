@@ -4,11 +4,11 @@
 
 ---
 
-Decode throughput for models exported through hf2mobile's QNN path (NPU + CPU), against the same phone's CPU.
+Decode throughput for models exported through hf2mobile's QNN path (NPU + CPU), against hf2mobile's CPU path on the same phone.
 
 ## Setup
 
-- **Device** — Galaxy S25+ (Snapdragon 8 Elite, HTP v79, 11.4 GB RAM)
+- **Device** — Galaxy S25+ (Snapdragon 8 Elite, HTP v79, 12 GB RAM — 10.9 GiB visible to the OS)
 - **Toolchain** — QAIRT SDK 2.48
 - **Runtime** — ONNXRuntime 1.27 with the QNN execution provider, driven by `hf2mobile-infer`
 - **Workload** — single-token prompt, 32 generated tokens
@@ -27,11 +27,11 @@ Decode throughput (tok/s), higher is better:
 | Qwen2.5-3B | 8.48 | 15.63 | **22.25** | 21.77 | n/a | — |
 | Qwen3-4B | n/a | 10.76 | **17.49** | 17.45 | n/a | — |
 
-The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the only thing that runs at all. **NPU W4 is the fastest configuration at every size.**
+The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the only thing that runs at all. **NPU W4 is the fastest configuration at every size** — the clearest sign that this workload is memory-bound rather than compute-bound: fewer weight bits, proportionally more throughput.
 
 On the missing cells:
 
-- **No CPU fp16 column.** ONNXRuntime's CPU EP does not execute fp16 — it upconverts to fp32 at load (the graph comes back as `Cast → MatMul → Cast`), so the column would restate CPU fp32 while costing *more* memory. This is **not** a hardware limit: the 8 Elite reports `fphp`/`asimdhp` (FEAT_FP16) and the Android ORT binary ships MLAS half-precision GEMM. (WIP: looking into the problems)
+- **No CPU fp16 column.** ONNXRuntime's CPU EP does not execute fp16 — it upconverts to fp32 at load (the graph comes back as `Cast → MatMul → Cast`), so the column would restate CPU fp32 while costing *more* memory. This is **not** a hardware limit. The 8 Elite reports `fphp`/`asimdhp` (FEAT_FP16) and the Android ORT binary ships MLAS half-precision GEMM; the block sits one layer above both, in that no fp16 MatMul kernel is registered for the CPU EP, so the cast is inserted before MLAS is ever reached.
 - **NPU fp16 at 4B** — the 6.8 GB context binary set crashes and reboots the phone. All context binaries are mapped at session creation, so the whole set has to fit.
 - **CPU fp32 at 3B and 4B** — 12.4 GB and 16.1 GB against ~6.2 GB of available RAM. The 3B attempt ran for 4m11s and then rebooted the device; 4B fp32 cannot even be exported on the host (16.1 GB resident against 13 GB free, no swap).
 
