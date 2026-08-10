@@ -30,6 +30,7 @@ Decode throughput (tok/s), higher is better:
 
 > [!IMPORTANT]
 > The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the only thing that runs at all.
+>
 > **NPU W4 is the fastest configuration at every size** — the clearest sign that this workload is memory-bound rather than compute-bound: fewer weight bits, proportionally more throughput.
 
 On the missing cells:
