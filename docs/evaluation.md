@@ -54,7 +54,7 @@ On the missing cells:
 
 Deployable bytes — NPU context binaries plus the fp16 main graph — against the CPU fp32 file:
 
-| | 🟪 CPU fp32 | 🟦 CPU+NPU fp16 | 🟦 CPU+NPU W8A8 | 🟦 CPU+NPU W4 |
+| | 🟪 CPU fp32 | 🟦 CPU+NPU fp16 | 🟦 CPU+NPU W8 | 🟦 CPU+NPU W4 |
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3-0.6B | 2.30 GB | 1.17 GB −49% | 748 MB −67% | **538 MB −77%** |
 | Qwen3-1.7B | 6.50 GB | 3.30 GB −49% | 1.95 GB −70% | **1.28 GB −80%** |
