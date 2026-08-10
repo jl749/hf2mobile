@@ -4,8 +4,6 @@
 
 ---
 
-Decode throughput for the two paths hf2mobile can export to, measured on the same phone:
-
 - 🟦 **NPU + CPU path** — `--target QNN`. The graph is cut at every attention — `GroupQueryAttention` in the exported graph, which is what `torch.nn.functional.scaled_dot_product_attention` becomes after fusion. The attentions stay on the CPU, along with the token embedding, the LM head and the sampling op; each slab of decoder between them goes to the NPU. One session, two execution providers.
 - 🟪 **CPU path** — `--target ORT`. The whole graph on ONNXRuntime's CPU execution provider; no NPU involvement.
 
@@ -30,9 +28,9 @@ Decode throughput (tok/s), higher is better:
 | Qwen2.5-3B | 8.48 | 15.63 | **22.25** | 21.77 | n/a | — |
 | Qwen3-4B | n/a | 10.76 | **17.49** | 17.45 | n/a | — |
 
-The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the only thing that runs at all.
-
-**NPU W4 is the fastest configuration at every size** — the clearest sign that this workload is memory-bound rather than compute-bound: fewer weight bits, proportionally more throughput.
+> [!IMPORTANT]
+> The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the only thing that runs at all.
+> **NPU W4 is the fastest configuration at every size** — the clearest sign that this workload is memory-bound rather than compute-bound: fewer weight bits, proportionally more throughput.
 
 On the missing cells:
 

@@ -55,7 +55,7 @@ Seven stages: trace module I/O → export the subgraphs → register the plugin 
 
 ## 📊 Evaluation
 
-**[docs/evaluation.md](docs/evaluation.md)** — NPU vs CPU decode throughput on a Galaxy S25+.
+**[docs/evaluation.md](docs/evaluation.md)** — `--target QNN` vs `--target CPU` decode throughput on a Galaxy S25+.
 
 <img src="docs/s25plus_decoder_throughput_comparison.svg" width="100%" alt="On a Snapdragon 8 Elite the NPU path runs **2.4–3.4× the CPU** wherever both fit, and past 1.7B it is the only thing that runs at all.">
 
