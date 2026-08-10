@@ -113,10 +113,6 @@
   </g>
   <text class="ink t-lab" x="101" y="243" text-anchor="middle">24.8</text>
 
-  <!-- annotations for the two truncations -->
-  <text class="ink2 t-ax" x="470" y="341" >fp16 ✕ at 4B</text>
-  <text class="ink2 t-ax" x="272" y="336" >CPU ✕ past 1.7B</text>
-
   <!-- ── legend ── -->
   <g transform="translate(614,96)">
     <g class="mark ring"><circle class="s1" cx="8" cy="0" r="5.5"/></g>
