@@ -4,7 +4,10 @@
 
 ---
 
-Decode throughput for models exported through hf2mobile's QNN path (NPU + CPU), against hf2mobile's CPU path on the same phone.
+Decode throughput for the two paths hf2mobile can export to, measured on the same phone:
+
+- 🟦 **NPU + CPU path** — `--target QNN`. The graph is cut at every attention — `GroupQueryAttention` in the exported graph, which is what `torch.nn.functional.scaled_dot_product_attention` becomes after fusion. The attentions stay on the CPU, along with the token embedding, the LM head and the sampling op; each slab of decoder between them goes to the NPU. One session, both execution providers.
+- 🟪 **CPU path** — `--target ORT`. The whole graph on ONNXRuntime's CPU execution provider; no NPU involvement.
 
 ## Setup
 
@@ -20,8 +23,9 @@ Decode throughput for models exported through hf2mobile's QNN path (NPU + CPU), 
 
 Decode throughput (tok/s), higher is better:
 
-| | NPU fp16 | NPU W8A8 | NPU W4A8 | NPU W4A16 | CPU fp32 | best vs CPU |
+| | 🟦 fp16 | 🟦 W8A8 | 🟦 W4A8 | 🟦 W4A16 | 🟪 fp32 | best vs CPU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| | *NPU + CPU* | *NPU + CPU* | *NPU + CPU* | *NPU + CPU* | *CPU only* | |
 | Qwen3-0.6B | 38.71 | 51.23 | **59.54** | 58.82 | 24.80 | **2.40×** |
 | Qwen3-1.7B | 15.66 | 21.44 | **30.12** | 29.32 | 8.99 | **3.35×** |
 | Qwen2.5-3B | 8.48 | 15.63 | **22.25** | 21.77 | n/a | — |
@@ -31,7 +35,7 @@ The NPU is **2.4–3.4× the CPU wherever both run**, and past 1.7B it is the on
 
 On the missing cells:
 
-- **No CPU fp16 column.** ONNXRuntime's CPU EP does not execute fp16 — it upconverts to fp32 at load (the graph comes back as `Cast → MatMul → Cast`), so the column would restate CPU fp32 while costing *more* memory. This is **not** a hardware limit. The 8 Elite reports `fphp`/`asimdhp` (FEAT_FP16) and the Android ORT binary ships MLAS half-precision GEMM; the block sits one layer above both, in that no fp16 MatMul kernel is registered for the CPU EP, so the cast is inserted before MLAS is ever reached.
+- **No CPU fp16 column.** ONNXRuntime's CPU EP does not execute fp16 — it upconverts to fp32 at load (the graph comes back as `Cast → MatMul → Cast`), so the column would restate CPU fp32 while costing *more* memory. This is **not** a hardware limit. The 8 Elite reports `fphp`/`asimdhp` (FEAT_FP16) and the Android ORT binary ships MLAS half-precision GEMM; the block sits one layer above both, in that no fp16 MatMul kernel is registered for the CPU EP, so the cast is inserted before MLAS is ever reached. (WIP: figure out why)
 - **NPU fp16 at 4B** — the 6.8 GB context binary set crashes and reboots the phone. All context binaries are mapped at session creation, so the whole set has to fit.
 - **CPU fp32 at 3B and 4B** — 12.4 GB and 16.1 GB against ~6.2 GB of available RAM. The 3B attempt ran for 4m11s and then rebooted the device; 4B fp32 cannot even be exported on the host (16.1 GB resident against 13 GB free, no swap).
 
@@ -39,17 +43,17 @@ On the missing cells:
 
 | | weights | activations | graph I/O |
 | --- | --- | --- | --- |
-| NPU fp16 | float16 | float16 | float16 |
-| NPU W8A8 | int8 symmetric, **per-row** | uint8 asymmetric, per-tensor | float16 |
-| NPU W4A8 | int4 symmetric, **per-row** | uint8 asymmetric, per-tensor | float16 |
-| NPU W4A16 | int4 symmetric, **per-row** | uint16 asymmetric, per-tensor | float16 |
-| CPU fp32 | float32 | float32 | float32 |
+| 🟦 fp16 | float16 | float16 | float16 |
+| 🟦 W8A8 | int8 symmetric, **per-row** | uint8 asymmetric, per-tensor | float16 |
+| 🟦 W4A8 | int4 symmetric, **per-row** | uint8 asymmetric, per-tensor | float16 |
+| 🟦 W4A16 | int4 symmetric, **per-row** | uint16 asymmetric, per-tensor | float16 |
+| 🟪 CPU fp32 | float32 | float32 | float32 |
 
 ### Artifact size
 
 Deployable bytes — NPU context binaries plus the fp16 main graph — against the CPU fp32 file:
 
-| | CPU fp32 | NPU fp16 | NPU W8A8 | NPU W4 |
+| | 🟪 CPU fp32 | 🟦 fp16 | 🟦 W8A8 | 🟦 W4 |
 | --- | ---: | ---: | ---: | ---: |
 | Qwen3-0.6B | 2.30 GB | 1.17 GB −49% | 748 MB −67% | **538 MB −77%** |
 | Qwen3-1.7B | 6.50 GB | 3.30 GB −49% | 1.95 GB −70% | **1.28 GB −80%** |
