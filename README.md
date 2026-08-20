@@ -14,19 +14,6 @@ hf2mobile-inference 2026-08-01__ORT__Qwen-Qwen3-0.6B --prompt "Where is Paris?" 
 
 ---
 
-## Table of Contents
-
-- [Motivation](docs/motivation.md): why operator-level ONNX is no longer sufficient
-- [Approach](docs/approach.md): the module boundary as the unit of export
-- [How it works](docs/how-it-works.md): the export stages, and the Rust runtime that runs the result on a phone
-- [Evaluation](docs/evaluation.md): NPU vs CPU decode throughput on a Galaxy S25+
-- [Requirements](#requirements)
-- [Install](#install)
-- [Usage (CLI)](#usage-cli): export, postprocess and infer, on the host or over `adb`
-- [Roadmap](#roadmap)
-
----
-
 ## Motivation
 
 **[docs/motivation.md](docs/motivation.md)**: why operator-level ONNX is no longer sufficient.
@@ -39,7 +26,7 @@ ONNX standardized the operator level, which sufficed while the vocabulary stayed
 
 **[docs/approach.md](docs/approach.md)**: the module boundary as the unit of export.
 
-Trace the model as its semantic modules (attention, RoPE, RMSNorm, the LM head) rather than as a flat operator graph, hold each module as a single node, and expand it per target at export time. The portable artifact is then the module-level trace rather than any file generated from it, and the NPU/CPU partition becomes an export-time decision instead of a property of whichever converter consumes the file.
+Trace the model as its semantic modules (Attention, RoPE, RMSNorm, the LM head) rather than as a flat operator graph, hold each module as a single node, and expand it per target at export time. The portable artifact is then the module-level trace rather than a runtime-specific topology. The NPU/CPU partition becomes an export-time decision instead of a property of whichever converter consumes the file.
 
 ---
 

@@ -4,8 +4,10 @@
 
 ---
 
-- **NPU + CPU path** (`--target QNN`). The graph is cut at every attention, that is, at each `GroupQueryAttention` in the exported graph, which is what `torch.nn.functional.scaled_dot_product_attention` becomes after fusion. The attentions stay on the CPU, along with the token embedding, the LM head and the sampling op; each slab of decoder between them goes to the NPU. One session, two execution providers.
-- **CPU path** (`--target ORT`). The whole graph on ONNXRuntime's CPU execution provider, with no NPU involvement.
+- **NPU + CPU path** (`--target QNN`).<br>
+  The graph is cut at every attention, that is, at each `GroupQueryAttention` in the exported graph, which is what `torch.nn.functional.scaled_dot_product_attention` becomes after fusion. The attentions stay on the CPU, along with the token embedding, the LM head and the sampling op; each slab of decoder between them goes to the NPU. One session, two execution providers.
+- **CPU path** (`--target ORT`).<br>
+  The whole graph on ONNXRuntime's CPU execution provider, with no NPU involvement.
 
 ## Setup
 
