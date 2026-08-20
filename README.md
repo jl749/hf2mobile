@@ -76,10 +76,10 @@ nix develop .#android
 
 ## Install
 
-### HostPC
-
 <details>
-<summary><b>Click to expand</b> (build the Rust extension into the venv)</summary>
+<summary><b>Click to expand</b></summary>
+
+### HostPC
 
 For development:
 
@@ -103,12 +103,7 @@ maturin build --release -o dist/
 uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
 ```
 
-</details>
-
 ### Android
-
-<details>
-<summary><b>Click to expand</b> (cross-compile one binary and push it)</summary>
 
 Nothing is *installed* on the device. One binary is cross-compiled and pushed (see [Usage](#usage-cli)):
 
