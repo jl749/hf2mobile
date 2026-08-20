@@ -79,7 +79,7 @@ nix develop .#android
 ### HostPC
 
 <details>
-<summary><b>Click to expand</b>: build the Rust extension into the venv</summary>
+<summary><b>Click to expand</b> (build the Rust extension into the venv)</summary>
 
 For development:
 
@@ -108,7 +108,7 @@ uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
 ### Android
 
 <details>
-<summary><b>Click to expand</b>: cross-compile one binary and push it</summary>
+<summary><b>Click to expand</b> (cross-compile one binary and push it)</summary>
 
 Nothing is *installed* on the device. One binary is cross-compiled and pushed (see [Usage](#usage-cli)):
 
@@ -187,7 +187,7 @@ The same engine backs both paths, and the flags below apply to both.
 There are no sampling flags, because the policy is baked into the graph. Output streams to stdout, followed by prompt length, tokens generated, TTFT and tok/s.
 
 <details>
-<summary><b>HostPC</b>: run it in the venv</summary>
+<summary><b>HostPC</b> (run it in the venv)</summary>
 
 ```bash
 nix develop
