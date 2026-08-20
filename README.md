@@ -52,7 +52,7 @@ Seven stages: trace module I/O, export the subgraphs, register the plugin ops, e
 ## Requirements
 
 <details>
-<summary><b>Click to expand</b>: toolchain, and what the flake provides</summary>
+<summary><b>Click to expand</b></summary>
 
 - Python **>= 3.12**
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
