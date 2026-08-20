@@ -51,6 +51,9 @@ Seven stages: trace module I/O, export the subgraphs, register the plugin ops, e
 
 ## Requirements
 
+<details>
+<summary><b>Click to expand</b>: toolchain, and what the flake provides</summary>
+
 - Python **>= 3.12**
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
 - A **Rust toolchain** and [`maturin`](https://www.maturin.rs/), required only to build from source. `hf2mobile` is a mixed Rust/Python project, and a build compiles the `_ortrs_binding` extension module.
@@ -67,11 +70,16 @@ nix develop .#android
 
 > Pre-built ONNXRuntime so for `arm64-v8a` can be downloaded from [onnxruntime-android AAR](https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/) (Find `jni/arm64-v8a/libonnxruntime.so`).
 
+</details>
+
 ---
 
 ## Install
 
 ### HostPC
+
+<details>
+<summary><b>Click to expand</b>: build the Rust extension into the venv</summary>
 
 For development:
 
@@ -95,7 +103,12 @@ maturin build --release -o dist/
 uv pip install dist/hf2mobile-0.1.0-cp312-abi3-linux_x86_64.whl
 ```
 
+</details>
+
 ### Android
+
+<details>
+<summary><b>Click to expand</b>: cross-compile one binary and push it</summary>
 
 Nothing is *installed* on the device. One binary is cross-compiled and pushed (see [Usage](#usage-cli)):
 
@@ -118,6 +131,8 @@ adb shell chmod +x $D/hf2mobile-infer
 ```
 
 `.cargo/config.toml` points cargo and the `cc` crate at the NDK's API-24 clang. API 24 (Android 7.0) is the floor ONNXRuntime's own Android builds target. `llvm-strip` roughly halves the 9 MB if the push is slow. The same source built for the host is just `cargo build --release`.
+
+</details>
 
 ---
 
