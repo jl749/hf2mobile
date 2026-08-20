@@ -212,7 +212,7 @@ hf2mobile-inference 2026-08-01__ORT__google-gemma-3-270m-it --prompt "Where is P
 </details>
 
 <details>
-<summary><b>Android</b>: run it over <code>adb</code></summary>
+<summary><b>Android</b> (run it over <code>adb</code>)</summary>
 
 The binary and `libonnxruntime.so` are already on the device from [Install / Android](#android), so only the export directory still has to go over:
 
@@ -236,7 +236,7 @@ adb shell "$D/hf2mobile-infer $D/2026-08-01__ORT__google-gemma-3-270m-it \
 ## Roadmap
 
 <details>
-<summary><b>Click to expand</b>: what ships today, and what is next per axis</summary>
+<summary><b>Click to expand</b> (what ships today, and what is next per axis)</summary>
 
 Checked items are in the current export path; the rest are ordered by priority within each group.
 
